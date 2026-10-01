@@ -6,7 +6,7 @@ use std::{
     process::ExitCode,
 };
 
-use rasterizer::asset::GltfAsset;
+use rasterizer::{asset::GltfAsset, config::Config, vertex::transform_scene};
 
 const USAGE: &str = "Usage: rasterizer [scene-name|path.gltf|path.glb]\n\nWithout arguments, list bundled scenes. Example: cargo run -- kitchen";
 
@@ -112,6 +112,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
+    let config = match Config::load(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Failed to load '{}': {error}", config_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
     let asset = match GltfAsset::load(&path) {
         Ok(asset) => asset,
         Err(error) => {
@@ -119,10 +127,22 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let clip_scene = match transform_scene(&asset, &config) {
+        Ok(scene) => scene,
+        Err(error) => {
+            eprintln!("Failed to transform '{}': {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
 
     let document = &asset.document;
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
     println!("Loaded {}", path.display());
+    println!("Resolution: {}x{}", config.width, config.height);
+    println!(
+        "Camera (config.toml): position {:?}, target {:?}",
+        config.camera.position, config.camera.target
+    );
     println!("Scenes: {}", document.scenes().len());
     if let Some(scene) = document.default_scene() {
         println!(
@@ -144,6 +164,21 @@ fn main() -> ExitCode {
     println!("Buffers loaded: {}", asset.buffers.len());
     println!("Cameras: {}", document.cameras().len());
     println!("Animations: {}", document.animations().len());
+    let vertices: usize = clip_scene
+        .primitives
+        .iter()
+        .map(|p| p.positions.len())
+        .sum();
+    let triangles: usize = clip_scene
+        .primitives
+        .iter()
+        .map(|p| p.triangles.len())
+        .sum();
+    println!(
+        "Clip-space scene {}: {} primitives, {vertices} vertices, {triangles} triangles",
+        clip_scene.scene_index,
+        clip_scene.primitives.len()
+    );
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {
