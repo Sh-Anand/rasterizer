@@ -6,7 +6,10 @@ use std::{
     process::ExitCode,
 };
 
-use rasterizer::{asset::GltfAsset, config::Config, vertex::transform_scene};
+use rasterizer::{
+    asset::GltfAsset, clip::clip_scene, config::Config, vertex::transform_scene,
+    viewport::project_scene,
+};
 
 const USAGE: &str = "Usage: rasterizer [scene-name|path.gltf|path.glb]\n\nWithout arguments, list bundled scenes. Example: cargo run -- kitchen";
 
@@ -127,10 +130,24 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let clip_scene = match transform_scene(&asset, &config) {
+    let transformed = match transform_scene(&asset, &config) {
         Ok(scene) => scene,
         Err(error) => {
             eprintln!("Failed to transform '{}': {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let clipped = match clip_scene(&transformed) {
+        Ok(scene) => scene,
+        Err(error) => {
+            eprintln!("Failed to clip '{}': {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let screen = match project_scene(&clipped, config.width, config.height) {
+        Ok(scene) => scene,
+        Err(error) => {
+            eprintln!("Failed to project '{}': {error}", path.display());
             return ExitCode::FAILURE;
         }
     };
@@ -164,21 +181,26 @@ fn main() -> ExitCode {
     println!("Buffers loaded: {}", asset.buffers.len());
     println!("Cameras: {}", document.cameras().len());
     println!("Animations: {}", document.animations().len());
-    let vertices: usize = clip_scene
+    let vertices: usize = transformed
         .primitives
         .iter()
         .map(|p| p.positions.len())
         .sum();
-    let triangles: usize = clip_scene
+    let triangles: usize = transformed
         .primitives
         .iter()
         .map(|p| p.triangles.len())
         .sum();
     println!(
         "Clip-space scene {}: {} primitives, {vertices} vertices, {triangles} triangles",
-        clip_scene.scene_index,
-        clip_scene.primitives.len()
+        transformed.scene_index,
+        transformed.primitives.len()
     );
+    let clipped_triangles: usize = clipped.primitives.iter().map(|p| p.triangles.len()).sum();
+    println!("After clipping: {clipped_triangles} triangles");
+    let screen_vertices: usize = screen.primitives.iter().map(|p| p.vertices.len()).sum();
+    let screen_triangles: usize = screen.primitives.iter().map(|p| p.triangles.len()).sum();
+    println!("Pixel-space: {screen_vertices} vertices, {screen_triangles} triangles");
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {
