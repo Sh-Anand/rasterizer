@@ -7,7 +7,7 @@ use std::{
 };
 
 use rasterizer::{
-    asset::GltfAsset, clip::clip_scene, config::Config, vertex::transform_scene,
+    asset::GltfAsset, backend::cpu, clip::clip_scene, config::Config, vertex::transform_scene,
     viewport::project_scene,
 };
 
@@ -151,6 +151,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    cpu::render(&screen, config.width, config.height);
 
     let document = &asset.document;
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
