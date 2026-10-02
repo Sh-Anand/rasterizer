@@ -11,6 +11,7 @@ use crate::{
 #[derive(Debug)]
 pub struct ClipPrimitive {
     pub source: PrimitiveSource,
+    pub mirrored: bool,
     pub vertices: Vec<ClipVertex>,
     pub triangles: Vec<Triangle>,
 }
@@ -19,6 +20,7 @@ pub struct ClipPrimitive {
 pub struct ClipVertex {
     pub position: Vec4,
     pub uv: Vec2,
+    pub emissive_uv: Vec2,
     /// World-space normal.
     pub normal: Vec3,
 }
@@ -126,7 +128,8 @@ fn transform_node(
         }
         let mvp = view_projection * model;
         let linear = Mat3::from_mat4(model);
-        if !linear.is_finite() || linear.determinant() == 0.0 {
+        let determinant = linear.determinant();
+        if !linear.is_finite() || determinant == 0.0 || !determinant.is_finite() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -167,25 +170,25 @@ fn transform_node(
                 .ok_or_else(|| invalid("Cannot read vertex positions"))?
                 .map(Vec3::from_array)
                 .collect();
-            let base_color_texture = primitive
-                .material()
-                .pbr_metallic_roughness()
-                .base_color_texture();
-            let tex_coord = base_color_texture
-                .as_ref()
-                .map_or(0, |texture| texture.tex_coord());
-            let uvs: Vec<Vec2> = match reader.read_tex_coords(tex_coord) {
-                Some(uvs) => uvs.into_f32().map(Vec2::from).collect(),
-                None if base_color_texture.is_some() => {
-                    return Err(invalid(
-                        "Missing texture coordinates for base-color texture",
-                    ));
+            let read_uvs = |texture: Option<gltf::texture::Info<'_>>| -> io::Result<Vec<Vec2>> {
+                let tex_coord = texture.as_ref().map_or(0, |texture| texture.tex_coord());
+                let uvs: Vec<Vec2> = match reader.read_tex_coords(tex_coord) {
+                    Some(uvs) => uvs.into_f32().map(Vec2::from).collect(),
+                    None if texture.is_some() => {
+                        return Err(invalid(&format!(
+                            "Missing TEXCOORD_{tex_coord} for material texture"
+                        )));
+                    }
+                    None => vec![Vec2::ZERO; positions.len()],
+                };
+                if uvs.len() != positions.len() || uvs.iter().any(|uv| !uv.is_finite()) {
+                    return Err(invalid("Invalid texture coordinates"));
                 }
-                None => vec![Vec2::ZERO; positions.len()],
+                Ok(uvs)
             };
-            if uvs.len() != positions.len() || uvs.iter().any(|uv| !uv.is_finite()) {
-                return Err(invalid("Invalid texture coordinates"));
-            }
+            let material = primitive.material();
+            let uvs = read_uvs(material.pbr_metallic_roughness().base_color_texture())?;
+            let emissive_uvs = read_uvs(material.emissive_texture())?;
             let indices: Vec<u32> = if primitive.indices().is_some() {
                 reader
                     .read_indices()
@@ -217,9 +220,11 @@ fn transform_node(
             let mut vertices: Vec<ClipVertex> = positions
                 .iter()
                 .zip(uvs)
-                .map(|(position, uv)| ClipVertex {
+                .zip(emissive_uvs)
+                .map(|((position, uv), emissive_uv)| ClipVertex {
                     position: mvp * position.extend(1.0),
                     uv,
+                    emissive_uv,
                     normal: Vec3::ZERO,
                 })
                 .collect();
@@ -261,6 +266,7 @@ fn transform_node(
                     primitive_index: primitive.index(),
                     material_index: primitive.material().index(),
                 },
+                mirrored: determinant < 0.0,
                 vertices,
                 triangles,
             });

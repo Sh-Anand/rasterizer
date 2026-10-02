@@ -123,7 +123,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let light = match DirectionalLight::new(config.light.direction) {
+    let light = match DirectionalLight::new(
+        config.light.direction,
+        config.light.color,
+        config.light.intensity,
+    ) {
         Ok(light) => light,
         Err(error) => {
             eprintln!("Invalid light: {error}");
@@ -231,7 +235,9 @@ fn main() -> ExitCode {
         rendered.covered_fragments
     );
     println!("Wrote {}", output_path.display());
-    println!("Shading: directional diffuse lighting; no shadows, mipmaps, or alpha blending.");
+    println!(
+        "Shading: directional diffuse lighting + emission; no shadows, mipmaps, or alpha blending."
+    );
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {

@@ -25,7 +25,7 @@ impl<'a> Texture<'a> {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "Base-color textures must use 8-bit channels",
+                    "Color textures must use 8-bit channels",
                 ));
             }
         };

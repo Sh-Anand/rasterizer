@@ -15,6 +15,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct LightConfig {
     pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
 }
 
 #[derive(Debug, Deserialize)]

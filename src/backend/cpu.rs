@@ -39,6 +39,13 @@ pub fn render(
             let vertices = triangle
                 .indices
                 .map(|index| primitive.vertices[index as usize]);
+            let [a, b, c] = vertices.map(|v| v.position.truncate().as_dvec2());
+            let area = (b - a).perp_dot(c - a);
+            // The viewport's downward Y axis reverses the projected winding.
+            let front_facing = (area < 0.0) != primitive.mirrored;
+            if area == 0.0 || (!front_facing && !material.double_sided) {
+                continue;
+            }
             rasterize_triangle(
                 vertices.map(|v| v.position.truncate()),
                 width,
@@ -53,14 +60,20 @@ pub fn render(
                     let [x, y] = sample.pixel;
                     let index = y as usize * width as usize + x as usize;
                     if depth < framebuffer.depth[index] {
-                        let (uv, normal) = interpolate_attributes(vertices, sample.barycentric);
-                        let color = material.base_color(uv);
+                        let attributes = interpolate_attributes(vertices, sample.barycentric);
+                        let color = material.base_color(attributes.uv);
                         if material.alpha_cutoff.is_some_and(|cutoff| color.w < cutoff) {
                             return;
                         }
+                        let normal = if front_facing {
+                            attributes.normal
+                        } else {
+                            -attributes.normal
+                        };
+                        let shaded = light.shade(color.truncate(), normal)
+                            + material.emission(attributes.emissive_uv);
                         framebuffer.depth[index] = depth;
-                        framebuffer.color[index] =
-                            encode_srgb(light.shade(color.truncate(), normal));
+                        framebuffer.color[index] = encode_srgb(shaded);
                     }
                 },
             );

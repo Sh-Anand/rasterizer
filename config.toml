@@ -12,3 +12,6 @@ far = 1000.0
 [light]
 # World-space direction toward the light.
 direction = [1.0, 3.0, 2.0]
+# Linear RGB and a brightness multiplier.
+color = [1.0, 1.0, 1.0]
+intensity = 1.0

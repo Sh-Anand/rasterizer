@@ -50,10 +50,13 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f64)
         (outside.position.as_dvec4() * (1.0 - t) + inside.position.as_dvec4() * t).as_vec4();
     position[axis] = -sign as f32 * position.w;
     let uv = (outside.uv.as_dvec2() * (1.0 - t) + inside.uv.as_dvec2() * t).as_vec2();
+    let emissive_uv =
+        (outside.emissive_uv.as_dvec2() * (1.0 - t) + inside.emissive_uv.as_dvec2() * t).as_vec2();
     let normal = (outside.normal.as_dvec3() * (1.0 - t) + inside.normal.as_dvec3() * t).as_vec3();
     ClipVertex {
         position,
         uv,
+        emissive_uv,
         normal,
     }
 }
@@ -61,6 +64,7 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f64)
 fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
     let mut output = ClipPrimitive {
         source: primitive.source,
+        mirrored: primitive.mirrored,
         vertices: Vec::new(),
         triangles: Vec::new(),
     };
