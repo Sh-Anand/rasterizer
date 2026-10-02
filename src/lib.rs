@@ -3,6 +3,7 @@ pub mod backend;
 pub mod clip;
 pub mod config;
 pub mod coverage;
+pub mod framebuffer;
 pub mod geometry;
 pub mod vertex;
 pub mod viewport;

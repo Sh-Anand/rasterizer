@@ -152,7 +152,23 @@ fn main() -> ExitCode {
         }
     };
 
-    let fragments = cpu::render(&screen, config.width, config.height);
+    let rendered = match cpu::render(&screen, config.width, config.height) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            eprintln!("Failed to render '{}': {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let output_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("output");
+    let output_path = output_dir.join(scene_name(&path)).with_extension("png");
+    if let Err(error) = fs::create_dir_all(&output_dir) {
+        eprintln!("Failed to create '{}': {error}", output_dir.display());
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = rendered.framebuffer.save(&output_path) {
+        eprintln!("Failed to save '{}': {error}", output_path.display());
+        return ExitCode::FAILURE;
+    }
 
     let document = &asset.document;
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
@@ -203,7 +219,11 @@ fn main() -> ExitCode {
     let screen_vertices: usize = screen.primitives.iter().map(|p| p.vertices.len()).sum();
     let screen_triangles: usize = screen.primitives.iter().map(|p| p.triangles.len()).sum();
     println!("Pixel-space: {screen_vertices} vertices, {screen_triangles} triangles");
-    println!("Covered fragments (before depth testing): {fragments}");
+    println!(
+        "Covered fragments (before depth testing): {}",
+        rendered.covered_fragments
+    );
+    println!("Wrote {}", output_path.display());
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {
