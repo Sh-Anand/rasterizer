@@ -15,3 +15,9 @@ direction = [1.0, 3.0, 2.0]
 # Linear RGB and a brightness multiplier.
 color = [1.0, 1.0, 1.0]
 intensity = 1.0
+
+[shadow]
+enabled = true
+resolution = 1024
+# Constant bias in normalized depth; slope bias is automatic.
+bias = 0.0001

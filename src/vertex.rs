@@ -8,7 +8,7 @@ use crate::{
     geometry::{PrimitiveSource, Triangle},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClipPrimitive {
     pub source: PrimitiveSource,
     pub mirrored: bool,
@@ -19,13 +19,14 @@ pub struct ClipPrimitive {
 #[derive(Debug, Clone, Copy)]
 pub struct ClipVertex {
     pub position: Vec4,
+    pub world_position: Vec3,
     pub uv: Vec2,
     pub emissive_uv: Vec2,
     /// World-space normal.
     pub normal: Vec3,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClipScene {
     pub scene_index: usize,
     pub primitives: Vec<ClipPrimitive>,
@@ -52,6 +53,28 @@ pub fn transform_scene(asset: &GltfAsset, config: &Config) -> io::Result<ClipSce
         scene_index: scene.index(),
         primitives,
     })
+}
+
+pub fn reproject_scene(scene: &ClipScene, view_projection: Mat4) -> io::Result<ClipScene> {
+    if !view_projection.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Non-finite projection matrix",
+        ));
+    }
+    let mut scene = scene.clone();
+    for primitive in &mut scene.primitives {
+        for vertex in &mut primitive.vertices {
+            vertex.position = view_projection * vertex.world_position.extend(1.0);
+            if !vertex.position.is_finite() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Non-finite reprojected position",
+                ));
+            }
+        }
+    }
+    Ok(scene)
 }
 
 fn camera_matrix(config: &Config) -> io::Result<Mat4> {
@@ -223,13 +246,17 @@ fn transform_node(
                 .zip(emissive_uvs)
                 .map(|((position, uv), emissive_uv)| ClipVertex {
                     position: mvp * position.extend(1.0),
+                    world_position: model.transform_point3(*position),
                     uv,
                     emissive_uv,
                     normal: Vec3::ZERO,
                 })
                 .collect();
-            if vertices.iter().any(|vertex| !vertex.position.is_finite()) {
-                return Err(invalid("Non-finite clip-space position"));
+            if vertices
+                .iter()
+                .any(|vertex| !vertex.position.is_finite() || !vertex.world_position.is_finite())
+            {
+                return Err(invalid("Non-finite vertex position"));
             }
             if let Some(normals) = reader.read_normals() {
                 if normals.len() != vertices.len() {

@@ -148,6 +148,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let shadow = if config.shadow.enabled {
+        match cpu::render_shadow_map(&transformed, &asset, &light, &config.shadow) {
+            Ok(shadow) => Some(shadow),
+            Err(error) => {
+                eprintln!(
+                    "Failed to build shadow map for '{}': {error}",
+                    path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let clipped = match clip_scene(&transformed) {
         Ok(scene) => scene,
         Err(error) => {
@@ -163,7 +177,14 @@ fn main() -> ExitCode {
         }
     };
 
-    let rendered = match cpu::render(&screen, &asset, config.width, config.height, &light) {
+    let rendered = match cpu::render(
+        &screen,
+        &asset,
+        config.width,
+        config.height,
+        &light,
+        shadow.as_ref(),
+    ) {
         Ok(rendered) => rendered,
         Err(error) => {
             eprintln!("Failed to render '{}': {error}", path.display());
@@ -179,6 +200,17 @@ fn main() -> ExitCode {
     if let Err(error) = rendered.framebuffer.save(&output_path) {
         eprintln!("Failed to save '{}': {error}", output_path.display());
         return ExitCode::FAILURE;
+    }
+    if let Some(shadow) = &shadow {
+        let shadow_path = output_dir.join(format!(
+            "{}-shadow.png",
+            scene_name(&path).to_string_lossy()
+        ));
+        if let Err(error) = shadow.depth.save(&shadow_path) {
+            eprintln!("Failed to save '{}': {error}", shadow_path.display());
+            return ExitCode::FAILURE;
+        }
+        println!("Wrote {}", shadow_path.display());
     }
 
     let document = &asset.document;
@@ -235,9 +267,15 @@ fn main() -> ExitCode {
         rendered.covered_fragments
     );
     println!("Wrote {}", output_path.display());
-    println!(
-        "Shading: directional diffuse lighting + emission; no shadows, mipmaps, or alpha blending."
-    );
+    if let Some(shadow) = &shadow {
+        println!(
+            "Shadows: {}x{} hard shadow map, constant depth bias {}",
+            shadow.depth.width, shadow.depth.height, config.shadow.bias
+        );
+    } else {
+        println!("Shadows: disabled");
+    }
+    println!("Shading: directional diffuse lighting + emission; no mipmaps or alpha blending.");
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {

@@ -9,6 +9,15 @@ pub struct Config {
     pub height: u32,
     pub camera: CameraConfig,
     pub light: LightConfig,
+    pub shadow: ShadowConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowConfig {
+    pub enabled: bool,
+    pub resolution: u32,
+    pub bias: f32,
 }
 
 #[derive(Debug, Deserialize)]

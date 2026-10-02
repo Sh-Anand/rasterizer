@@ -49,12 +49,16 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f64)
     let mut position =
         (outside.position.as_dvec4() * (1.0 - t) + inside.position.as_dvec4() * t).as_vec4();
     position[axis] = -sign as f32 * position.w;
+    let world_position = (outside.world_position.as_dvec3() * (1.0 - t)
+        + inside.world_position.as_dvec3() * t)
+        .as_vec3();
     let uv = (outside.uv.as_dvec2() * (1.0 - t) + inside.uv.as_dvec2() * t).as_vec2();
     let emissive_uv =
         (outside.emissive_uv.as_dvec2() * (1.0 - t) + inside.emissive_uv.as_dvec2() * t).as_vec2();
     let normal = (outside.normal.as_dvec3() * (1.0 - t) + inside.normal.as_dvec3() * t).as_vec3();
     ClipVertex {
         position,
+        world_position,
         uv,
         emissive_uv,
         normal,

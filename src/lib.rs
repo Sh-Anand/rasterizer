@@ -7,6 +7,7 @@ pub mod framebuffer;
 pub mod geometry;
 pub mod lighting;
 pub mod material;
+pub mod shadow;
 pub mod texture;
 pub mod vertex;
 pub mod viewport;

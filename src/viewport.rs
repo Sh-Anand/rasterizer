@@ -10,6 +10,7 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub struct ScreenVertex {
     pub position: Vec3,
+    pub world_position: Vec3,
     pub inv_w: f32,
     pub uv: Vec2,
     pub emissive_uv: Vec2,
@@ -32,6 +33,7 @@ pub struct ScreenScene {
 }
 
 pub struct FragmentAttributes {
+    pub world_position: Vec3,
     pub uv: Vec2,
     pub emissive_uv: Vec2,
     pub normal: Vec3,
@@ -90,6 +92,7 @@ fn project_vertex(vertex: ClipVertex, width: f32, height: f32) -> io::Result<Scr
     }
     Ok(ScreenVertex {
         position,
+        world_position: vertex.world_position,
         inv_w,
         uv: vertex.uv,
         emissive_uv: vertex.emissive_uv,
@@ -103,6 +106,11 @@ pub fn interpolate_attributes(
 ) -> FragmentAttributes {
     let weights: [f64; 3] =
         std::array::from_fn(|i| f64::from(barycentric[i]) * f64::from(vertices[i].inv_w));
+    let world_position: DVec3 = vertices
+        .iter()
+        .zip(weights)
+        .map(|(vertex, weight)| vertex.world_position.as_dvec3() * weight)
+        .sum();
     let uv: DVec2 = vertices
         .iter()
         .zip(weights)
@@ -120,6 +128,7 @@ pub fn interpolate_attributes(
         .sum();
     let sum = weights.iter().sum::<f64>();
     FragmentAttributes {
+        world_position: (world_position / sum).as_vec3(),
         uv: (uv / sum).as_vec2(),
         emissive_uv: (emissive_uv / sum).as_vec2(),
         normal: (normal / sum).normalize_or_zero().as_vec3(),

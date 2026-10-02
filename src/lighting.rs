@@ -38,4 +38,8 @@ impl DirectionalLight {
     pub fn shade(&self, base_color: Vec3, normal: Vec3) -> Vec3 {
         base_color * self.radiance * normal.dot(self.direction).max(0.0)
     }
+
+    pub fn direction(&self) -> Vec3 {
+        self.direction
+    }
 }
