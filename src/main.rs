@@ -152,7 +152,7 @@ fn main() -> ExitCode {
         }
     };
 
-    cpu::render(&screen, config.width, config.height);
+    let fragments = cpu::render(&screen, config.width, config.height);
 
     let document = &asset.document;
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
@@ -203,6 +203,7 @@ fn main() -> ExitCode {
     let screen_vertices: usize = screen.primitives.iter().map(|p| p.vertices.len()).sum();
     let screen_triangles: usize = screen.primitives.iter().map(|p| p.triangles.len()).sum();
     println!("Pixel-space: {screen_vertices} vertices, {screen_triangles} triangles");
+    println!("Covered fragments (before depth testing): {fragments}");
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {
