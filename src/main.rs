@@ -7,8 +7,8 @@ use std::{
 };
 
 use rasterizer::{
-    asset::GltfAsset, backend::cpu, clip::clip_scene, config::Config, vertex::transform_scene,
-    viewport::project_scene,
+    asset::GltfAsset, backend::cpu, clip::clip_scene, config::Config, lighting::DirectionalLight,
+    vertex::transform_scene, viewport::project_scene,
 };
 
 const USAGE: &str = "Usage: rasterizer [scene-name|path.gltf|path.glb]\n\nWithout arguments, list bundled scenes. Example: cargo run -- kitchen";
@@ -123,6 +123,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let light = match DirectionalLight::new(config.light.direction) {
+        Ok(light) => light,
+        Err(error) => {
+            eprintln!("Invalid light: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let asset = match GltfAsset::load(&path) {
         Ok(asset) => asset,
         Err(error) => {
@@ -152,7 +159,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let rendered = match cpu::render(&screen, &asset, config.width, config.height) {
+    let rendered = match cpu::render(&screen, &asset, config.width, config.height, &light) {
         Ok(rendered) => rendered,
         Err(error) => {
             eprintln!("Failed to render '{}': {error}", path.display());
@@ -224,7 +231,7 @@ fn main() -> ExitCode {
         rendered.covered_fragments
     );
     println!("Wrote {}", output_path.display());
-    println!("Shading: base color only; no lighting, mipmaps, or alpha blending.");
+    println!("Shading: directional diffuse lighting; no shadows, mipmaps, or alpha blending.");
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {

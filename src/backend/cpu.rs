@@ -4,9 +4,10 @@ use crate::{
     asset::GltfAsset,
     coverage::rasterize_triangle,
     framebuffer::Framebuffer,
+    lighting::DirectionalLight,
     material::Material,
     texture::encode_srgb,
-    viewport::{ScreenScene, interpolate_uv},
+    viewport::{ScreenScene, interpolate_attributes},
 };
 
 pub struct RenderOutput {
@@ -19,6 +20,7 @@ pub fn render(
     asset: &GltfAsset,
     width: u32,
     height: u32,
+    light: &DirectionalLight,
 ) -> io::Result<RenderOutput> {
     let materials = asset
         .document
@@ -51,13 +53,14 @@ pub fn render(
                     let [x, y] = sample.pixel;
                     let index = y as usize * width as usize + x as usize;
                     if depth < framebuffer.depth[index] {
-                        let uv = interpolate_uv(vertices, sample.barycentric);
+                        let (uv, normal) = interpolate_attributes(vertices, sample.barycentric);
                         let color = material.base_color(uv);
                         if material.alpha_cutoff.is_some_and(|cutoff| color.w < cutoff) {
                             return;
                         }
                         framebuffer.depth[index] = depth;
-                        framebuffer.color[index] = encode_srgb(color.truncate());
+                        framebuffer.color[index] =
+                            encode_srgb(light.shade(color.truncate(), normal));
                     }
                 },
             );

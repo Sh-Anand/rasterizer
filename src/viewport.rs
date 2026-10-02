@@ -1,6 +1,6 @@
 use std::io;
 
-use glam::{DVec2, Vec2, Vec3};
+use glam::{DVec2, DVec3, Vec2, Vec3};
 
 use crate::{
     geometry::{PrimitiveSource, Triangle},
@@ -12,6 +12,8 @@ pub struct ScreenVertex {
     pub position: Vec3,
     pub inv_w: f32,
     pub uv: Vec2,
+    /// World-space normal.
+    pub normal: Vec3,
 }
 
 #[derive(Debug)]
@@ -81,10 +83,11 @@ fn project_vertex(vertex: ClipVertex, width: f32, height: f32) -> io::Result<Scr
         position,
         inv_w,
         uv: vertex.uv,
+        normal: vertex.normal,
     })
 }
 
-pub fn interpolate_uv(vertices: [ScreenVertex; 3], barycentric: [f32; 3]) -> Vec2 {
+pub fn interpolate_attributes(vertices: [ScreenVertex; 3], barycentric: [f32; 3]) -> (Vec2, Vec3) {
     let weights: [f64; 3] =
         std::array::from_fn(|i| f64::from(barycentric[i]) * f64::from(vertices[i].inv_w));
     let uv: DVec2 = vertices
@@ -92,5 +95,14 @@ pub fn interpolate_uv(vertices: [ScreenVertex; 3], barycentric: [f32; 3]) -> Vec
         .zip(weights)
         .map(|(vertex, weight)| vertex.uv.as_dvec2() * weight)
         .sum();
-    (uv / weights.iter().sum::<f64>()).as_vec2()
+    let normal: DVec3 = vertices
+        .iter()
+        .zip(weights)
+        .map(|(vertex, weight)| vertex.normal.as_dvec3() * weight)
+        .sum();
+    let sum = weights.iter().sum::<f64>();
+    (
+        (uv / sum).as_vec2(),
+        (normal / sum).normalize_or_zero().as_vec3(),
+    )
 }

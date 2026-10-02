@@ -1,6 +1,6 @@
 use std::io;
 
-use glam::{Mat4, Vec2, Vec3, Vec4, camera::rh};
+use glam::{Mat3, Mat4, Vec2, Vec3, Vec4, camera::rh};
 
 use crate::{
     asset::GltfAsset,
@@ -19,6 +19,8 @@ pub struct ClipPrimitive {
 pub struct ClipVertex {
     pub position: Vec4,
     pub uv: Vec2,
+    /// World-space normal.
+    pub normal: Vec3,
 }
 
 #[derive(Debug)]
@@ -123,6 +125,23 @@ fn transform_node(
             ));
         }
         let mvp = view_projection * model;
+        let linear = Mat3::from_mat4(model);
+        if !linear.is_finite() || linear.determinant() == 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Node {}: Normal transform requires an invertible model matrix",
+                    node.index()
+                ),
+            ));
+        }
+        let normal_matrix = linear.inverse().transpose();
+        if !normal_matrix.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Node {}: Non-finite normal matrix", node.index()),
+            ));
+        }
         for primitive in mesh.primitives() {
             let invalid = |message: &str| {
                 io::Error::new(
@@ -143,14 +162,11 @@ fn transform_node(
             }
             let reader = primitive
                 .reader(|buffer| asset.buffers.get(buffer.index()).map(|data| &data.0[..]));
-            let positions: Vec<_> = reader
+            let positions: Vec<Vec3> = reader
                 .read_positions()
                 .ok_or_else(|| invalid("Cannot read vertex positions"))?
-                .map(|position| mvp * Vec3::from_array(position).extend(1.0))
+                .map(Vec3::from_array)
                 .collect();
-            if positions.iter().any(|position| !position.is_finite()) {
-                return Err(invalid("Non-finite clip-space position"));
-            }
             let base_color_texture = primitive
                 .material()
                 .pbr_metallic_roughness()
@@ -190,7 +206,7 @@ fn transform_node(
             {
                 return Err(invalid("Triangle index is outside the vertex buffer"));
             }
-            let triangles = indices
+            let mut triangles: Vec<Triangle> = indices
                 .chunks_exact(3)
                 .enumerate()
                 .map(|(source_index, triangle)| Triangle {
@@ -198,6 +214,46 @@ fn transform_node(
                     source_index,
                 })
                 .collect();
+            let mut vertices: Vec<ClipVertex> = positions
+                .iter()
+                .zip(uvs)
+                .map(|(position, uv)| ClipVertex {
+                    position: mvp * position.extend(1.0),
+                    uv,
+                    normal: Vec3::ZERO,
+                })
+                .collect();
+            if vertices.iter().any(|vertex| !vertex.position.is_finite()) {
+                return Err(invalid("Non-finite clip-space position"));
+            }
+            if let Some(normals) = reader.read_normals() {
+                if normals.len() != vertices.len() {
+                    return Err(invalid("Normal count does not match vertex count"));
+                }
+                for (vertex, normal) in vertices.iter_mut().zip(normals) {
+                    vertex.normal = (normal_matrix * Vec3::from_array(normal))
+                        .try_normalize()
+                        .ok_or_else(|| invalid("Invalid vertex normal"))?;
+                }
+            } else {
+                if primitive.get(&gltf::Semantic::Normals).is_some() {
+                    return Err(invalid("Cannot read vertex normals"));
+                }
+                u32::try_from(indices.len())
+                    .map_err(|_| invalid("Too many flat-shaded vertices"))?;
+                let mut flat_vertices = Vec::with_capacity(indices.len());
+                for triangle in &mut triangles {
+                    let [a, b, c] = triangle.indices.map(|index| positions[index as usize]);
+                    let normal = (normal_matrix * (b - a).cross(c - a)).normalize_or_zero();
+                    for index in &mut triangle.indices {
+                        let mut vertex = vertices[*index as usize];
+                        vertex.normal = normal;
+                        *index = flat_vertices.len() as u32;
+                        flat_vertices.push(vertex);
+                    }
+                }
+                vertices = flat_vertices;
+            }
             output.push(ClipPrimitive {
                 source: PrimitiveSource {
                     node_index: node.index(),
@@ -205,11 +261,7 @@ fn transform_node(
                     primitive_index: primitive.index(),
                     material_index: primitive.material().index(),
                 },
-                vertices: positions
-                    .into_iter()
-                    .zip(uvs)
-                    .map(|(position, uv)| ClipVertex { position, uv })
-                    .collect(),
+                vertices,
                 triangles,
             });
         }

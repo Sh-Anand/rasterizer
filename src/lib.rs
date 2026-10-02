@@ -5,6 +5,7 @@ pub mod config;
 pub mod coverage;
 pub mod framebuffer;
 pub mod geometry;
+pub mod lighting;
 pub mod material;
 pub mod texture;
 pub mod vertex;

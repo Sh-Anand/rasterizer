@@ -8,6 +8,13 @@ pub struct Config {
     pub width: u32,
     pub height: u32,
     pub camera: CameraConfig,
+    pub light: LightConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightConfig {
+    pub direction: [f32; 3],
 }
 
 #[derive(Debug, Deserialize)]
