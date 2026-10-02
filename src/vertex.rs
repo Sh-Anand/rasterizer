@@ -2,12 +2,17 @@ use std::io;
 
 use glam::{Mat4, Vec3, Vec4, camera::rh};
 
-use crate::{asset::GltfAsset, config::Config};
+use crate::{
+    asset::GltfAsset,
+    config::Config,
+    geometry::{PrimitiveSource, Triangle},
+};
 
 #[derive(Debug)]
 pub struct ClipPrimitive {
+    pub source: PrimitiveSource,
     pub positions: Vec<Vec4>,
-    pub triangles: Vec<[u32; 3]>,
+    pub triangles: Vec<Triangle>,
 }
 
 #[derive(Debug)]
@@ -162,9 +167,19 @@ fn transform_node(
             }
             let triangles = indices
                 .chunks_exact(3)
-                .map(|triangle| [triangle[0], triangle[1], triangle[2]])
+                .enumerate()
+                .map(|(source_index, triangle)| Triangle {
+                    indices: [triangle[0], triangle[1], triangle[2]],
+                    source_index,
+                })
                 .collect();
             output.push(ClipPrimitive {
+                source: PrimitiveSource {
+                    node_index: node.index(),
+                    mesh_index: mesh.index(),
+                    primitive_index: primitive.index(),
+                    material_index: primitive.material().index(),
+                },
                 positions,
                 triangles,
             });

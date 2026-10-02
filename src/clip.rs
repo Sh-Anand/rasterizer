@@ -2,7 +2,10 @@ use std::io;
 
 use glam::Vec4;
 
-use crate::vertex::{ClipPrimitive, ClipScene};
+use crate::{
+    geometry::Triangle,
+    vertex::{ClipPrimitive, ClipScene},
+};
 
 // Left, right, bottom, top, near, far: w + sign * coordinate >= 0.
 const PLANES: [(usize, f64); 6] = [
@@ -50,6 +53,7 @@ fn intersection(outside: Vec4, inside: Vec4, axis: usize, sign: f64) -> Vec4 {
 
 fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
     let mut output = ClipPrimitive {
+        source: primitive.source,
         positions: Vec::new(),
         triangles: Vec::new(),
     };
@@ -57,7 +61,9 @@ fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
     let mut scratch = Vec::with_capacity(9);
 
     for triangle in &primitive.triangles {
-        let vertices = triangle.map(|index| primitive.positions[index as usize]);
+        let vertices = triangle
+            .indices
+            .map(|index| primitive.positions[index as usize]);
         let codes = vertices.map(outcode);
         if codes[0] & codes[1] & codes[2] != 0 {
             continue;
@@ -99,9 +105,10 @@ fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
         let base = end - polygon.len() as u32;
         output.positions.extend_from_slice(&polygon);
         for index in 1..polygon.len() as u32 - 1 {
-            output
-                .triangles
-                .push([base, base + index, base + index + 1]);
+            output.triangles.push(Triangle {
+                indices: [base, base + index, base + index + 1],
+                source_index: triangle.source_index,
+            });
         }
     }
     Ok(output)

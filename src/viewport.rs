@@ -2,7 +2,10 @@ use std::io;
 
 use glam::{Vec3, Vec4};
 
-use crate::vertex::ClipScene;
+use crate::{
+    geometry::{PrimitiveSource, Triangle},
+    vertex::ClipScene,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScreenVertex {
@@ -12,8 +15,9 @@ pub struct ScreenVertex {
 
 #[derive(Debug)]
 pub struct ScreenPrimitive {
+    pub source: PrimitiveSource,
     pub vertices: Vec<ScreenVertex>,
-    pub triangles: Vec<[u32; 3]>,
+    pub triangles: Vec<Triangle>,
 }
 
 #[derive(Debug)]
@@ -39,6 +43,7 @@ pub fn project_scene(scene: &ClipScene, width: u32, height: u32) -> io::Result<S
                 .map(|&position| project_vertex(position, width as f32, height as f32))
                 .collect::<io::Result<_>>()?;
             Ok(ScreenPrimitive {
+                source: primitive.source,
                 vertices,
                 triangles: primitive.triangles.clone(),
             })
