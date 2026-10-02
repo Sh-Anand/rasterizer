@@ -4,7 +4,7 @@ use glam::Vec4;
 
 use crate::{
     geometry::Triangle,
-    vertex::{ClipPrimitive, ClipScene},
+    vertex::{ClipPrimitive, ClipScene, ClipVertex},
 };
 
 // Left, right, bottom, top, near, far: w + sign * coordinate >= 0.
@@ -42,19 +42,21 @@ fn outcode(vertex: Vec4) -> u8 {
     code
 }
 
-fn intersection(outside: Vec4, inside: Vec4, axis: usize, sign: f64) -> Vec4 {
-    let a = distance(outside, axis, sign);
-    let b = distance(inside, axis, sign);
+fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f64) -> ClipVertex {
+    let a = distance(outside.position, axis, sign);
+    let b = distance(inside.position, axis, sign);
     let t = a / (a - b);
-    let mut vertex = (outside.as_dvec4() * (1.0 - t) + inside.as_dvec4() * t).as_vec4();
-    vertex[axis] = -sign as f32 * vertex.w;
-    vertex
+    let mut position =
+        (outside.position.as_dvec4() * (1.0 - t) + inside.position.as_dvec4() * t).as_vec4();
+    position[axis] = -sign as f32 * position.w;
+    let uv = (outside.uv.as_dvec2() * (1.0 - t) + inside.uv.as_dvec2() * t).as_vec2();
+    ClipVertex { position, uv }
 }
 
 fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
     let mut output = ClipPrimitive {
         source: primitive.source,
-        positions: Vec::new(),
+        vertices: Vec::new(),
         triangles: Vec::new(),
     };
     let mut polygon = Vec::with_capacity(9);
@@ -63,8 +65,8 @@ fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
     for triangle in &primitive.triangles {
         let vertices = triangle
             .indices
-            .map(|index| primitive.positions[index as usize]);
-        let codes = vertices.map(outcode);
+            .map(|index| primitive.vertices[index as usize]);
+        let codes = vertices.map(|vertex| outcode(vertex.position));
         if codes[0] & codes[1] & codes[2] != 0 {
             continue;
         }
@@ -77,9 +79,9 @@ fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
                 }
                 scratch.clear();
                 let mut previous = *polygon.last().unwrap();
-                let mut previous_distance = distance(previous, axis, sign);
+                let mut previous_distance = distance(previous.position, axis, sign);
                 for &current in &polygon {
-                    let current_distance = distance(current, axis, sign);
+                    let current_distance = distance(current.position, axis, sign);
                     if previous_distance < 0.0 && current_distance > 0.0 {
                         scratch.push(intersection(previous, current, axis, sign));
                     } else if current_distance < 0.0 && previous_distance > 0.0 {
@@ -96,14 +98,14 @@ fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
         }
 
         // The homogeneous origin cannot undergo perspective division.
-        polygon.retain(|vertex| vertex.w > 0.0);
+        polygon.retain(|vertex| vertex.position.w > 0.0);
         if polygon.len() < 3 {
             continue;
         }
-        let end = u32::try_from(output.positions.len() + polygon.len())
+        let end = u32::try_from(output.vertices.len() + polygon.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Too many clipped vertices"))?;
         let base = end - polygon.len() as u32;
-        output.positions.extend_from_slice(&polygon);
+        output.vertices.extend_from_slice(&polygon);
         for index in 1..polygon.len() as u32 - 1 {
             output.triangles.push(Triangle {
                 indices: [base, base + index, base + index + 1],

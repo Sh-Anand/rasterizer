@@ -1,16 +1,17 @@
 use std::io;
 
-use glam::{Vec3, Vec4};
+use glam::{DVec2, Vec2, Vec3};
 
 use crate::{
     geometry::{PrimitiveSource, Triangle},
-    vertex::ClipScene,
+    vertex::{ClipScene, ClipVertex},
 };
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScreenVertex {
     pub position: Vec3,
     pub inv_w: f32,
+    pub uv: Vec2,
 }
 
 #[derive(Debug)]
@@ -38,9 +39,9 @@ pub fn project_scene(scene: &ClipScene, width: u32, height: u32) -> io::Result<S
         .iter()
         .map(|primitive| {
             let vertices = primitive
-                .positions
+                .vertices
                 .iter()
-                .map(|&position| project_vertex(position, width as f32, height as f32))
+                .map(|&vertex| project_vertex(vertex, width as f32, height as f32))
                 .collect::<io::Result<_>>()?;
             Ok(ScreenPrimitive {
                 source: primitive.source,
@@ -55,7 +56,8 @@ pub fn project_scene(scene: &ClipScene, width: u32, height: u32) -> io::Result<S
     })
 }
 
-fn project_vertex(clip: Vec4, width: f32, height: f32) -> io::Result<ScreenVertex> {
+fn project_vertex(vertex: ClipVertex, width: f32, height: f32) -> io::Result<ScreenVertex> {
+    let clip = vertex.position;
     if !clip.is_finite() || clip.w <= 0.0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -75,5 +77,20 @@ fn project_vertex(clip: Vec4, width: f32, height: f32) -> io::Result<ScreenVerte
             "Perspective division produced a non-finite result",
         ));
     }
-    Ok(ScreenVertex { position, inv_w })
+    Ok(ScreenVertex {
+        position,
+        inv_w,
+        uv: vertex.uv,
+    })
+}
+
+pub fn interpolate_uv(vertices: [ScreenVertex; 3], barycentric: [f32; 3]) -> Vec2 {
+    let weights: [f64; 3] =
+        std::array::from_fn(|i| f64::from(barycentric[i]) * f64::from(vertices[i].inv_w));
+    let uv: DVec2 = vertices
+        .iter()
+        .zip(weights)
+        .map(|(vertex, weight)| vertex.uv.as_dvec2() * weight)
+        .sum();
+    (uv / weights.iter().sum::<f64>()).as_vec2()
 }

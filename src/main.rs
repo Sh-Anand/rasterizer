@@ -152,7 +152,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let rendered = match cpu::render(&screen, config.width, config.height) {
+    let rendered = match cpu::render(&screen, &asset, config.width, config.height) {
         Ok(rendered) => rendered,
         Err(error) => {
             eprintln!("Failed to render '{}': {error}", path.display());
@@ -202,7 +202,7 @@ fn main() -> ExitCode {
     let vertices: usize = transformed
         .primitives
         .iter()
-        .map(|p| p.positions.len())
+        .map(|p| p.vertices.len())
         .sum();
     let triangles: usize = transformed
         .primitives
@@ -224,6 +224,7 @@ fn main() -> ExitCode {
         rendered.covered_fragments
     );
     println!("Wrote {}", output_path.display());
+    println!("Shading: base color only; no lighting, mipmaps, or alpha blending.");
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {

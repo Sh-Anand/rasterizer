@@ -1,6 +1,6 @@
 use std::io;
 
-use glam::{Mat4, Vec3, Vec4, camera::rh};
+use glam::{Mat4, Vec2, Vec3, Vec4, camera::rh};
 
 use crate::{
     asset::GltfAsset,
@@ -11,8 +11,14 @@ use crate::{
 #[derive(Debug)]
 pub struct ClipPrimitive {
     pub source: PrimitiveSource,
-    pub positions: Vec<Vec4>,
+    pub vertices: Vec<ClipVertex>,
     pub triangles: Vec<Triangle>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClipVertex {
+    pub position: Vec4,
+    pub uv: Vec2,
 }
 
 #[derive(Debug)]
@@ -145,6 +151,25 @@ fn transform_node(
             if positions.iter().any(|position| !position.is_finite()) {
                 return Err(invalid("Non-finite clip-space position"));
             }
+            let base_color_texture = primitive
+                .material()
+                .pbr_metallic_roughness()
+                .base_color_texture();
+            let tex_coord = base_color_texture
+                .as_ref()
+                .map_or(0, |texture| texture.tex_coord());
+            let uvs: Vec<Vec2> = match reader.read_tex_coords(tex_coord) {
+                Some(uvs) => uvs.into_f32().map(Vec2::from).collect(),
+                None if base_color_texture.is_some() => {
+                    return Err(invalid(
+                        "Missing texture coordinates for base-color texture",
+                    ));
+                }
+                None => vec![Vec2::ZERO; positions.len()],
+            };
+            if uvs.len() != positions.len() || uvs.iter().any(|uv| !uv.is_finite()) {
+                return Err(invalid("Invalid texture coordinates"));
+            }
             let indices: Vec<u32> = if primitive.indices().is_some() {
                 reader
                     .read_indices()
@@ -180,7 +205,11 @@ fn transform_node(
                     primitive_index: primitive.index(),
                     material_index: primitive.material().index(),
                 },
-                positions,
+                vertices: positions
+                    .into_iter()
+                    .zip(uvs)
+                    .map(|(position, uv)| ClipVertex { position, uv })
+                    .collect(),
                 triangles,
             });
         }
