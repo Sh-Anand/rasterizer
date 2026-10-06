@@ -5,8 +5,12 @@ edition = "2024"
 publish = false
 
 [dependencies]
+bincode = { version = "2", default-features = false, features = ["std", "derive"] }
+blake3 = "1"
 glam = "0.33"
 gltf = { version = "1.4.1", features = ["extensions", "extras"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
+xatlas-rs-v2 = "0.1.4"

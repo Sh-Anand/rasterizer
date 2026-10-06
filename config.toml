@@ -21,3 +21,10 @@ enabled = true
 resolution = 1024
 # Constant bias in normalized depth; slope bias is automatic.
 bias = 0.0001
+
+[bake]
+# Approximate atlas resolution; chart padding can increase the actual size.
+resolution = 32
+hemicube_resolution = 16
+# Surface offset as a fraction of the scene's diagonal.
+bias = 0.00001

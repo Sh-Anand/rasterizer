@@ -2,6 +2,9 @@ use std::io;
 
 use glam::Vec3;
 
+mod capture;
+pub(crate) use capture::CaptureScene;
+
 use crate::{
     asset::GltfAsset,
     clip::clip_scene,
@@ -9,11 +12,12 @@ use crate::{
     coverage::rasterize_triangle,
     framebuffer::{DepthBuffer, Framebuffer},
     lighting::Light,
+    lightmap::Lightmap,
     material::{Material, load_materials},
     shadow::{LightShadow, ShadowMap, ShadowProjection},
     texture::encode_srgb,
     vertex::{ClipScene, reproject_scene},
-    viewport::{ScreenScene, interpolate_attributes, project_scene},
+    viewport::{ScreenPrimitive, ScreenScene, interpolate_attributes, project_scene},
 };
 
 pub struct RenderOutput {
@@ -26,10 +30,32 @@ pub struct RenderLight {
     pub shadow: Option<LightShadow>,
 }
 
+pub enum Lighting<'a> {
+    Direct(&'a [RenderLight]),
+    Baked(&'a Lightmap),
+}
+
+pub fn direct_lighting(lights: &[RenderLight], position: Vec3, normal: Vec3) -> Vec3 {
+    lights
+        .iter()
+        .filter(|light| {
+            !light
+                .shadow
+                .as_ref()
+                .is_some_and(|shadow| shadow.is_shadowed(position))
+        })
+        .map(|light| light.light.shade(Vec3::ONE, normal, position))
+        .sum()
+}
+
 enum Pass<'a> {
     Shaded {
         color: &'a mut [[u8; 3]],
-        lights: &'a [RenderLight],
+        lighting: Lighting<'a>,
+    },
+    Capture {
+        color: &'a mut [Vec3],
+        lightmap: &'a Lightmap,
     },
     Shadow(ShadowProjection),
 }
@@ -39,16 +65,16 @@ pub fn render(
     asset: &GltfAsset,
     width: u32,
     height: u32,
-    lights: &[RenderLight],
+    lighting: Lighting<'_>,
 ) -> io::Result<RenderOutput> {
     let mut framebuffer = Framebuffer::new(width, height)?;
     let covered_fragments = draw(
-        scene,
+        &scene.primitives,
         &load_materials(asset)?,
         &mut framebuffer.depth,
         Pass::Shaded {
             color: &mut framebuffer.color,
-            lights,
+            lighting,
         },
     );
     Ok(RenderOutput {
@@ -60,17 +86,16 @@ pub fn render(
 pub fn prepare_lights(
     lights: Vec<Light>,
     scene: &ClipScene,
-    asset: &GltfAsset,
+    materials: &[Material<'_>],
     config: &ShadowConfig,
 ) -> io::Result<Vec<RenderLight>> {
-    let materials = load_materials(asset)?;
     lights
         .into_iter()
         .map(|light| {
             let shadow = if config.enabled {
                 let mut shadow = LightShadow::new(scene, &light, config)?;
                 for map in shadow.maps_mut() {
-                    draw_shadow_map(scene, &materials, map)?;
+                    draw_shadow_map(scene, materials, map)?;
                 }
                 Some(shadow)
             } else {
@@ -91,7 +116,7 @@ fn draw_shadow_map(
         project_scene(&clipped, shadow.depth.width, shadow.depth.height)?
     };
     draw(
-        &screen,
+        &screen.primitives,
         materials,
         &mut shadow.depth,
         Pass::Shadow(shadow.projection),
@@ -100,7 +125,7 @@ fn draw_shadow_map(
 }
 
 fn draw(
-    scene: &ScreenScene,
+    primitives: &[ScreenPrimitive],
     materials: &[Material<'_>],
     depth_buffer: &mut DepthBuffer,
     mut pass: Pass<'_>,
@@ -112,7 +137,7 @@ fn draw(
     let default_material = Material::default();
     let (width, height) = (depth_buffer.width, depth_buffer.height);
     let mut covered_fragments = 0;
-    for primitive in &scene.primitives {
+    for primitive in primitives {
         let material = primitive
             .source
             .material_index
@@ -127,7 +152,11 @@ fn draw(
             let area = ab.truncate().perp_dot(ac.truncate());
             // The viewport's downward Y axis reverses the projected winding.
             let front_facing = (area < 0.0) != primitive.mirrored;
-            if area == 0.0 || (!front_facing && !material.double_sided) {
+            if area == 0.0
+                || (!front_facing
+                    && !material.double_sided
+                    && !matches!(pass, Pass::Capture { .. }))
+            {
                 continue;
             }
             let depths = vertices.map(|v| {
@@ -186,29 +215,35 @@ fn draw(
                         return;
                     }
                     depth_buffer.values[index] = depth;
-                    if let Pass::Shaded { color, lights } = &mut pass {
-                        let normal = if front_facing {
-                            attributes.normal
-                        } else {
-                            -attributes.normal
-                        };
-                        let mut diffuse = Vec3::ZERO;
-                        for light in *lights {
-                            if light
-                                .shadow
-                                .as_ref()
-                                .is_some_and(|map| map.is_shadowed(attributes.world_position))
-                            {
-                                continue;
-                            }
-                            diffuse += light.light.shade(
-                                base_color.truncate(),
-                                normal,
-                                attributes.world_position,
-                            );
+                    match &mut pass {
+                        Pass::Shaded { color, lighting } => {
+                            let illumination = match lighting {
+                                Lighting::Direct(lights) => {
+                                    let normal = if front_facing {
+                                        attributes.normal
+                                    } else {
+                                        -attributes.normal
+                                    };
+                                    direct_lighting(lights, attributes.world_position, normal)
+                                }
+                                Lighting::Baked(lightmap) => {
+                                    lightmap.sample(attributes.lightmap_uv, !front_facing)
+                                }
+                            };
+                            let diffuse = base_color.truncate() * illumination;
+                            color[index] =
+                                encode_srgb(diffuse + material.emission(attributes.emissive_uv));
                         }
-                        color[index] =
-                            encode_srgb(diffuse + material.emission(attributes.emissive_uv));
+                        Pass::Capture { color, lightmap } => {
+                            // Single-sided backs block light, but don't reflect it.
+                            color[index] = if front_facing || material.double_sided {
+                                base_color.truncate()
+                                    * lightmap.sample(attributes.lightmap_uv, !front_facing)
+                            } else {
+                                Vec3::ZERO
+                            };
+                        }
+                        Pass::Shadow(_) => {}
                     }
                 },
             );

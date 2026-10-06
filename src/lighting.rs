@@ -2,7 +2,7 @@ use std::io;
 
 use glam::Vec3;
 
-use crate::{asset::GltfAsset, config::LightConfig, material::load_materials, vertex::ClipScene};
+use crate::{config::LightConfig, material::Material, vertex::ClipScene};
 
 pub enum Light {
     Directional(DirectionalLight),
@@ -127,7 +127,7 @@ impl AreaLight {
 
 pub fn collect_lights(
     scene: &ClipScene,
-    asset: &GltfAsset,
+    materials: &[Material<'_>],
     config: &LightConfig,
 ) -> io::Result<Vec<Light>> {
     let mut lights = vec![Light::Directional(DirectionalLight::new(
@@ -135,7 +135,6 @@ pub fn collect_lights(
         config.color,
         config.intensity,
     )?)];
-    let materials = load_materials(asset)?;
     for primitive in &scene.primitives {
         let Some(index) = primitive.source.material_index else {
             continue;

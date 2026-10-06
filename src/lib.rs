@@ -1,11 +1,13 @@
 pub mod asset;
 pub mod backend;
+pub mod bake;
 pub mod clip;
 pub mod config;
 pub mod coverage;
 pub mod framebuffer;
 pub mod geometry;
 pub mod lighting;
+pub mod lightmap;
 pub mod material;
 pub mod shadow;
 pub mod texture;

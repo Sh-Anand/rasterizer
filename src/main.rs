@@ -9,15 +9,15 @@ use std::{
 use rasterizer::{
     asset::GltfAsset,
     backend::cpu,
+    bake,
     clip::clip_scene,
     config::Config,
-    lighting::{Light, collect_lights},
-    shadow::LightShadow,
+    lightmap::{BakedLighting, cache_key},
     vertex::transform_scene,
     viewport::project_scene,
 };
 
-const USAGE: &str = "Usage: rasterizer [scene-name|path.gltf|path.glb]\n\nWithout arguments, list bundled scenes. Example: cargo run -- kitchen";
+const USAGE: &str = "Usage: rasterizer [bake] <scene-name|path.gltf|path.glb>\n\nWithout arguments, list bundled scenes.\nBake: cargo run --release -- bake kitchen\nRender: cargo run --release -- kitchen";
 
 fn scene_paths() -> io::Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -94,111 +94,89 @@ fn resolve_scene(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);
     let Some(path) = args.next() else {
-        return match list_scenes() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Failed to list scenes: {error}");
-                ExitCode::FAILURE
-            }
-        };
+        list_scenes().map_err(|error| format!("Failed to list scenes: {error}"))?;
+        return Ok(());
     };
 
+    let baking = path == "bake";
+    let path = if baking {
+        args.next()
+            .ok_or_else(|| format!("Expected a scene to bake.\n\n{USAGE}"))?
+    } else {
+        path
+    };
     if args.next().is_some() {
-        eprintln!("Expected one scene name or asset path.\n\n{USAGE}");
-        return ExitCode::FAILURE;
+        return Err(format!("Expected one scene name or asset path.\n\n{USAGE}").into());
     }
     if path == "--help" || path == "-h" {
         println!("{USAGE}");
-        return ExitCode::SUCCESS;
+        return Ok(());
     }
 
-    let path = match resolve_scene(Path::new(&path)) {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
+    let path = resolve_scene(Path::new(&path))?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config_path = root.join("config.toml");
+    let config = Config::load(&config_path)
+        .map_err(|error| format!("Failed to load '{}': {error}", config_path.display()))?;
+    let asset = GltfAsset::load(&path)
+        .map_err(|error| format!("Failed to load '{}': {error}", path.display()))?;
+    let mut transformed = transform_scene(&asset, &config)
+        .map_err(|error| format!("Failed to transform '{}': {error}", path.display()))?;
+    let output_dir = root.join("output");
+    fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("Failed to create '{}': {error}", output_dir.display()))?;
+    let cache_path = output_dir
+        .join(scene_name(&path))
+        .with_extension("lightmap");
+    let lighting = if baking {
+        let lighting = bake::bake(&mut transformed, &asset, &config)
+            .map_err(|error| format!("Failed to bake '{}': {error}", path.display()))?;
+        lighting
+            .save(&cache_path)
+            .map_err(|error| format!("Failed to save '{}': {error}", cache_path.display()))?;
+        println!("Baked {}", cache_path.display());
+        lighting
+    } else {
+        let lighting =
+            BakedLighting::load(&cache_path, cache_key(&asset, &config)?).map_err(|error| {
+                format!(
+                    "Failed to load '{}': {error}\nRun: cargo run --release -- bake {}",
+                    cache_path.display(),
+                    path.display()
+                )
+            })?;
+        lighting.apply(&mut transformed)?;
+        lighting
     };
-    let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
-    let config = match Config::load(&config_path) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("Failed to load '{}': {error}", config_path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let asset = match GltfAsset::load(&path) {
-        Ok(asset) => asset,
-        Err(error) => {
-            eprintln!("Failed to load '{}': {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let transformed = match transform_scene(&asset, &config) {
-        Ok(scene) => scene,
-        Err(error) => {
-            eprintln!("Failed to transform '{}': {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let lights = match collect_lights(&transformed, &asset, &config.light)
-        .and_then(|lights| cpu::prepare_lights(lights, &transformed, &asset, &config.shadow))
-    {
-        Ok(lights) => lights,
-        Err(error) => {
-            eprintln!("Failed to prepare lights for '{}': {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let shadow = lights.iter().find_map(|light| match &light.shadow {
-        Some(LightShadow::Directional(map)) => Some(map),
-        _ => None,
-    });
-    let clipped = match clip_scene(&transformed) {
-        Ok(scene) => scene,
-        Err(error) => {
-            eprintln!("Failed to clip '{}': {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let screen = match project_scene(&clipped, config.width, config.height) {
-        Ok(scene) => scene,
-        Err(error) => {
-            eprintln!("Failed to project '{}': {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let rendered = match cpu::render(&screen, &asset, config.width, config.height, &lights) {
-        Ok(rendered) => rendered,
-        Err(error) => {
-            eprintln!("Failed to render '{}': {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let output_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("output");
+    let clipped = clip_scene(&transformed)
+        .map_err(|error| format!("Failed to clip '{}': {error}", path.display()))?;
+    let screen = project_scene(&clipped, config.width, config.height)
+        .map_err(|error| format!("Failed to project '{}': {error}", path.display()))?;
+    let rendered = cpu::render(
+        &screen,
+        &asset,
+        config.width,
+        config.height,
+        cpu::Lighting::Baked(&lighting.lightmap),
+    )
+    .map_err(|error| format!("Failed to render '{}': {error}", path.display()))?;
     let output_path = output_dir.join(scene_name(&path)).with_extension("png");
-    if let Err(error) = fs::create_dir_all(&output_dir) {
-        eprintln!("Failed to create '{}': {error}", output_dir.display());
-        return ExitCode::FAILURE;
-    }
-    if let Err(error) = rendered.framebuffer.save(&output_path) {
-        eprintln!("Failed to save '{}': {error}", output_path.display());
-        return ExitCode::FAILURE;
-    }
-    if let Some(shadow) = shadow {
-        let shadow_path = output_dir.join(format!(
-            "{}-shadow.png",
-            scene_name(&path).to_string_lossy()
-        ));
-        if let Err(error) = shadow.depth.save(&shadow_path) {
-            eprintln!("Failed to save '{}': {error}", shadow_path.display());
-            return ExitCode::FAILURE;
-        }
-        println!("Wrote {}", shadow_path.display());
-    }
+    rendered
+        .framebuffer
+        .save(&output_path)
+        .map_err(|error| format!("Failed to save '{}': {error}", output_path.display()))?;
 
     let document = &asset.document;
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
@@ -254,30 +232,15 @@ fn main() -> ExitCode {
         rendered.covered_fragments
     );
     println!("Wrote {}", output_path.display());
-    if config.shadow.enabled {
-        let maps: usize = lights
-            .iter()
-            .filter_map(|light| light.shadow.as_ref())
-            .map(|shadow| shadow.maps().len())
-            .sum();
-        println!(
-            "Shadows: {maps} depth views at {}x{}, constant depth bias {}",
-            config.shadow.resolution, config.shadow.resolution, config.shadow.bias
-        );
-    } else {
-        println!("Shadows: disabled");
-    }
-    let area_lights = lights
-        .iter()
-        .filter(|light| matches!(light.light, Light::Area(_)))
-        .count();
-    println!("Lights: 1 directional, {area_lights} emissive triangles (centroid samples)");
-    println!("Shading: diffuse lighting + emission; no mipmaps or alpha blending.");
+    println!(
+        "Lighting: {}x{} baked direct + one indirect bounce; no runtime light or shadow passes",
+        lighting.lightmap.width, lighting.lightmap.height
+    );
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {
         println!("Declared extensions: {}", extensions.join(", "));
         println!("Extension metadata is retained; extension behavior is not implemented.");
     }
-    ExitCode::SUCCESS
+    Ok(())
 }

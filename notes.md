@@ -20,6 +20,16 @@ Approximate each triangle's diffuse illumination with one sample at its world-sp
 
 Use rasterized shadow maps at each emitting triangle's centroid: five cube faces aligned to its normal for a one-sided emitter, six for a two-sided emitter. Each sample produces a hard shadow; this does not integrate visibility over the emitting area or model indirect lighting. Rendering and storage scale with the number of emitting triangles. We keep the per-triangle baseline rather than grouping emitters for now.
 
-Perspective shadow faces store linear light-view depth, normalized by their far distance, with a half-texel slope bias and the configured constant bias. Their range fits the full scene; the near plane is 0.0001 times the far distance, so very nearby occluders can be clipped. The first implementation retains all light maps for the shading pass.
+Perspective shadow faces store linear light-view depth, normalized by their far distance, with a half-texel slope bias and the configured constant bias. Their range fits the full scene; the near plane is 0.0001 times the far distance, so very nearby occluders can be clipped. All light maps remain resident during direct-light baking.
 
 Lighting and visibility will remain rasterization-based, including future GI; no ray tracing or shadow rays.
+
+## Baked lighting
+
+Bake direct diffuse lighting and exactly one diffuse indirect bounce for static geometry, materials, and lights. Store linear floating-point lighting for a white receiver; apply the receiver's base color and emission when rendering. This is not a bake of view-dependent specular lighting.
+
+Generate a separate lightmap UV atlas with xatlas, giving each placed mesh instance its own space without changing material UVs or source triangle identities. Two-sided surfaces have independent front/back lighting. Chart padding supports bilinear filtering; sub-texel triangles use a centroid sample. The requested resolution is approximate: many small charts can make the atlas substantially larger.
+
+For indirect lighting, rasterize a five-face hemicube at each surface sample and integrate incoming light with cosine/solid-angle weights. Captures read only the completed direct-light bake, multiplied by the visible surface's base color. Exclude emission because emissive triangles already contribute to direct lighting; never feed indirect results back into these captures. Single-sided backfaces block light but do not reflect it.
+
+Keep the initial bake coarse: this CPU method is expensive, and low lightmap/hemicube resolutions can blur shadows, miss small features, and leak light. Cache the result using scene, material, light, and bake settings; camera and image-resolution changes do not require rebaking.

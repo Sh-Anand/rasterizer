@@ -22,6 +22,7 @@ pub struct ClipVertex {
     pub world_position: Vec3,
     pub uv: Vec2,
     pub emissive_uv: Vec2,
+    pub lightmap_uv: Vec2,
     /// World-space normal.
     pub normal: Vec3,
 }
@@ -249,6 +250,7 @@ fn transform_node(
                     world_position: model.transform_point3(*position),
                     uv,
                     emissive_uv,
+                    lightmap_uv: Vec2::ZERO,
                     normal: Vec3::ZERO,
                 })
                 .collect();

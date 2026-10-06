@@ -55,17 +55,20 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f64)
     let uv = (outside.uv.as_dvec2() * (1.0 - t) + inside.uv.as_dvec2() * t).as_vec2();
     let emissive_uv =
         (outside.emissive_uv.as_dvec2() * (1.0 - t) + inside.emissive_uv.as_dvec2() * t).as_vec2();
+    let lightmap_uv =
+        (outside.lightmap_uv.as_dvec2() * (1.0 - t) + inside.lightmap_uv.as_dvec2() * t).as_vec2();
     let normal = (outside.normal.as_dvec3() * (1.0 - t) + inside.normal.as_dvec3() * t).as_vec3();
     ClipVertex {
         position,
         world_position,
         uv,
         emissive_uv,
+        lightmap_uv,
         normal,
     }
 }
 
-fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
+pub(crate) fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
     let mut output = ClipPrimitive {
         source: primitive.source,
         mirrored: primitive.mirrored,

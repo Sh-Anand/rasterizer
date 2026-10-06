@@ -4,7 +4,7 @@ use glam::{DVec2, DVec3, Vec2, Vec3};
 
 use crate::{
     geometry::{PrimitiveSource, Triangle},
-    vertex::{ClipScene, ClipVertex},
+    vertex::{ClipPrimitive, ClipScene, ClipVertex},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -14,6 +14,7 @@ pub struct ScreenVertex {
     pub inv_w: f32,
     pub uv: Vec2,
     pub emissive_uv: Vec2,
+    pub lightmap_uv: Vec2,
     /// World-space normal.
     pub normal: Vec3,
 }
@@ -36,6 +37,7 @@ pub struct FragmentAttributes {
     pub world_position: Vec3,
     pub uv: Vec2,
     pub emissive_uv: Vec2,
+    pub lightmap_uv: Vec2,
     pub normal: Vec3,
 }
 
@@ -49,23 +51,28 @@ pub fn project_scene(scene: &ClipScene, width: u32, height: u32) -> io::Result<S
     let primitives = scene
         .primitives
         .iter()
-        .map(|primitive| {
-            let vertices = primitive
-                .vertices
-                .iter()
-                .map(|&vertex| project_vertex(vertex, width as f32, height as f32))
-                .collect::<io::Result<_>>()?;
-            Ok(ScreenPrimitive {
-                source: primitive.source,
-                mirrored: primitive.mirrored,
-                vertices,
-                triangles: primitive.triangles.clone(),
-            })
-        })
+        .map(|primitive| project_primitive(primitive, width, height))
         .collect::<io::Result<_>>()?;
     Ok(ScreenScene {
         scene_index: scene.scene_index,
         primitives,
+    })
+}
+
+pub(crate) fn project_primitive(
+    primitive: &ClipPrimitive,
+    width: u32,
+    height: u32,
+) -> io::Result<ScreenPrimitive> {
+    Ok(ScreenPrimitive {
+        source: primitive.source,
+        mirrored: primitive.mirrored,
+        vertices: primitive
+            .vertices
+            .iter()
+            .map(|&vertex| project_vertex(vertex, width as f32, height as f32))
+            .collect::<io::Result<_>>()?,
+        triangles: primitive.triangles.clone(),
     })
 }
 
@@ -96,6 +103,7 @@ fn project_vertex(vertex: ClipVertex, width: f32, height: f32) -> io::Result<Scr
         inv_w,
         uv: vertex.uv,
         emissive_uv: vertex.emissive_uv,
+        lightmap_uv: vertex.lightmap_uv,
         normal: vertex.normal,
     })
 }
@@ -126,11 +134,17 @@ pub fn interpolate_attributes(
         .zip(weights)
         .map(|(vertex, weight)| vertex.normal.as_dvec3() * weight)
         .sum();
+    let lightmap_uv: DVec2 = vertices
+        .iter()
+        .zip(weights)
+        .map(|(vertex, weight)| vertex.lightmap_uv.as_dvec2() * weight)
+        .sum();
     let sum = weights.iter().sum::<f64>();
     FragmentAttributes {
         world_position: (world_position / sum).as_vec3(),
         uv: (uv / sum).as_vec2(),
         emissive_uv: (emissive_uv / sum).as_vec2(),
+        lightmap_uv: (lightmap_uv / sum).as_vec2(),
         normal: (normal / sum).normalize_or_zero().as_vec3(),
     }
 }
