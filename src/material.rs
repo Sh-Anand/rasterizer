@@ -2,7 +2,15 @@ use std::io;
 
 use glam::{Vec2, Vec3, Vec4};
 
-use crate::texture::Texture;
+use crate::{asset::GltfAsset, texture::Texture};
+
+pub fn load_materials(asset: &GltfAsset) -> io::Result<Vec<Material<'_>>> {
+    asset
+        .document
+        .materials()
+        .map(|material| Material::new(material, &asset.images))
+        .collect()
+}
 
 pub struct Material<'a> {
     pub base_color_factor: Vec4,

@@ -7,8 +7,14 @@ use std::{
 };
 
 use rasterizer::{
-    asset::GltfAsset, backend::cpu, clip::clip_scene, config::Config, lighting::DirectionalLight,
-    vertex::transform_scene, viewport::project_scene,
+    asset::GltfAsset,
+    backend::cpu,
+    clip::clip_scene,
+    config::Config,
+    lighting::{Light, collect_lights},
+    shadow::LightShadow,
+    vertex::transform_scene,
+    viewport::project_scene,
 };
 
 const USAGE: &str = "Usage: rasterizer [scene-name|path.gltf|path.glb]\n\nWithout arguments, list bundled scenes. Example: cargo run -- kitchen";
@@ -123,17 +129,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let light = match DirectionalLight::new(
-        config.light.direction,
-        config.light.color,
-        config.light.intensity,
-    ) {
-        Ok(light) => light,
-        Err(error) => {
-            eprintln!("Invalid light: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
     let asset = match GltfAsset::load(&path) {
         Ok(asset) => asset,
         Err(error) => {
@@ -148,20 +143,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let shadow = if config.shadow.enabled {
-        match cpu::render_shadow_map(&transformed, &asset, &light, &config.shadow) {
-            Ok(shadow) => Some(shadow),
-            Err(error) => {
-                eprintln!(
-                    "Failed to build shadow map for '{}': {error}",
-                    path.display()
-                );
-                return ExitCode::FAILURE;
-            }
+    let lights = match collect_lights(&transformed, &asset, &config.light)
+        .and_then(|lights| cpu::prepare_lights(lights, &transformed, &asset, &config.shadow))
+    {
+        Ok(lights) => lights,
+        Err(error) => {
+            eprintln!("Failed to prepare lights for '{}': {error}", path.display());
+            return ExitCode::FAILURE;
         }
-    } else {
-        None
     };
+    let shadow = lights.iter().find_map(|light| match &light.shadow {
+        Some(LightShadow::Directional(map)) => Some(map),
+        _ => None,
+    });
     let clipped = match clip_scene(&transformed) {
         Ok(scene) => scene,
         Err(error) => {
@@ -177,14 +171,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let rendered = match cpu::render(
-        &screen,
-        &asset,
-        config.width,
-        config.height,
-        &light,
-        shadow.as_ref(),
-    ) {
+    let rendered = match cpu::render(&screen, &asset, config.width, config.height, &lights) {
         Ok(rendered) => rendered,
         Err(error) => {
             eprintln!("Failed to render '{}': {error}", path.display());
@@ -201,7 +188,7 @@ fn main() -> ExitCode {
         eprintln!("Failed to save '{}': {error}", output_path.display());
         return ExitCode::FAILURE;
     }
-    if let Some(shadow) = &shadow {
+    if let Some(shadow) = shadow {
         let shadow_path = output_dir.join(format!(
             "{}-shadow.png",
             scene_name(&path).to_string_lossy()
@@ -267,15 +254,25 @@ fn main() -> ExitCode {
         rendered.covered_fragments
     );
     println!("Wrote {}", output_path.display());
-    if let Some(shadow) = &shadow {
+    if config.shadow.enabled {
+        let maps: usize = lights
+            .iter()
+            .filter_map(|light| light.shadow.as_ref())
+            .map(|shadow| shadow.maps().len())
+            .sum();
         println!(
-            "Shadows: {}x{} hard shadow map, constant depth bias {}",
-            shadow.depth.width, shadow.depth.height, config.shadow.bias
+            "Shadows: {maps} depth views at {}x{}, constant depth bias {}",
+            config.shadow.resolution, config.shadow.resolution, config.shadow.bias
         );
     } else {
         println!("Shadows: disabled");
     }
-    println!("Shading: directional diffuse lighting + emission; no mipmaps or alpha blending.");
+    let area_lights = lights
+        .iter()
+        .filter(|light| matches!(light.light, Light::Area(_)))
+        .count();
+    println!("Lights: 1 directional, {area_lights} emissive triangles (centroid samples)");
+    println!("Shading: diffuse lighting + emission; no mipmaps or alpha blending.");
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {

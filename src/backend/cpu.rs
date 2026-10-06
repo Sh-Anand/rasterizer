@@ -8,9 +8,9 @@ use crate::{
     config::ShadowConfig,
     coverage::rasterize_triangle,
     framebuffer::{DepthBuffer, Framebuffer},
-    lighting::DirectionalLight,
-    material::Material,
-    shadow::ShadowMap,
+    lighting::Light,
+    material::{Material, load_materials},
+    shadow::{LightShadow, ShadowMap, ShadowProjection},
     texture::encode_srgb,
     vertex::{ClipScene, reproject_scene},
     viewport::{ScreenScene, interpolate_attributes, project_scene},
@@ -21,10 +21,17 @@ pub struct RenderOutput {
     pub covered_fragments: u64,
 }
 
-struct Shading<'a> {
-    color: &'a mut [[u8; 3]],
-    light: &'a DirectionalLight,
-    shadow: Option<&'a ShadowMap>,
+pub struct RenderLight {
+    pub light: Light,
+    pub shadow: Option<LightShadow>,
+}
+
+enum Pass<'a> {
+    Shaded {
+        color: &'a mut [[u8; 3]],
+        lights: &'a [RenderLight],
+    },
+    Shadow(ShadowProjection),
 }
 
 pub fn render(
@@ -32,52 +39,76 @@ pub fn render(
     asset: &GltfAsset,
     width: u32,
     height: u32,
-    light: &DirectionalLight,
-    shadow: Option<&ShadowMap>,
+    lights: &[RenderLight],
 ) -> io::Result<RenderOutput> {
     let mut framebuffer = Framebuffer::new(width, height)?;
     let covered_fragments = draw(
         scene,
-        asset,
+        &load_materials(asset)?,
         &mut framebuffer.depth,
-        Some(Shading {
+        Pass::Shaded {
             color: &mut framebuffer.color,
-            light,
-            shadow,
-        }),
-    )?;
+            lights,
+        },
+    );
     Ok(RenderOutput {
         framebuffer,
         covered_fragments,
     })
 }
 
-pub fn render_shadow_map(
+pub fn prepare_lights(
+    lights: Vec<Light>,
     scene: &ClipScene,
     asset: &GltfAsset,
-    light: &DirectionalLight,
     config: &ShadowConfig,
-) -> io::Result<ShadowMap> {
-    let mut shadow = ShadowMap::new(scene, light, config)?;
+) -> io::Result<Vec<RenderLight>> {
+    let materials = load_materials(asset)?;
+    lights
+        .into_iter()
+        .map(|light| {
+            let shadow = if config.enabled {
+                let mut shadow = LightShadow::new(scene, &light, config)?;
+                for map in shadow.maps_mut() {
+                    draw_shadow_map(scene, &materials, map)?;
+                }
+                Some(shadow)
+            } else {
+                None
+            };
+            Ok(RenderLight { light, shadow })
+        })
+        .collect()
+}
+
+fn draw_shadow_map(
+    scene: &ClipScene,
+    materials: &[Material<'_>],
+    shadow: &mut ShadowMap,
+) -> io::Result<()> {
     let screen = {
         let clipped = clip_scene(&reproject_scene(scene, shadow.view_projection)?)?;
         project_scene(&clipped, shadow.depth.width, shadow.depth.height)?
     };
-    draw(&screen, asset, &mut shadow.depth, None)?;
-    Ok(shadow)
+    draw(
+        &screen,
+        materials,
+        &mut shadow.depth,
+        Pass::Shadow(shadow.projection),
+    );
+    Ok(())
 }
 
 fn draw(
     scene: &ScreenScene,
-    asset: &GltfAsset,
+    materials: &[Material<'_>],
     depth_buffer: &mut DepthBuffer,
-    mut shading: Option<Shading<'_>>,
-) -> io::Result<u64> {
-    let materials = asset
-        .document
-        .materials()
-        .map(|material| Material::new(material, &asset.images))
-        .collect::<io::Result<Vec<_>>>()?;
+    mut pass: Pass<'_>,
+) -> u64 {
+    let linear_far = match &pass {
+        Pass::Shadow(ShadowProjection::Perspective { far }) => Some(*far),
+        _ => None,
+    };
     let default_material = Material::default();
     let (width, height) = (depth_buffer.width, depth_buffer.height);
     let mut covered_fragments = 0;
@@ -99,11 +130,21 @@ fn draw(
             if area == 0.0 || (!front_facing && !material.double_sided) {
                 continue;
             }
-            // Bound the depth change between a sample and its texel center.
-            let depth_bias = if shading.is_none() {
-                let dx = (ab.z * ac.y - ac.z * ab.y) / area;
-                let dy = (ab.x * ac.z - ac.x * ab.z) / area;
-                (0.5 * (dx.abs() + dy.abs())) as f32
+            let depths = vertices.map(|v| {
+                if linear_far.is_some() {
+                    v.inv_w
+                } else {
+                    v.position.z
+                }
+            });
+            // Both projected depth and reciprocal light-view depth are affine in screen space.
+            let depth_bias = if matches!(pass, Pass::Shadow(_)) {
+                let db = f64::from(depths[1]) - f64::from(depths[0]);
+                let dc = f64::from(depths[2]) - f64::from(depths[0]);
+                let dx = (db * ac.y - dc * ab.y) / area;
+                let dy = (ab.x * dc - ac.x * db) / area;
+                let bias = (0.5 * (dx.abs() + dy.abs())) as f32;
+                if linear_far.is_some() { -bias } else { bias }
             } else {
                 0.0
             };
@@ -113,47 +154,65 @@ fn draw(
                 height,
                 |sample| {
                     covered_fragments += 1;
-                    let depth = vertices
+                    let depth = depths
                         .iter()
                         .zip(sample.barycentric)
-                        .map(|(vertex, weight)| vertex.position.z * weight)
+                        .map(|(depth, weight)| depth * weight)
                         .sum::<f32>()
                         + depth_bias;
+                    let depth = if let Some(far) = linear_far {
+                        if depth <= 0.0 {
+                            return;
+                        }
+                        depth.recip() / far
+                    } else {
+                        depth
+                    };
                     let [x, y] = sample.pixel;
                     let index = y as usize * width as usize + x as usize;
                     if !depth.is_finite() || depth >= depth_buffer.values[index] {
                         return;
                     }
-                    if shading.is_none() && material.alpha_cutoff.is_none() {
+                    if matches!(pass, Pass::Shadow(_)) && material.alpha_cutoff.is_none() {
                         depth_buffer.values[index] = depth;
                         return;
                     }
                     let attributes = interpolate_attributes(vertices, sample.barycentric);
-                    let color = material.base_color(attributes.uv);
-                    if material.alpha_cutoff.is_some_and(|cutoff| color.w < cutoff) {
+                    let base_color = material.base_color(attributes.uv);
+                    if material
+                        .alpha_cutoff
+                        .is_some_and(|cutoff| base_color.w < cutoff)
+                    {
                         return;
                     }
                     depth_buffer.values[index] = depth;
-                    if let Some(shading) = &mut shading {
+                    if let Pass::Shaded { color, lights } = &mut pass {
                         let normal = if front_facing {
                             attributes.normal
                         } else {
                             -attributes.normal
                         };
-                        let diffuse = if shading
-                            .shadow
-                            .is_some_and(|map| map.is_shadowed(attributes.world_position))
-                        {
-                            Vec3::ZERO
-                        } else {
-                            shading.light.shade(color.truncate(), normal)
-                        };
-                        shading.color[index] =
+                        let mut diffuse = Vec3::ZERO;
+                        for light in *lights {
+                            if light
+                                .shadow
+                                .as_ref()
+                                .is_some_and(|map| map.is_shadowed(attributes.world_position))
+                            {
+                                continue;
+                            }
+                            diffuse += light.light.shade(
+                                base_color.truncate(),
+                                normal,
+                                attributes.world_position,
+                            );
+                        }
+                        color[index] =
                             encode_srgb(diffuse + material.emission(attributes.emissive_uv));
                     }
                 },
             );
         }
     }
-    Ok(covered_fragments)
+    covered_fragments
 }
