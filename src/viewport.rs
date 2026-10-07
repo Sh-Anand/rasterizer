@@ -14,6 +14,7 @@ pub struct ScreenVertex {
     pub inv_w: f32,
     pub uv: Vec2,
     pub metallic_roughness_uv: Vec2,
+    pub occlusion_uv: Vec2,
     pub emissive_uv: Vec2,
     pub lightmap_uv: Vec2,
     /// World-space normal.
@@ -38,6 +39,7 @@ pub struct FragmentAttributes {
     pub world_position: Vec3,
     pub uv: Vec2,
     pub metallic_roughness_uv: Vec2,
+    pub occlusion_uv: Vec2,
     pub emissive_uv: Vec2,
     pub lightmap_uv: Vec2,
     pub normal: Vec3,
@@ -105,6 +107,7 @@ fn project_vertex(vertex: ClipVertex, width: f32, height: f32) -> io::Result<Scr
         inv_w,
         uv: vertex.uv,
         metallic_roughness_uv: vertex.metallic_roughness_uv,
+        occlusion_uv: vertex.occlusion_uv,
         emissive_uv: vertex.emissive_uv,
         lightmap_uv: vertex.lightmap_uv,
         normal: vertex.normal,
@@ -142,6 +145,11 @@ pub fn interpolate_attributes(
         .zip(weights)
         .map(|(vertex, weight)| vertex.normal.as_dvec3() * weight)
         .sum();
+    let occlusion_uv: DVec2 = vertices
+        .iter()
+        .zip(weights)
+        .map(|(vertex, weight)| vertex.occlusion_uv.as_dvec2() * weight)
+        .sum();
     let lightmap_uv: DVec2 = vertices
         .iter()
         .zip(weights)
@@ -152,6 +160,7 @@ pub fn interpolate_attributes(
         world_position: (world_position / sum).as_vec3(),
         uv: (uv / sum).as_vec2(),
         metallic_roughness_uv: (metallic_roughness_uv / sum).as_vec2(),
+        occlusion_uv: (occlusion_uv / sum).as_vec2(),
         emissive_uv: (emissive_uv / sum).as_vec2(),
         lightmap_uv: (lightmap_uv / sum).as_vec2(),
         normal: (normal / sum).normalize_or_zero().as_vec3(),

@@ -22,6 +22,7 @@ pub struct ClipVertex {
     pub world_position: Vec3,
     pub uv: Vec2,
     pub metallic_roughness_uv: Vec2,
+    pub occlusion_uv: Vec2,
     pub emissive_uv: Vec2,
     pub lightmap_uv: Vec2,
     /// World-space normal.
@@ -195,11 +196,12 @@ fn transform_node(
                 .ok_or_else(|| invalid("Cannot read vertex positions"))?
                 .map(Vec3::from_array)
                 .collect();
-            let read_uvs = |texture: Option<gltf::texture::Info<'_>>| -> io::Result<Vec<Vec2>> {
-                let tex_coord = texture.as_ref().map_or(0, |texture| texture.tex_coord());
+            let read_uvs = |tex_coord: Option<u32>| -> io::Result<Vec<Vec2>> {
+                let required = tex_coord.is_some();
+                let tex_coord = tex_coord.unwrap_or(0);
                 let uvs: Vec<Vec2> = match reader.read_tex_coords(tex_coord) {
                     Some(uvs) => uvs.into_f32().map(Vec2::from).collect(),
-                    None if texture.is_some() => {
+                    None if required => {
                         return Err(invalid(&format!(
                             "Missing TEXCOORD_{tex_coord} for material texture"
                         )));
@@ -213,9 +215,14 @@ fn transform_node(
             };
             let material = primitive.material();
             let pbr = material.pbr_metallic_roughness();
-            let uvs = read_uvs(pbr.base_color_texture())?;
-            let metallic_roughness_uvs = read_uvs(pbr.metallic_roughness_texture())?;
-            let emissive_uvs = read_uvs(material.emissive_texture())?;
+            let uvs = read_uvs(pbr.base_color_texture().map(|info| info.tex_coord()))?;
+            let metallic_roughness_uvs = read_uvs(
+                pbr.metallic_roughness_texture()
+                    .map(|info| info.tex_coord()),
+            )?;
+            let occlusion_uvs =
+                read_uvs(material.occlusion_texture().map(|info| info.tex_coord()))?;
+            let emissive_uvs = read_uvs(material.emissive_texture().map(|info| info.tex_coord()))?;
             let indices: Vec<u32> = if primitive.indices().is_some() {
                 reader
                     .read_indices()
@@ -252,6 +259,7 @@ fn transform_node(
                     world_position: model.transform_point3(*position),
                     uv: uvs[i],
                     metallic_roughness_uv: metallic_roughness_uvs[i],
+                    occlusion_uv: occlusion_uvs[i],
                     emissive_uv: emissive_uvs[i],
                     lightmap_uv: Vec2::ZERO,
                     normal: Vec3::ZERO,

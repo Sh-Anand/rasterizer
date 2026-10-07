@@ -36,7 +36,7 @@ For indirect lighting, rasterize a five-face hemicube at each surface sample and
 
 Keep the initial bake coarse: this CPU method is expensive, and low lightmap/hemicube resolutions can blur shadows, miss small features, and leak light. Cache the result using scene, material, light, and bake settings; camera and image-resolution changes do not require rebaking.
 
-The indirect bake remains Lambertian: both bounce captures and the final receiver omit angle-dependent diffuse Fresnel weighting. Its RGB lightmap does not retain incoming light directions, so removing this approximation would require storing directional lighting and doing more runtime work. The bake uses mesh normals; indirect normal-map detail would need higher-resolution normal-aware baking or directional lightmaps. Normal maps and AO remain deferred; an AO map can later attenuate the indirect map without affecting runtime direct light.
+The indirect bake remains Lambertian: both bounce captures and the final receiver omit angle-dependent diffuse Fresnel weighting. Its RGB lightmap does not retain incoming light directions, so removing this approximation would require storing directional lighting and doing more runtime work. The bake uses mesh normals; indirect normal-map detail would need higher-resolution normal-aware baking or directional lightmaps. Normal maps remain deferred.
 
 ## Runtime material shading
 
