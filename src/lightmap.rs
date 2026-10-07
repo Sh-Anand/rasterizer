@@ -147,7 +147,7 @@ impl BakedLighting {
 
 pub fn cache_key(asset: &GltfAsset, config: &Config) -> io::Result<[u8; 32]> {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"rasterizer-lightmap-v2");
+    hash.update(b"rasterizer-lightmap-v3");
     hash.update(
         &gltf::json::serialize::to_vec(asset.document.as_json()).map_err(io::Error::other)?,
     );

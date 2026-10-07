@@ -58,31 +58,22 @@ pub fn bake(
     if count == 0 {
         return Ok(baked);
     }
-    eprintln!("Baking {width}x{height} lightmap ({count} surface samples)...");
+    eprintln!("Baking {width}x{height} one-bounce lightmap ({count} surface samples)...");
     for (i, sample) in samples.iter().enumerate() {
         if let Some(sample) = sample {
             baked.lightmap.front[i] =
-                cpu::direct_lighting(lights, sample.position, sample.normal).to_array();
+                cpu::lambertian_lighting(lights, sample.position, sample.normal).to_array();
             if sample.double_sided {
                 baked.lightmap.back[i] =
-                    cpu::direct_lighting(lights, sample.position, -sample.normal).to_array();
+                    cpu::lambertian_lighting(lights, sample.position, -sample.normal).to_array();
             }
         }
     }
     dilate(&mut baked.lightmap, &valid, &owners);
 
-    let mut indirect = bake_indirect(scene, materials, &baked.lightmap, &samples, settings)?;
-    dilate(&mut indirect, &valid, &owners);
-    for (dst, src) in baked
-        .lightmap
-        .front
-        .iter_mut()
-        .chain(&mut baked.lightmap.back)
-        .flatten()
-        .zip(indirect.front.iter().chain(&indirect.back).flatten())
-    {
-        *dst += src;
-    }
+    // The direct map is only temporary input to the bounce captures.
+    baked.lightmap = bake_indirect(scene, materials, &baked.lightmap, &samples, settings)?;
+    dilate(&mut baked.lightmap, &valid, &owners);
     Ok(baked)
 }
 

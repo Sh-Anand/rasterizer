@@ -2,6 +2,8 @@ use std::f32::consts::PI;
 
 use glam::Vec3;
 
+const DIELECTRIC_F0: f32 = 0.04;
+
 pub fn diffuse_color(base_color: Vec3, metallic: f32) -> Vec3 {
     base_color * (1.0 - metallic)
 }
@@ -16,12 +18,12 @@ impl Brdf {
     pub fn new(base_color: Vec3, metallic: f32, roughness: f32) -> Self {
         Self {
             diffuse: diffuse_color(base_color, metallic),
-            f0: Vec3::splat(0.04).lerp(base_color, metallic),
+            f0: Vec3::splat(DIELECTRIC_F0).lerp(base_color, metallic),
             alpha_squared: roughness.clamp(0.045, 1.0).powi(4),
         }
     }
 
-    pub fn specular(&self, normal: Vec3, view: Vec3, light: Vec3) -> Vec3 {
+    pub fn evaluate(&self, normal: Vec3, view: Vec3, light: Vec3) -> Vec3 {
         let no_v = normal.dot(view).clamp(0.0, 1.0);
         let no_l = normal.dot(light).clamp(0.0, 1.0);
         if no_v == 0.0 || no_l == 0.0 {
@@ -39,7 +41,9 @@ impl Brdf {
         let visibility = 0.5
             / (no_l * (no_v * no_v * (1.0 - a2) + a2).sqrt()
                 + no_v * (no_l * no_l * (1.0 - a2) + a2).sqrt());
-        let fresnel = self.f0 + (Vec3::ONE - self.f0) * (1.0 - vo_h).powi(5);
-        fresnel * (distribution * visibility)
+        let fresnel_weight = (1.0 - vo_h).powi(5);
+        let fresnel = self.f0 + (Vec3::ONE - self.f0) * fresnel_weight;
+        let dielectric_fresnel = DIELECTRIC_F0 + (1.0 - DIELECTRIC_F0) * fresnel_weight;
+        self.diffuse * ((1.0 - dielectric_fresnel) / PI) + fresnel * (distribution * visibility)
     }
 }

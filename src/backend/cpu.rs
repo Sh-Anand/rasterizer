@@ -17,7 +17,9 @@ use crate::{
     shadow::{LightShadow, ShadowMap, ShadowProjection},
     texture::encode_srgb,
     vertex::{ClipScene, reproject_scene},
-    viewport::{ScreenPrimitive, ScreenScene, interpolate_attributes, project_scene},
+    viewport::{
+        FragmentAttributes, ScreenPrimitive, ScreenScene, interpolate_attributes, project_scene,
+    },
 };
 
 pub struct RenderOutput {
@@ -31,12 +33,40 @@ pub struct RenderLight {
 }
 
 pub struct Lighting<'a> {
-    pub lightmap: Option<&'a Lightmap>,
+    pub indirect: Option<&'a Lightmap>,
     pub lights: &'a [RenderLight],
     pub camera_position: Vec3,
 }
 
-pub fn direct_lighting(lights: &[RenderLight], position: Vec3, normal: Vec3) -> Vec3 {
+impl Lighting<'_> {
+    fn shade(
+        &self,
+        material: &Material<'_>,
+        attributes: &FragmentAttributes,
+        base_color: Vec3,
+        front_facing: bool,
+    ) -> Vec3 {
+        let normal = if front_facing {
+            attributes.normal
+        } else {
+            -attributes.normal
+        };
+        let view = (self.camera_position - attributes.world_position).normalize_or_zero();
+        let (metallic, roughness) = material.metallic_roughness(attributes.metallic_roughness_uv);
+        let brdf = Brdf::new(base_color, metallic, roughness);
+        let mut reflected = self.indirect.map_or(Vec3::ZERO, |map| {
+            brdf.diffuse * map.sample(attributes.lightmap_uv, !front_facing)
+        });
+        for sample in visible_lights(self.lights, attributes.world_position) {
+            reflected += brdf.evaluate(normal, view, sample.direction)
+                * sample.irradiance
+                * normal.dot(sample.direction).max(0.0);
+        }
+        reflected + material.emission(attributes.emissive_uv)
+    }
+}
+
+pub(crate) fn lambertian_lighting(lights: &[RenderLight], position: Vec3, normal: Vec3) -> Vec3 {
     visible_lights(lights, position)
         .map(|sample| sample.diffuse(normal))
         .sum()
@@ -229,30 +259,12 @@ fn draw(
                     depth_buffer.values[index] = depth;
                     match &mut pass {
                         Pass::Shaded { color, lighting } => {
-                            let normal = if front_facing {
-                                attributes.normal
-                            } else {
-                                -attributes.normal
-                            };
-                            let view = (lighting.camera_position - attributes.world_position)
-                                .normalize_or_zero();
-                            let (metallic, roughness) =
-                                material.metallic_roughness(attributes.metallic_roughness_uv);
-                            let brdf = Brdf::new(base_color.truncate(), metallic, roughness);
-                            let mut reflected = lighting.lightmap.map_or(Vec3::ZERO, |map| {
-                                brdf.diffuse * map.sample(attributes.lightmap_uv, !front_facing)
-                            });
-                            for sample in visible_lights(lighting.lights, attributes.world_position)
-                            {
-                                if lighting.lightmap.is_none() {
-                                    reflected += brdf.diffuse * sample.diffuse(normal);
-                                }
-                                reflected += brdf.specular(normal, view, sample.direction)
-                                    * sample.irradiance
-                                    * normal.dot(sample.direction).max(0.0);
-                            }
-                            color[index] =
-                                encode_srgb(reflected + material.emission(attributes.emissive_uv));
+                            color[index] = encode_srgb(lighting.shade(
+                                material,
+                                &attributes,
+                                base_color.truncate(),
+                                front_facing,
+                            ));
                         }
                         Pass::Capture { color, lightmap } => {
                             // Single-sided backs block light, but don't reflect it.

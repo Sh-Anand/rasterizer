@@ -185,7 +185,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.width,
         config.height,
         cpu::Lighting {
-            lightmap: Some(&lighting.lightmap),
+            indirect: Some(&lighting.lightmap),
             lights: &lights,
             camera_position: config.camera.position.into(),
         },
@@ -252,7 +252,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("Wrote {}", output_path.display());
     println!(
-        "Lighting: {}x{} baked diffuse (direct + one bounce), plus shadowed runtime direct specular",
+        "Lighting: {}x{} baked one-bounce indirect; shadowed runtime direct diffuse + specular",
         lighting.lightmap.width, lighting.lightmap.height
     );
 
