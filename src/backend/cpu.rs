@@ -6,14 +6,14 @@ mod capture;
 pub(crate) use capture::CaptureScene;
 
 use crate::{
-    asset::GltfAsset,
+    brdf::{Brdf, diffuse_color},
     clip::clip_scene,
     config::ShadowConfig,
     coverage::rasterize_triangle,
     framebuffer::{DepthBuffer, Framebuffer},
-    lighting::Light,
+    lighting::{Light, LightSample},
     lightmap::Lightmap,
-    material::{Material, load_materials},
+    material::Material,
     shadow::{LightShadow, ShadowMap, ShadowProjection},
     texture::encode_srgb,
     vertex::{ClipScene, reproject_scene},
@@ -30,22 +30,28 @@ pub struct RenderLight {
     pub shadow: Option<LightShadow>,
 }
 
-pub enum Lighting<'a> {
-    Direct(&'a [RenderLight]),
-    Baked(&'a Lightmap),
+pub struct Lighting<'a> {
+    pub lightmap: Option<&'a Lightmap>,
+    pub lights: &'a [RenderLight],
+    pub camera_position: Vec3,
 }
 
 pub fn direct_lighting(lights: &[RenderLight], position: Vec3, normal: Vec3) -> Vec3 {
+    visible_lights(lights, position)
+        .map(|sample| sample.diffuse(normal))
+        .sum()
+}
+
+fn visible_lights(lights: &[RenderLight], position: Vec3) -> impl Iterator<Item = LightSample> {
     lights
         .iter()
-        .filter(|light| {
+        .filter(move |light| {
             !light
                 .shadow
                 .as_ref()
                 .is_some_and(|shadow| shadow.is_shadowed(position))
         })
-        .map(|light| light.light.shade(Vec3::ONE, normal, position))
-        .sum()
+        .filter_map(move |light| light.light.sample(position))
 }
 
 enum Pass<'a> {
@@ -62,15 +68,21 @@ enum Pass<'a> {
 
 pub fn render(
     scene: &ScreenScene,
-    asset: &GltfAsset,
+    materials: &[Material<'_>],
     width: u32,
     height: u32,
     lighting: Lighting<'_>,
 ) -> io::Result<RenderOutput> {
+    if !lighting.camera_position.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Non-finite camera position",
+        ));
+    }
     let mut framebuffer = Framebuffer::new(width, height)?;
     let covered_fragments = draw(
         &scene.primitives,
-        &load_materials(asset)?,
+        materials,
         &mut framebuffer.depth,
         Pass::Shaded {
             color: &mut framebuffer.color,
@@ -217,29 +229,38 @@ fn draw(
                     depth_buffer.values[index] = depth;
                     match &mut pass {
                         Pass::Shaded { color, lighting } => {
-                            let illumination = match lighting {
-                                Lighting::Direct(lights) => {
-                                    let normal = if front_facing {
-                                        attributes.normal
-                                    } else {
-                                        -attributes.normal
-                                    };
-                                    direct_lighting(lights, attributes.world_position, normal)
-                                }
-                                Lighting::Baked(lightmap) => {
-                                    lightmap.sample(attributes.lightmap_uv, !front_facing)
-                                }
+                            let normal = if front_facing {
+                                attributes.normal
+                            } else {
+                                -attributes.normal
                             };
-                            let diffuse = base_color.truncate() * illumination;
+                            let view = (lighting.camera_position - attributes.world_position)
+                                .normalize_or_zero();
+                            let (metallic, roughness) =
+                                material.metallic_roughness(attributes.metallic_roughness_uv);
+                            let brdf = Brdf::new(base_color.truncate(), metallic, roughness);
+                            let mut reflected = lighting.lightmap.map_or(Vec3::ZERO, |map| {
+                                brdf.diffuse * map.sample(attributes.lightmap_uv, !front_facing)
+                            });
+                            for sample in visible_lights(lighting.lights, attributes.world_position)
+                            {
+                                if lighting.lightmap.is_none() {
+                                    reflected += brdf.diffuse * sample.diffuse(normal);
+                                }
+                                reflected += brdf.specular(normal, view, sample.direction)
+                                    * sample.irradiance
+                                    * normal.dot(sample.direction).max(0.0);
+                            }
                             color[index] =
-                                encode_srgb(diffuse + material.emission(attributes.emissive_uv));
+                                encode_srgb(reflected + material.emission(attributes.emissive_uv));
                         }
                         Pass::Capture { color, lightmap } => {
                             // Single-sided backs block light, but don't reflect it.
                             color[index] = if front_facing || material.double_sided {
-                                base_color.truncate()
-                                    * (1.0 - material.metallic(attributes.metallic_roughness_uv))
-                                    * lightmap.sample(attributes.lightmap_uv, !front_facing)
+                                diffuse_color(
+                                    base_color.truncate(),
+                                    material.metallic(attributes.metallic_roughness_uv),
+                                ) * lightmap.sample(attributes.lightmap_uv, !front_facing)
                             } else {
                                 Vec3::ZERO
                             };

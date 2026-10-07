@@ -1,6 +1,7 @@
 pub mod asset;
 pub mod backend;
 pub mod bake;
+pub mod brdf;
 pub mod clip;
 pub mod config;
 pub mod coverage;

@@ -19,6 +19,7 @@ pub struct Material<'a> {
     pub base_color_factor: Vec4,
     pub base_color_texture: Option<Texture<'a>>,
     pub metallic_factor: f32,
+    pub roughness_factor: f32,
     pub metallic_roughness_texture: Option<Texture<'a>>,
     pub emissive_factor: Vec3,
     pub emissive_texture: Option<Texture<'a>>,
@@ -32,6 +33,7 @@ impl Default for Material<'_> {
             base_color_factor: Vec4::ONE,
             base_color_texture: None,
             metallic_factor: 1.0,
+            roughness_factor: 1.0,
             metallic_roughness_texture: None,
             emissive_factor: Vec3::ZERO,
             emissive_texture: None,
@@ -48,6 +50,7 @@ impl<'a> Material<'a> {
             base_color_factor: Vec4::from(pbr.base_color_factor()),
             base_color_texture: load_texture(pbr.base_color_texture(), images, ColorSpace::Srgb)?,
             metallic_factor: pbr.metallic_factor(),
+            roughness_factor: pbr.roughness_factor(),
             metallic_roughness_texture: load_texture(
                 pbr.metallic_roughness_texture(),
                 images,
@@ -70,11 +73,18 @@ impl<'a> Material<'a> {
     }
 
     pub fn metallic(&self, uv: Vec2) -> f32 {
-        self.metallic_factor
-            * self
-                .metallic_roughness_texture
-                .as_ref()
-                .map_or(1.0, |texture| texture.sample(uv).z)
+        self.metallic_roughness(uv).0
+    }
+
+    pub fn metallic_roughness(&self, uv: Vec2) -> (f32, f32) {
+        let sample = self
+            .metallic_roughness_texture
+            .as_ref()
+            .map_or(Vec4::ONE, |texture| texture.sample(uv));
+        (
+            self.metallic_factor * sample.z,
+            self.roughness_factor * sample.y,
+        )
     }
 
     pub fn emission(&self, uv: Vec2) -> Vec3 {

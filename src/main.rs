@@ -12,7 +12,9 @@ use rasterizer::{
     bake,
     clip::clip_scene,
     config::Config,
+    lighting::collect_lights,
     lightmap::{BakedLighting, cache_key},
+    material::load_materials,
     vertex::transform_scene,
     viewport::project_scene,
 };
@@ -140,24 +142,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cache_path = output_dir
         .join(scene_name(&path))
         .with_extension("lightmap");
-    let lighting = if baking {
-        let lighting = bake::bake(&mut transformed, &asset, &config)
-            .map_err(|error| format!("Failed to bake '{}': {error}", path.display()))?;
-        lighting
-            .save(&cache_path)
-            .map_err(|error| format!("Failed to save '{}': {error}", cache_path.display()))?;
-        println!("Baked {}", cache_path.display());
-        lighting
+    let cached = if baking {
+        None
     } else {
-        let lighting =
+        Some(
             BakedLighting::load(&cache_path, cache_key(&asset, &config)?).map_err(|error| {
                 format!(
                     "Failed to load '{}': {error}\nRun: cargo run --release -- bake {}",
                     cache_path.display(),
                     path.display()
                 )
-            })?;
+            })?,
+        )
+    };
+    let materials = load_materials(&asset)?;
+    eprintln!("Preparing direct-light shadows...");
+    let lights = cpu::prepare_lights(
+        collect_lights(&transformed, &materials, &config.light)?,
+        &transformed,
+        &materials,
+        &config.shadow,
+    )?;
+    let lighting = if let Some(lighting) = cached {
         lighting.apply(&mut transformed)?;
+        lighting
+    } else {
+        let lighting = bake::bake(&mut transformed, &asset, &materials, &lights, &config)
+            .map_err(|error| format!("Failed to bake '{}': {error}", path.display()))?;
+        lighting
+            .save(&cache_path)
+            .map_err(|error| format!("Failed to save '{}': {error}", cache_path.display()))?;
+        println!("Baked {}", cache_path.display());
         lighting
     };
     let clipped = clip_scene(&transformed)
@@ -166,10 +181,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("Failed to project '{}': {error}", path.display()))?;
     let rendered = cpu::render(
         &screen,
-        &asset,
+        &materials,
         config.width,
         config.height,
-        cpu::Lighting::Baked(&lighting.lightmap),
+        cpu::Lighting {
+            lightmap: Some(&lighting.lightmap),
+            lights: &lights,
+            camera_position: config.camera.position.into(),
+        },
     )
     .map_err(|error| format!("Failed to render '{}': {error}", path.display()))?;
     let output_path = output_dir.join(scene_name(&path)).with_extension("png");
@@ -233,7 +252,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("Wrote {}", output_path.display());
     println!(
-        "Lighting: {}x{} baked direct + one indirect bounce; no runtime light or shadow passes",
+        "Lighting: {}x{} baked diffuse (direct + one bounce), plus shadowed runtime direct specular",
         lighting.lightmap.width, lighting.lightmap.height
     );
 

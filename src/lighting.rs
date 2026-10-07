@@ -1,4 +1,4 @@
-use std::io;
+use std::{f32::consts::PI, io};
 
 use glam::Vec3;
 
@@ -10,17 +10,31 @@ pub enum Light {
 }
 
 impl Light {
-    pub fn shade(&self, base_color: Vec3, normal: Vec3, position: Vec3) -> Vec3 {
+    pub fn sample(&self, position: Vec3) -> Option<LightSample> {
         match self {
-            Self::Directional(light) => light.shade(base_color, normal),
-            Self::Area(light) => light.shade(base_color, normal, position),
+            Self::Directional(light) => Some(LightSample {
+                direction: light.direction,
+                irradiance: light.irradiance,
+            }),
+            Self::Area(light) => light.sample(position),
         }
+    }
+}
+
+pub struct LightSample {
+    pub direction: Vec3,
+    pub irradiance: Vec3,
+}
+
+impl LightSample {
+    pub fn diffuse(&self, normal: Vec3) -> Vec3 {
+        self.irradiance * (normal.dot(self.direction).max(0.0) / PI)
     }
 }
 
 pub struct DirectionalLight {
     direction: Vec3,
-    radiance: Vec3,
+    irradiance: Vec3,
 }
 
 impl DirectionalLight {
@@ -33,12 +47,13 @@ impl DirectionalLight {
             )
         })?;
         let color = Vec3::from_array(color);
-        let radiance = color * intensity;
+        // Preserve intensity as the response of a facing white Lambertian surface.
+        let irradiance = color * intensity * PI;
         if !color.is_finite()
             || color.min_element() < 0.0
             || !intensity.is_finite()
             || intensity < 0.0
-            || !radiance.is_finite()
+            || !irradiance.is_finite()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -47,12 +62,8 @@ impl DirectionalLight {
         }
         Ok(Self {
             direction,
-            radiance,
+            irradiance,
         })
-    }
-
-    pub fn shade(&self, base_color: Vec3, normal: Vec3) -> Vec3 {
-        base_color * self.radiance * normal.dot(self.direction).max(0.0)
     }
 
     pub fn direction(&self) -> Vec3 {
@@ -105,11 +116,11 @@ impl AreaLight {
         })
     }
 
-    pub fn shade(&self, base_color: Vec3, normal: Vec3, position: Vec3) -> Vec3 {
+    fn sample(&self, position: Vec3) -> Option<LightSample> {
         let offset = self.position - position;
         let distance_squared = offset.length_squared();
         if distance_squared == 0.0 || !distance_squared.is_finite() {
-            return Vec3::ZERO;
+            return None;
         }
         let direction = offset / distance_squared.sqrt();
         let emitter_cosine = self.normal.dot(-direction);
@@ -118,10 +129,11 @@ impl AreaLight {
         } else {
             emitter_cosine.max(0.0)
         };
-        // One centroid sample of the diffuse area-light integral.
-        let weight = self.area * emitter_cosine * normal.dot(direction).max(0.0)
-            / (std::f32::consts::PI * distance_squared);
-        base_color * self.radiance * weight
+        let weight = self.area * emitter_cosine / distance_squared;
+        Some(LightSample {
+            direction,
+            irradiance: self.radiance * weight,
+        })
     }
 }
 

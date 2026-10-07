@@ -9,9 +9,8 @@ use crate::{
     backend::cpu,
     config::{BakeConfig, Config},
     coverage::rasterize_triangle,
-    lighting::collect_lights,
     lightmap::{BakedLighting, Lightmap, MeshLayout, cache_key, invalid},
-    material::{Material, load_materials},
+    material::Material,
     vertex::ClipScene,
 };
 
@@ -28,6 +27,8 @@ struct Sample {
 pub fn bake(
     scene: &mut ClipScene,
     asset: &GltfAsset,
+    materials: &[Material<'_>],
+    lights: &[cpu::RenderLight],
     config: &Config,
 ) -> io::Result<BakedLighting> {
     let settings = &config.bake;
@@ -43,14 +44,6 @@ pub fn bake(
         ));
     }
     let key = cache_key(asset, config)?;
-    let materials = load_materials(asset)?;
-    eprintln!("Preparing direct-light shadows...");
-    let lights = cpu::prepare_lights(
-        collect_lights(scene, &materials, &config.light)?,
-        scene,
-        &materials,
-        &config.shadow,
-    )?;
     eprintln!("Generating lightmap UVs...");
     let (layouts, width, height, owners) = unwrap(scene, settings.resolution)?;
     let mut baked = BakedLighting {
@@ -59,7 +52,7 @@ pub fn bake(
         lightmap: Lightmap::new(width, height)?,
     };
     baked.apply(scene)?;
-    let samples = surface_samples(scene, &materials, width, height);
+    let samples = surface_samples(scene, materials, width, height);
     let valid: Vec<_> = samples.iter().map(Option::is_some).collect();
     let count = valid.iter().filter(|&&v| v).count();
     if count == 0 {
@@ -69,17 +62,16 @@ pub fn bake(
     for (i, sample) in samples.iter().enumerate() {
         if let Some(sample) = sample {
             baked.lightmap.front[i] =
-                cpu::direct_lighting(&lights, sample.position, sample.normal).to_array();
+                cpu::direct_lighting(lights, sample.position, sample.normal).to_array();
             if sample.double_sided {
                 baked.lightmap.back[i] =
-                    cpu::direct_lighting(&lights, sample.position, -sample.normal).to_array();
+                    cpu::direct_lighting(lights, sample.position, -sample.normal).to_array();
             }
         }
     }
-    drop(lights);
     dilate(&mut baked.lightmap, &valid, &owners);
 
-    let mut indirect = bake_indirect(scene, &materials, &baked.lightmap, &samples, settings)?;
+    let mut indirect = bake_indirect(scene, materials, &baked.lightmap, &samples, settings)?;
     dilate(&mut indirect, &valid, &owners);
     for (dst, src) in baked
         .lightmap
