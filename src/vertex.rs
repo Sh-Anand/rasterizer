@@ -2,6 +2,8 @@ use std::io;
 
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4, camera::rh};
 
+mod tangent;
+
 use crate::{
     asset::GltfAsset,
     config::Config,
@@ -21,12 +23,15 @@ pub struct ClipVertex {
     pub position: Vec4,
     pub world_position: Vec3,
     pub uv: Vec2,
+    pub normal_uv: Vec2,
     pub metallic_roughness_uv: Vec2,
     pub occlusion_uv: Vec2,
     pub emissive_uv: Vec2,
     pub lightmap_uv: Vec2,
     /// World-space normal.
     pub normal: Vec3,
+    /// World-space tangent; W is the bitangent sign (zero for an unusable frame).
+    pub tangent: Vec4,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +201,9 @@ fn transform_node(
                 .ok_or_else(|| invalid("Cannot read vertex positions"))?
                 .map(Vec3::from_array)
                 .collect();
+            if positions.iter().any(|position| !position.is_finite()) {
+                return Err(invalid("Non-finite vertex position"));
+            }
             let read_uvs = |tex_coord: Option<u32>| -> io::Result<Vec<Vec2>> {
                 let required = tex_coord.is_some();
                 let tex_coord = tex_coord.unwrap_or(0);
@@ -216,6 +224,7 @@ fn transform_node(
             let material = primitive.material();
             let pbr = material.pbr_metallic_roughness();
             let uvs = read_uvs(pbr.base_color_texture().map(|info| info.tex_coord()))?;
+            let normal_uvs = read_uvs(material.normal_texture().map(|info| info.tex_coord()))?;
             let metallic_roughness_uvs = read_uvs(
                 pbr.metallic_roughness_texture()
                     .map(|info| info.tex_coord()),
@@ -251,6 +260,40 @@ fn transform_node(
                     source_index,
                 })
                 .collect();
+            let normals: Option<Vec<Vec3>> = reader
+                .read_normals()
+                .map(|normals| normals.map(Vec3::from_array).collect());
+            if normals
+                .as_ref()
+                .is_some_and(|normals| normals.len() != positions.len())
+            {
+                return Err(invalid("Normal count does not match vertex count"));
+            }
+            if normals.is_none() && primitive.get(&gltf::Semantic::Normals).is_some() {
+                return Err(invalid("Cannot read vertex normals"));
+            }
+            if normals.as_ref().is_some_and(|normals| {
+                normals
+                    .iter()
+                    .any(|normal| normal.try_normalize().is_none())
+            }) {
+                return Err(invalid("Invalid vertex normal"));
+            }
+            let tangents = if material.normal_texture().is_some() {
+                let supplied = normals.as_ref().and_then(|_| reader.read_tangents());
+                Some(if let Some(supplied) = supplied {
+                    let tangents: Vec<Vec4> = supplied.map(Vec4::from_array).collect();
+                    tangent::from_vertices(&tangents, positions.len(), &triangles)
+                        .map_err(|error| invalid(&error.to_string()))?
+                } else {
+                    if normals.is_some() && primitive.get(&gltf::Semantic::Tangents).is_some() {
+                        return Err(invalid("Cannot read vertex tangents"));
+                    }
+                    tangent::generate(&positions, normals.as_deref(), &normal_uvs, &triangles)
+                })
+            } else {
+                None
+            };
             let mut vertices: Vec<ClipVertex> = positions
                 .iter()
                 .enumerate()
@@ -258,11 +301,13 @@ fn transform_node(
                     position: mvp * position.extend(1.0),
                     world_position: model.transform_point3(*position),
                     uv: uvs[i],
+                    normal_uv: normal_uvs[i],
                     metallic_roughness_uv: metallic_roughness_uvs[i],
                     occlusion_uv: occlusion_uvs[i],
                     emissive_uv: emissive_uvs[i],
                     lightmap_uv: Vec2::ZERO,
                     normal: Vec3::ZERO,
+                    tangent: Vec4::ZERO,
                 })
                 .collect();
             if vertices
@@ -271,19 +316,13 @@ fn transform_node(
             {
                 return Err(invalid("Non-finite vertex position"));
             }
-            if let Some(normals) = reader.read_normals() {
-                if normals.len() != vertices.len() {
-                    return Err(invalid("Normal count does not match vertex count"));
-                }
+            if let Some(normals) = normals {
                 for (vertex, normal) in vertices.iter_mut().zip(normals) {
-                    vertex.normal = (normal_matrix * Vec3::from_array(normal))
+                    vertex.normal = (normal_matrix * normal)
                         .try_normalize()
                         .ok_or_else(|| invalid("Invalid vertex normal"))?;
                 }
             } else {
-                if primitive.get(&gltf::Semantic::Normals).is_some() {
-                    return Err(invalid("Cannot read vertex normals"));
-                }
                 u32::try_from(indices.len())
                     .map_err(|_| invalid("Too many flat-shaded vertices"))?;
                 let mut flat_vertices = Vec::with_capacity(indices.len());
@@ -298,6 +337,10 @@ fn transform_node(
                     }
                 }
                 vertices = flat_vertices;
+            }
+            if let Some(tangents) = tangents {
+                tangent::apply(&mut vertices, &mut triangles, &tangents, linear)
+                    .map_err(|error| invalid(&error.to_string()))?;
             }
             output.push(ClipPrimitive {
                 source: PrimitiveSource {

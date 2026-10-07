@@ -46,11 +46,9 @@ impl Lighting<'_> {
         base_color: Vec3,
         front_facing: bool,
     ) -> Vec3 {
-        let normal = if front_facing {
-            attributes.normal
-        } else {
-            -attributes.normal
-        };
+        let normal =
+            material.shading_normal(attributes.normal_uv, attributes.normal, attributes.tangent);
+        let normal = if front_facing { normal } else { -normal };
         let view = (self.camera_position - attributes.world_position).normalize_or_zero();
         let (metallic, roughness) = material.metallic_roughness(attributes.metallic_roughness_uv);
         let brdf = Brdf::new(base_color, metallic, roughness);

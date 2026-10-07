@@ -1,6 +1,6 @@
 use std::io;
 
-use glam::{DVec2, DVec3, Vec2, Vec3};
+use glam::{DVec2, DVec3, DVec4, Vec2, Vec3, Vec4};
 
 use crate::{
     geometry::{PrimitiveSource, Triangle},
@@ -13,12 +13,14 @@ pub struct ScreenVertex {
     pub world_position: Vec3,
     pub inv_w: f32,
     pub uv: Vec2,
+    pub normal_uv: Vec2,
     pub metallic_roughness_uv: Vec2,
     pub occlusion_uv: Vec2,
     pub emissive_uv: Vec2,
     pub lightmap_uv: Vec2,
     /// World-space normal.
     pub normal: Vec3,
+    pub tangent: Vec4,
 }
 
 #[derive(Debug)]
@@ -38,11 +40,13 @@ pub struct ScreenScene {
 pub struct FragmentAttributes {
     pub world_position: Vec3,
     pub uv: Vec2,
+    pub normal_uv: Vec2,
     pub metallic_roughness_uv: Vec2,
     pub occlusion_uv: Vec2,
     pub emissive_uv: Vec2,
     pub lightmap_uv: Vec2,
     pub normal: Vec3,
+    pub tangent: Vec4,
 }
 
 pub fn project_scene(scene: &ClipScene, width: u32, height: u32) -> io::Result<ScreenScene> {
@@ -106,11 +110,13 @@ fn project_vertex(vertex: ClipVertex, width: f32, height: f32) -> io::Result<Scr
         world_position: vertex.world_position,
         inv_w,
         uv: vertex.uv,
+        normal_uv: vertex.normal_uv,
         metallic_roughness_uv: vertex.metallic_roughness_uv,
         occlusion_uv: vertex.occlusion_uv,
         emissive_uv: vertex.emissive_uv,
         lightmap_uv: vertex.lightmap_uv,
         normal: vertex.normal,
+        tangent: vertex.tangent,
     })
 }
 
@@ -129,6 +135,16 @@ pub fn interpolate_attributes(
         .iter()
         .zip(weights)
         .map(|(vertex, weight)| vertex.uv.as_dvec2() * weight)
+        .sum();
+    let normal_uv: DVec2 = vertices
+        .iter()
+        .zip(weights)
+        .map(|(vertex, weight)| vertex.normal_uv.as_dvec2() * weight)
+        .sum();
+    let tangent: DVec4 = vertices
+        .iter()
+        .zip(weights)
+        .map(|(vertex, weight)| vertex.tangent.as_dvec4() * weight)
         .sum();
     let emissive_uv: DVec2 = vertices
         .iter()
@@ -159,10 +175,12 @@ pub fn interpolate_attributes(
     FragmentAttributes {
         world_position: (world_position / sum).as_vec3(),
         uv: (uv / sum).as_vec2(),
+        normal_uv: (normal_uv / sum).as_vec2(),
         metallic_roughness_uv: (metallic_roughness_uv / sum).as_vec2(),
         occlusion_uv: (occlusion_uv / sum).as_vec2(),
         emissive_uv: (emissive_uv / sum).as_vec2(),
         lightmap_uv: (lightmap_uv / sum).as_vec2(),
         normal: (normal / sum).normalize_or_zero().as_vec3(),
+        tangent: (tangent / sum).as_vec4(),
     }
 }

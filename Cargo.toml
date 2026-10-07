@@ -10,6 +10,7 @@ blake3 = "1"
 glam = "0.33"
 gltf = { version = "1.4.1", features = ["extensions", "extras"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+mikktspace = { version = "0.3", default-features = false, features = ["glam"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
