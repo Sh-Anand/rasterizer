@@ -130,7 +130,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = resolve_scene(Path::new(&path))?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let config_path = root.join("config.toml");
-    let config = Config::load(&config_path)
+    let config = Config::load_scene(&config_path, &scene_name(&path).to_string_lossy())
         .map_err(|error| format!("Failed to load '{}': {error}", config_path.display()))?;
     let asset = GltfAsset::load(&path)
         .map_err(|error| format!("Failed to load '{}': {error}", path.display()))?;

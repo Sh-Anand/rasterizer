@@ -1,4 +1,4 @@
-use std::{fs, io, path::Path};
+use std::{collections::HashMap, fs, io, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +8,8 @@ pub struct Config {
     pub width: u32,
     pub height: u32,
     pub camera: CameraConfig,
+    #[serde(default)]
+    scene_cameras: HashMap<String, CameraConfig>,
     pub light: LightConfig,
     pub shadow: ShadowConfig,
     #[serde(default)]
@@ -63,5 +65,13 @@ impl Config {
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
         let text = fs::read_to_string(path)?;
         toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    pub fn load_scene(path: impl AsRef<Path>, scene: &str) -> io::Result<Self> {
+        let mut config = Self::load(path)?;
+        if let Some(camera) = config.scene_cameras.remove(scene) {
+            config.camera = camera;
+        }
+        Ok(config)
     }
 }
