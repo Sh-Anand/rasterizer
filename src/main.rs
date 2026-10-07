@@ -6,20 +6,22 @@ use std::{
     process::ExitCode,
 };
 
+use glam::Vec3;
+
 use rasterizer::{
     asset::GltfAsset,
     backend::cpu,
     bake,
     clip::clip_scene,
     config::Config,
-    lighting::collect_lights,
+    lighting::{DirectionalLight, Light, collect_lights},
     lightmap::{BakedLighting, cache_key},
     material::load_materials,
     vertex::transform_scene,
     viewport::project_scene,
 };
 
-const USAGE: &str = "Usage: rasterizer [bake] <scene-name|path.gltf|path.glb>\n\nWithout arguments, list bundled scenes.\nBake: cargo run --release -- bake kitchen\nRender: cargo run --release -- kitchen";
+const USAGE: &str = "Usage: rasterizer [bake] <scene-name|path.gltf|path.glb> [--camera-light]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (direct lighting only).\nBake: cargo run --release -- bake kitchen\nRender: cargo run --release -- living-room --camera-light";
 
 fn scene_paths() -> io::Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -106,8 +108,25 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = env::args_os().skip(1);
+    let mut camera_light = false;
+    let mut positional = Vec::new();
+    for arg in env::args_os().skip(1) {
+        if arg == "--camera-light" {
+            camera_light = true;
+        } else if arg == "--help" || arg == "-h" {
+            println!("{USAGE}");
+            return Ok(());
+        } else if arg.to_string_lossy().starts_with('-') {
+            return Err(format!("Unknown option '{}'.\n\n{USAGE}", arg.to_string_lossy()).into());
+        } else {
+            positional.push(arg);
+        }
+    }
+    let mut args = positional.into_iter();
     let Some(path) = args.next() else {
+        if camera_light {
+            return Err(format!("Expected a scene.\n\n{USAGE}").into());
+        }
         list_scenes().map_err(|error| format!("Failed to list scenes: {error}"))?;
         return Ok(());
     };
@@ -122,11 +141,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if args.next().is_some() {
         return Err(format!("Expected one scene name or asset path.\n\n{USAGE}").into());
     }
-    if path == "--help" || path == "-h" {
-        println!("{USAGE}");
-        return Ok(());
-    }
-
     let path = resolve_scene(Path::new(&path))?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let config_path = root.join("config.toml");
@@ -157,7 +171,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let materials = load_materials(&asset)?;
     eprintln!("Preparing direct-light shadows...");
-    let lights = cpu::prepare_lights(
+    let mut lights = cpu::prepare_lights(
         collect_lights(&transformed, &materials, &config.light)?,
         &transformed,
         &materials,
@@ -175,6 +189,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("Baked {}", cache_path.display());
         lighting
     };
+    if camera_light {
+        let direction = Vec3::from(config.camera.position) - Vec3::from(config.camera.target);
+        lights.push(cpu::RenderLight {
+            light: Light::Directional(DirectionalLight::new(direction.to_array(), [1.0; 3], 1.0)?),
+            shadow: None,
+        });
+    }
     let clipped = clip_scene(&transformed)
         .map_err(|error| format!("Failed to clip '{}': {error}", path.display()))?;
     let screen = project_scene(&clipped, config.width, config.height)
@@ -252,9 +273,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("Wrote {}", output_path.display());
     println!(
-        "Lighting: {}x{} baked one-bounce indirect; shadowed runtime direct diffuse + specular",
+        "Lighting: {}x{} baked one-bounce indirect; runtime direct diffuse + specular",
         lighting.lightmap.width, lighting.lightmap.height
     );
+    if camera_light {
+        println!("Camera light: white, unshadowed, direct-only");
+    }
 
     let extensions: Vec<_> = document.extensions_used().collect();
     if !extensions.is_empty() {
