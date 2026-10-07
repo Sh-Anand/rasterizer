@@ -21,6 +21,7 @@ pub struct ClipVertex {
     pub position: Vec4,
     pub world_position: Vec3,
     pub uv: Vec2,
+    pub metallic_roughness_uv: Vec2,
     pub emissive_uv: Vec2,
     pub lightmap_uv: Vec2,
     /// World-space normal.
@@ -211,7 +212,9 @@ fn transform_node(
                 Ok(uvs)
             };
             let material = primitive.material();
-            let uvs = read_uvs(material.pbr_metallic_roughness().base_color_texture())?;
+            let pbr = material.pbr_metallic_roughness();
+            let uvs = read_uvs(pbr.base_color_texture())?;
+            let metallic_roughness_uvs = read_uvs(pbr.metallic_roughness_texture())?;
             let emissive_uvs = read_uvs(material.emissive_texture())?;
             let indices: Vec<u32> = if primitive.indices().is_some() {
                 reader
@@ -243,13 +246,13 @@ fn transform_node(
                 .collect();
             let mut vertices: Vec<ClipVertex> = positions
                 .iter()
-                .zip(uvs)
-                .zip(emissive_uvs)
-                .map(|((position, uv), emissive_uv)| ClipVertex {
+                .enumerate()
+                .map(|(i, position)| ClipVertex {
                     position: mvp * position.extend(1.0),
                     world_position: model.transform_point3(*position),
-                    uv,
-                    emissive_uv,
+                    uv: uvs[i],
+                    metallic_roughness_uv: metallic_roughness_uvs[i],
+                    emissive_uv: emissive_uvs[i],
                     lightmap_uv: Vec2::ZERO,
                     normal: Vec3::ZERO,
                 })

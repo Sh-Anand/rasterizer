@@ -53,6 +53,9 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f64)
         + inside.world_position.as_dvec3() * t)
         .as_vec3();
     let uv = (outside.uv.as_dvec2() * (1.0 - t) + inside.uv.as_dvec2() * t).as_vec2();
+    let metallic_roughness_uv = (outside.metallic_roughness_uv.as_dvec2() * (1.0 - t)
+        + inside.metallic_roughness_uv.as_dvec2() * t)
+        .as_vec2();
     let emissive_uv =
         (outside.emissive_uv.as_dvec2() * (1.0 - t) + inside.emissive_uv.as_dvec2() * t).as_vec2();
     let lightmap_uv =
@@ -62,6 +65,7 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f64)
         position,
         world_position,
         uv,
+        metallic_roughness_uv,
         emissive_uv,
         lightmap_uv,
         normal,

@@ -238,6 +238,7 @@ fn draw(
                             // Single-sided backs block light, but don't reflect it.
                             color[index] = if front_facing || material.double_sided {
                                 base_color.truncate()
+                                    * (1.0 - material.metallic(attributes.metallic_roughness_uv))
                                     * lightmap.sample(attributes.lightmap_uv, !front_facing)
                             } else {
                                 Vec3::ZERO

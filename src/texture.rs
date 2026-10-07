@@ -6,16 +6,27 @@ use gltf::{
     texture::{MagFilter, WrappingMode},
 };
 
+#[derive(Clone, Copy)]
+pub enum ColorSpace {
+    Srgb,
+    Linear,
+}
+
 pub struct Texture<'a> {
     image: &'a Data,
     channels: usize,
     wrap_s: WrappingMode,
     wrap_t: WrappingMode,
     filter: MagFilter,
+    color_space: ColorSpace,
 }
 
 impl<'a> Texture<'a> {
-    pub fn new(texture: gltf::Texture<'_>, images: &'a [Data]) -> io::Result<Self> {
+    pub fn new(
+        texture: gltf::Texture<'_>,
+        images: &'a [Data],
+        color_space: ColorSpace,
+    ) -> io::Result<Self> {
         let image = &images[texture.source().index()];
         let channels = match image.format {
             Format::R8 => 1,
@@ -25,7 +36,7 @@ impl<'a> Texture<'a> {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "Color textures must use 8-bit channels",
+                    "Textures must use 8-bit channels",
                 ));
             }
         };
@@ -44,6 +55,7 @@ impl<'a> Texture<'a> {
             wrap_s: sampler.wrap_s(),
             wrap_t: sampler.wrap_t(),
             filter: sampler.mag_filter().unwrap_or(MagFilter::Linear),
+            color_space,
         })
     }
 
@@ -77,10 +89,14 @@ impl<'a> Texture<'a> {
             [r, g, b, a] => [*r, *g, *b, *a],
             _ => unreachable!(),
         };
+        let decode = |value| match self.color_space {
+            ColorSpace::Srgb => decode_srgb(value),
+            ColorSpace::Linear => f32::from(value) / 255.0,
+        };
         Vec4::new(
-            decode_srgb(rgba[0]),
-            decode_srgb(rgba[1]),
-            decode_srgb(rgba[2]),
+            decode(rgba[0]),
+            decode(rgba[1]),
+            decode(rgba[2]),
             f32::from(rgba[3]) / 255.0,
         )
     }
