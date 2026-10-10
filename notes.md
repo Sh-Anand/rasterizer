@@ -52,4 +52,4 @@ Preserve the configured directional light's existing brightness convention: inte
 
 Prepare shadow maps once per process and share them between baking and runtime direct lighting. They remain resident through rendering, increasing memory use during the indirect bake. Cached-lightmap renders still rebuild these maps at startup; camera movement alone does not require new maps or a new indirect bake. Disk caching of shadows is deferred.
 
-Keep the existing clamped sRGB PNG output for now. Bright HDR highlights can clip; exposure and tone mapping are separate work.
+Keep the framebuffer in linear HDR and apply manual exposure, per-channel Reinhard tone mapping (`x / (1 + x)`), then sRGB encoding only at PNG export. This simple global curve preserves highlight differences but can desaturate bright colors; no automatic exposure or filmic color transform is modeled. Output settings do not affect the lighting bake. Tone mapping can be disabled to recover clamped output.

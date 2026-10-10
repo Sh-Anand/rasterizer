@@ -21,7 +21,7 @@ use rasterizer::{
     viewport::project_scene,
 };
 
-const USAGE: &str = "Usage: rasterizer [bake] <scene-name|path.gltf|path.glb> [--camera-light]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (direct lighting only).\nBake: cargo run --release -- bake kitchen\nRender: cargo run --release -- living-room --camera-light";
+const USAGE: &str = "Usage: rasterizer [bake] <scene-name|path.gltf|path.glb> [--camera-light]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (direct lighting only; off by default).\nBake: cargo run --release -- bake kitchen\nRender: cargo run --release -- living-room";
 
 fn scene_paths() -> io::Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -215,7 +215,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let output_path = output_dir.join(scene_name(&path)).with_extension("png");
     rendered
         .framebuffer
-        .save(&output_path)
+        .save(&output_path, &config.output)
         .map_err(|error| format!("Failed to save '{}': {error}", output_path.display()))?;
 
     let document = &asset.document;

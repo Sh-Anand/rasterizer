@@ -1,6 +1,11 @@
 width = 800
 height = 600
 
+[output]
+# Linear brightness multiplier; 2.0 is one stop brighter.
+exposure = 1.0
+tone_mapping = true
+
 [camera]
 position = [3.0, 2.0, 3.0]
 target = [0.0, 0.0, 0.0]

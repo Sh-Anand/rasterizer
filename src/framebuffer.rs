@@ -1,9 +1,14 @@
 use std::{io, path::Path};
 
+use glam::{DVec3, Vec3};
+
+use crate::{config::OutputConfig, texture::encode_srgb};
+
 pub struct Framebuffer {
     pub width: u32,
     pub height: u32,
-    pub color: Vec<[u8; 3]>,
+    /// Linear HDR RGB, before exposure and tone mapping.
+    pub color: Vec<Vec3>,
     pub depth: DepthBuffer,
 }
 
@@ -14,7 +19,7 @@ impl Framebuffer {
         color
             .try_reserve_exact(depth.values.len())
             .map_err(io::Error::other)?;
-        color.resize(depth.values.len(), [0, 0, 0]);
+        color.resize(depth.values.len(), Vec3::ZERO);
         Ok(Self {
             width,
             height,
@@ -23,10 +28,22 @@ impl Framebuffer {
         })
     }
 
-    pub fn save(&self, path: impl AsRef<Path>) -> image::ImageResult<()> {
+    pub fn save(&self, path: impl AsRef<Path>, output: &OutputConfig) -> image::ImageResult<()> {
+        output.validate()?;
+        let pixels: Vec<[u8; 3]> = self
+            .color
+            .iter()
+            .map(|color| {
+                let mut color = color.as_dvec3().max(DVec3::ZERO) * f64::from(output.exposure);
+                if output.tone_mapping {
+                    color /= DVec3::ONE + color;
+                }
+                encode_srgb(color.as_vec3())
+            })
+            .collect();
         image::save_buffer(
             path,
-            self.color.as_flattened(),
+            pixels.as_flattened(),
             self.width,
             self.height,
             image::ColorType::Rgb8,

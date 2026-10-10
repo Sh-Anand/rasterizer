@@ -14,6 +14,36 @@ pub struct Config {
     pub shadow: ShadowConfig,
     #[serde(default)]
     pub bake: BakeConfig,
+    #[serde(default)]
+    pub output: OutputConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputConfig {
+    pub exposure: f32,
+    pub tone_mapping: bool,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            exposure: 1.0,
+            tone_mapping: true,
+        }
+    }
+}
+
+impl OutputConfig {
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        if !self.exposure.is_finite() || self.exposure < 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Output exposure must be finite and nonnegative",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -64,7 +94,10 @@ pub struct CameraConfig {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
         let text = fs::read_to_string(path)?;
-        toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        let config: Self = toml::from_str(&text)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        config.output.validate()?;
+        Ok(config)
     }
 
     pub fn load_scene(path: impl AsRef<Path>, scene: &str) -> io::Result<Self> {

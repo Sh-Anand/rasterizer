@@ -15,7 +15,6 @@ use crate::{
     lightmap::Lightmap,
     material::Material,
     shadow::{LightShadow, ShadowMap, ShadowProjection},
-    texture::encode_srgb,
     vertex::{ClipScene, reproject_scene},
     viewport::{
         FragmentAttributes, ScreenPrimitive, ScreenScene, interpolate_attributes, project_scene,
@@ -86,7 +85,7 @@ fn visible_lights(lights: &[RenderLight], position: Vec3) -> impl Iterator<Item 
 
 enum Pass<'a> {
     Shaded {
-        color: &'a mut [[u8; 3]],
+        color: &'a mut [Vec3],
         lighting: Lighting<'a>,
     },
     Capture {
@@ -259,12 +258,12 @@ fn draw(
                     depth_buffer.values[index] = depth;
                     match &mut pass {
                         Pass::Shaded { color, lighting } => {
-                            color[index] = encode_srgb(lighting.shade(
+                            color[index] = lighting.shade(
                                 material,
                                 &attributes,
                                 base_color.truncate(),
                                 front_facing,
-                            ));
+                            );
                         }
                         Pass::Capture { color, lightmap } => {
                             // Single-sided backs block light, but don't reflect it.
