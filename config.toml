@@ -1,5 +1,7 @@
 width = 800
 height = 600
+# Material texture filtering: "none" (nearest), "bilinear", or "trilinear".
+sampling = "trilinear"
 
 [output]
 # Linear brightness multiplier; 2.0 is one stop brighter.

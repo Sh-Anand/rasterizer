@@ -169,7 +169,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             })?,
         )
     };
-    let materials = load_materials(&asset)?;
+    let materials = load_materials(&asset, config.sampling)?;
     eprintln!("Preparing direct-light shadows...");
     let mut lights = cpu::prepare_lights(
         collect_lights(&transformed, &materials, &config.light)?,

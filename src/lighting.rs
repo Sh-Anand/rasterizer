@@ -2,7 +2,7 @@ use std::{f32::consts::PI, io};
 
 use glam::Vec3;
 
-use crate::{config::LightConfig, material::Material, vertex::ClipScene};
+use crate::{config::LightConfig, material::Material, texture::UvSample, vertex::ClipScene};
 
 pub enum Light {
     Directional(DirectionalLight),
@@ -139,7 +139,7 @@ impl AreaLight {
 
 pub fn collect_lights(
     scene: &ClipScene,
-    materials: &[Material<'_>],
+    materials: &[Material],
     config: &LightConfig,
 ) -> io::Result<Vec<Light>> {
     let mut lights = vec![Light::Directional(DirectionalLight::new(
@@ -160,13 +160,13 @@ pub fn collect_lights(
             let uv = (vertices[0].uv + vertices[1].uv + vertices[2].uv) / 3.0;
             if material
                 .alpha_cutoff
-                .is_some_and(|cutoff| material.base_color(uv).w < cutoff)
+                .is_some_and(|cutoff| material.base_color(UvSample::point(uv)).w < cutoff)
             {
                 continue;
             }
             let emissive_uv =
                 (vertices[0].emissive_uv + vertices[1].emissive_uv + vertices[2].emissive_uv) / 3.0;
-            let radiance = material.emission(emissive_uv);
+            let radiance = material.emission(UvSample::point(emissive_uv));
             if radiance == Vec3::ZERO {
                 continue;
             }

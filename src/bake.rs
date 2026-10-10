@@ -11,6 +11,7 @@ use crate::{
     coverage::rasterize_triangle,
     lightmap::{BakedLighting, Lightmap, MeshLayout, cache_key, invalid},
     material::Material,
+    texture::UvSample,
     vertex::ClipScene,
 };
 
@@ -27,7 +28,7 @@ struct Sample {
 pub fn bake(
     scene: &mut ClipScene,
     asset: &GltfAsset,
-    materials: &[Material<'_>],
+    materials: &[Material],
     lights: &[cpu::RenderLight],
     config: &Config,
 ) -> io::Result<BakedLighting> {
@@ -79,7 +80,7 @@ pub fn bake(
 
 fn surface_samples(
     scene: &ClipScene,
-    materials: &[Material<'_>],
+    materials: &[Material],
     width: u32,
     height: u32,
 ) -> Vec<Option<Sample>> {
@@ -111,7 +112,7 @@ fn surface_samples(
                 let uv: Vec2 = v.iter().zip(weights).map(|(v, w)| v.uv * w).sum();
                 if material
                     .alpha_cutoff
-                    .is_some_and(|cutoff| material.base_color(uv).w < cutoff)
+                    .is_some_and(|cutoff| material.base_color(UvSample::point(uv)).w < cutoff)
                 {
                     return None;
                 }
@@ -147,7 +148,7 @@ fn surface_samples(
 
 fn bake_indirect(
     scene: &ClipScene,
-    materials: &[Material<'_>],
+    materials: &[Material],
     direct: &Lightmap,
     samples: &[Option<Sample>],
     settings: &BakeConfig,

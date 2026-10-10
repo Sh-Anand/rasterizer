@@ -1,37 +1,38 @@
 use std::io;
 
-use glam::{Vec2, Vec3, Vec4};
+use glam::{Vec3, Vec4};
 
 use crate::{
     asset::GltfAsset,
-    texture::{ColorSpace, Texture},
+    texture::{ColorSpace, Sampling, Texture, TextureLoader, UvSample},
 };
 
-pub fn load_materials(asset: &GltfAsset) -> io::Result<Vec<Material<'_>>> {
+pub fn load_materials(asset: &GltfAsset, sampling: Sampling) -> io::Result<Vec<Material>> {
+    let mut textures = TextureLoader::new(&asset.images, sampling);
     asset
         .document
         .materials()
-        .map(|material| Material::new(material, &asset.images))
+        .map(|material| Material::new(material, &mut textures))
         .collect()
 }
 
-pub struct Material<'a> {
+pub struct Material {
     pub base_color_factor: Vec4,
-    pub base_color_texture: Option<Texture<'a>>,
+    pub base_color_texture: Option<Texture>,
     pub normal_scale: f32,
-    pub normal_texture: Option<Texture<'a>>,
+    pub normal_texture: Option<Texture>,
     pub metallic_factor: f32,
     pub roughness_factor: f32,
-    pub metallic_roughness_texture: Option<Texture<'a>>,
+    pub metallic_roughness_texture: Option<Texture>,
     pub occlusion_strength: f32,
-    pub occlusion_texture: Option<Texture<'a>>,
+    pub occlusion_texture: Option<Texture>,
     pub emissive_factor: Vec3,
-    pub emissive_texture: Option<Texture<'a>>,
+    pub emissive_texture: Option<Texture>,
     pub alpha_cutoff: Option<f32>,
     pub double_sided: bool,
 }
 
-impl Default for Material<'_> {
+impl Default for Material {
     fn default() -> Self {
         Self {
             base_color_factor: Vec4::ONE,
@@ -51,28 +52,28 @@ impl Default for Material<'_> {
     }
 }
 
-impl<'a> Material<'a> {
-    pub fn new(material: gltf::Material<'_>, images: &'a [gltf::image::Data]) -> io::Result<Self> {
+impl Material {
+    fn new(material: gltf::Material<'_>, textures: &mut TextureLoader<'_>) -> io::Result<Self> {
         let pbr = material.pbr_metallic_roughness();
         let normal = material.normal_texture();
         let occlusion = material.occlusion_texture();
         Ok(Self {
             base_color_factor: Vec4::from(pbr.base_color_factor()),
-            base_color_texture: load_texture(pbr.base_color_texture(), images, ColorSpace::Srgb)?,
+            base_color_texture: load_texture(pbr.base_color_texture(), textures, ColorSpace::Srgb)?,
             normal_scale: normal.as_ref().map_or(1.0, |info| info.scale()),
             normal_texture: normal
                 .map(|info| {
                     check_texture_transform(
                         info.extension_value("KHR_texture_transform").is_some(),
                     )?;
-                    Texture::new(info.texture(), images, ColorSpace::Linear)
+                    textures.load(info.texture(), ColorSpace::Linear)
                 })
                 .transpose()?,
             metallic_factor: pbr.metallic_factor(),
             roughness_factor: pbr.roughness_factor(),
             metallic_roughness_texture: load_texture(
                 pbr.metallic_roughness_texture(),
-                images,
+                textures,
                 ColorSpace::Linear,
             )?,
             occlusion_strength: occlusion.as_ref().map_or(1.0, |info| info.strength()),
@@ -81,18 +82,22 @@ impl<'a> Material<'a> {
                     check_texture_transform(
                         info.extension_value("KHR_texture_transform").is_some(),
                     )?;
-                    Texture::new(info.texture(), images, ColorSpace::Linear)
+                    textures.load(info.texture(), ColorSpace::Linear)
                 })
                 .transpose()?,
             emissive_factor: Vec3::from(material.emissive_factor()),
-            emissive_texture: load_texture(material.emissive_texture(), images, ColorSpace::Srgb)?,
+            emissive_texture: load_texture(
+                material.emissive_texture(),
+                textures,
+                ColorSpace::Srgb,
+            )?,
             alpha_cutoff: (material.alpha_mode() == gltf::material::AlphaMode::Mask)
                 .then(|| material.alpha_cutoff().unwrap_or(0.5)),
             double_sided: material.double_sided(),
         })
     }
 
-    pub fn base_color(&self, uv: Vec2) -> Vec4 {
+    pub fn base_color(&self, uv: UvSample) -> Vec4 {
         self.base_color_factor
             * self
                 .base_color_texture
@@ -100,11 +105,11 @@ impl<'a> Material<'a> {
                 .map_or(Vec4::ONE, |texture| texture.sample(uv))
     }
 
-    pub fn metallic(&self, uv: Vec2) -> f32 {
+    pub fn metallic(&self, uv: UvSample) -> f32 {
         self.metallic_roughness(uv).0
     }
 
-    pub fn shading_normal(&self, uv: Vec2, normal: Vec3, tangent: Vec4) -> Vec3 {
+    pub fn shading_normal(&self, uv: UvSample, normal: Vec3, tangent: Vec4) -> Vec3 {
         let Some(texture) = &self.normal_texture else {
             return normal;
         };
@@ -125,7 +130,7 @@ impl<'a> Material<'a> {
             .unwrap_or(normal)
     }
 
-    pub fn metallic_roughness(&self, uv: Vec2) -> (f32, f32) {
+    pub fn metallic_roughness(&self, uv: UvSample) -> (f32, f32) {
         let sample = self
             .metallic_roughness_texture
             .as_ref()
@@ -136,13 +141,13 @@ impl<'a> Material<'a> {
         )
     }
 
-    pub fn occlusion(&self, uv: Vec2) -> f32 {
+    pub fn occlusion(&self, uv: UvSample) -> f32 {
         self.occlusion_texture.as_ref().map_or(1.0, |texture| {
             1.0 + self.occlusion_strength * (texture.sample(uv).x - 1.0)
         })
     }
 
-    pub fn emission(&self, uv: Vec2) -> Vec3 {
+    pub fn emission(&self, uv: UvSample) -> Vec3 {
         self.emissive_factor
             * self
                 .emissive_texture
@@ -151,14 +156,14 @@ impl<'a> Material<'a> {
     }
 }
 
-fn load_texture<'a>(
+fn load_texture(
     info: Option<gltf::texture::Info<'_>>,
-    images: &'a [gltf::image::Data],
+    textures: &mut TextureLoader<'_>,
     color_space: ColorSpace,
-) -> io::Result<Option<Texture<'a>>> {
+) -> io::Result<Option<Texture>> {
     info.map(|info| {
         check_texture_transform(info.extension_value("KHR_texture_transform").is_some())?;
-        Texture::new(info.texture(), images, color_space)
+        textures.load(info.texture(), color_space)
     })
     .transpose()
 }

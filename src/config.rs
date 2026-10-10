@@ -2,11 +2,15 @@ use std::{collections::HashMap, fs, io, path::Path};
 
 use serde::{Deserialize, Serialize};
 
+use crate::texture::Sampling;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub sampling: Sampling,
     pub camera: CameraConfig,
     #[serde(default)]
     scene_cameras: HashMap<String, CameraConfig>,

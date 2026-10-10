@@ -50,7 +50,7 @@ impl<'a> CaptureScene<'a> {
 
     pub fn render(
         &self,
-        materials: &[Material<'_>],
+        materials: &[Material],
         lightmap: &Lightmap,
         view_projection: Mat4,
         resolution: u32,

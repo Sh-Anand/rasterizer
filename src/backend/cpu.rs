@@ -17,7 +17,8 @@ use crate::{
     shadow::{LightShadow, ShadowMap, ShadowProjection},
     vertex::{ClipScene, reproject_scene},
     viewport::{
-        FragmentAttributes, ScreenPrimitive, ScreenScene, interpolate_attributes, project_scene,
+        FragmentAttributes, ScreenPrimitive, ScreenScene, UvGradients, interpolate_attributes,
+        project_scene,
     },
 };
 
@@ -40,7 +41,7 @@ pub struct Lighting<'a> {
 impl Lighting<'_> {
     fn shade(
         &self,
-        material: &Material<'_>,
+        material: &Material,
         attributes: &FragmentAttributes,
         base_color: Vec3,
         front_facing: bool,
@@ -97,7 +98,7 @@ enum Pass<'a> {
 
 pub fn render(
     scene: &ScreenScene,
-    materials: &[Material<'_>],
+    materials: &[Material],
     width: u32,
     height: u32,
     lighting: Lighting<'_>,
@@ -127,7 +128,7 @@ pub fn render(
 pub fn prepare_lights(
     lights: Vec<Light>,
     scene: &ClipScene,
-    materials: &[Material<'_>],
+    materials: &[Material],
     config: &ShadowConfig,
 ) -> io::Result<Vec<RenderLight>> {
     lights
@@ -149,7 +150,7 @@ pub fn prepare_lights(
 
 fn draw_shadow_map(
     scene: &ClipScene,
-    materials: &[Material<'_>],
+    materials: &[Material],
     shadow: &mut ShadowMap,
 ) -> io::Result<()> {
     let screen = {
@@ -167,7 +168,7 @@ fn draw_shadow_map(
 
 fn draw(
     primitives: &[ScreenPrimitive],
-    materials: &[Material<'_>],
+    materials: &[Material],
     depth_buffer: &mut DepthBuffer,
     mut pass: Pass<'_>,
 ) -> u64 {
@@ -218,6 +219,7 @@ fn draw(
             } else {
                 0.0
             };
+            let gradients = UvGradients::new(vertices);
             rasterize_triangle(
                 vertices.map(|v| v.position.truncate()),
                 width,
@@ -247,7 +249,8 @@ fn draw(
                         depth_buffer.values[index] = depth;
                         return;
                     }
-                    let attributes = interpolate_attributes(vertices, sample.barycentric);
+                    let attributes =
+                        interpolate_attributes(vertices, sample.barycentric, &gradients);
                     let base_color = material.base_color(attributes.uv);
                     if material
                         .alpha_cutoff

@@ -4,6 +4,7 @@ use glam::{DVec2, DVec3, DVec4, Vec2, Vec3, Vec4};
 
 use crate::{
     geometry::{PrimitiveSource, Triangle},
+    texture::UvSample,
     vertex::{ClipPrimitive, ClipScene, ClipVertex},
 };
 
@@ -39,14 +40,60 @@ pub struct ScreenScene {
 
 pub struct FragmentAttributes {
     pub world_position: Vec3,
-    pub uv: Vec2,
-    pub normal_uv: Vec2,
-    pub metallic_roughness_uv: Vec2,
-    pub occlusion_uv: Vec2,
-    pub emissive_uv: Vec2,
+    pub uv: UvSample,
+    pub normal_uv: UvSample,
+    pub metallic_roughness_uv: UvSample,
+    pub occlusion_uv: UvSample,
+    pub emissive_uv: UvSample,
     pub lightmap_uv: Vec2,
     pub normal: Vec3,
     pub tangent: Vec4,
+}
+
+pub struct UvGradients {
+    inv_w: DVec2,
+    sets: [[DVec2; 2]; 5],
+}
+
+impl UvGradients {
+    pub fn new(vertices: [ScreenVertex; 3]) -> Self {
+        let [a, b, c] = vertices.map(|v| v.position.truncate().as_dvec2());
+        let ab = b - a;
+        let ac = c - a;
+        let area = ab.perp_dot(ac);
+        let b = DVec2::new(ac.y, -ac.x) / area;
+        let c = DVec2::new(-ab.y, ab.x) / area;
+        let weights: [DVec2; 3] =
+            std::array::from_fn(|i| [-b - c, b, c][i] * f64::from(vertices[i].inv_w));
+        let uvs = vertices.map(|v| {
+            [
+                v.uv,
+                v.normal_uv,
+                v.metallic_roughness_uv,
+                v.occlusion_uv,
+                v.emissive_uv,
+            ]
+        });
+        Self {
+            inv_w: weights.iter().sum(),
+            sets: std::array::from_fn(|set| {
+                [
+                    (0..3).map(|i| uvs[i][set].as_dvec2() * weights[i].x).sum(),
+                    (0..3).map(|i| uvs[i][set].as_dvec2() * weights[i].y).sum(),
+                ]
+            }),
+        }
+    }
+
+    fn sample(&self, set: usize, uv: DVec2, inv_w: f64) -> UvSample {
+        let [dx, dy] = self.sets[set];
+        UvSample {
+            uv: uv.as_vec2(),
+            // Quotient rule for (UV/w) / (1/w).
+            dx: ((dx - uv * self.inv_w.x) / inv_w).as_vec2(),
+            dy: ((dy - uv * self.inv_w.y) / inv_w).as_vec2(),
+        }
+    }
 }
 
 pub fn project_scene(scene: &ClipScene, width: u32, height: u32) -> io::Result<ScreenScene> {
@@ -123,6 +170,7 @@ fn project_vertex(vertex: ClipVertex, width: f32, height: f32) -> io::Result<Scr
 pub fn interpolate_attributes(
     vertices: [ScreenVertex; 3],
     barycentric: [f32; 3],
+    gradients: &UvGradients,
 ) -> FragmentAttributes {
     let weights: [f64; 3] =
         std::array::from_fn(|i| f64::from(barycentric[i]) * f64::from(vertices[i].inv_w));
@@ -174,11 +222,11 @@ pub fn interpolate_attributes(
     let sum = weights.iter().sum::<f64>();
     FragmentAttributes {
         world_position: (world_position / sum).as_vec3(),
-        uv: (uv / sum).as_vec2(),
-        normal_uv: (normal_uv / sum).as_vec2(),
-        metallic_roughness_uv: (metallic_roughness_uv / sum).as_vec2(),
-        occlusion_uv: (occlusion_uv / sum).as_vec2(),
-        emissive_uv: (emissive_uv / sum).as_vec2(),
+        uv: gradients.sample(0, uv / sum, sum),
+        normal_uv: gradients.sample(1, normal_uv / sum, sum),
+        metallic_roughness_uv: gradients.sample(2, metallic_roughness_uv / sum, sum),
+        occlusion_uv: gradients.sample(3, occlusion_uv / sum, sum),
+        emissive_uv: gradients.sample(4, emissive_uv / sum, sum),
         lightmap_uv: (lightmap_uv / sum).as_vec2(),
         normal: (normal / sum).normalize_or_zero().as_vec3(),
         tangent: (tangent / sum).as_vec4(),

@@ -42,6 +42,10 @@ Apply normal maps only to runtime direct diffuse and specular lighting. Keep mes
 
 ## Runtime material shading
 
+Use one global material-texture filter: `none` (nearest), `bilinear` (level zero), or `trilinear` (mipmapped). Override glTF filter choices but preserve wrap modes. Filter color textures in linear RGB; data maps and alpha stay linear. Rasterized passes use analytic perspective-correct UV gradients instead of GPU quad derivatives; non-rasterized point queries use level zero. Changing the filter requires rebaking indirect lighting.
+
+Use isotropic box-filtered mipmaps, without anisotropic filtering, alpha-coverage preservation, or normal-variance roughness compensation. Oblique textures can blur and distant cutouts can thin out. Leave lightmap-atlas and shadow-depth sampling unchanged; ordinary atlas mipmaps would bleed between charts.
+
 Compute direct diffuse and specular together at runtime, sharing each light's direction and shadow lookup. This adds per-pixel diffuse evaluation instead of baking it, but permits camera/light-dependent Fresnel weighting. Use GGX distribution, height-correlated Smith visibility, and Schlick Fresnel, with dielectric F0 = 0.04 and metallic F0 = base color. Multiply direct diffuse reflectance by `1 - F_dielectric(V dot H)`; do not apply the metallic-tinted specular Fresnel to this term. Share the underlying `base_color * (1 - metallic)` reflectance with indirect shading. This follows the [glTF metallic-roughness mixing model](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#metal-brdf-and-dielectric-brdf), itself an approximation rather than an exactly energy-conserving layered BRDF.
 
 No specular indirect lighting, environment reflections, or microfacet multiple-scattering compensation is included. Rough metals can therefore lose energy and metals without directly visible lights can appear dark.
