@@ -146,6 +146,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = root.join("config.toml");
     let config = Config::load_scene(&config_path, &scene_name(&path).to_string_lossy())
         .map_err(|error| format!("Failed to load '{}': {error}", config_path.display()))?;
+    let (render_width, render_height) = config.render_size()?;
     let asset = GltfAsset::load(&path)
         .map_err(|error| format!("Failed to load '{}': {error}", path.display()))?;
     let mut transformed = transform_scene(&asset, &config)
@@ -198,13 +199,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let clipped = clip_scene(&transformed)
         .map_err(|error| format!("Failed to clip '{}': {error}", path.display()))?;
-    let screen = project_scene(&clipped, config.width, config.height)
+    let screen = project_scene(&clipped, render_width, render_height)
         .map_err(|error| format!("Failed to project '{}': {error}", path.display()))?;
     let rendered = cpu::render(
         &screen,
         &materials,
-        config.width,
-        config.height,
+        render_width,
+        render_height,
         cpu::Lighting {
             indirect: Some(&lighting.lightmap),
             lights: &lights,
@@ -215,13 +216,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let output_path = output_dir.join(scene_name(&path)).with_extension("png");
     rendered
         .framebuffer
-        .save(&output_path, &config.output)
+        .save(&output_path, &config.output, config.supersampling)
         .map_err(|error| format!("Failed to save '{}': {error}", output_path.display()))?;
 
     let document = &asset.document;
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
     println!("Loaded {}", path.display());
     println!("Resolution: {}x{}", config.width, config.height);
+    println!(
+        "Supersampling: {}x per axis ({} samples/pixel); render resolution: {render_width}x{render_height}",
+        config.supersampling,
+        u64::from(config.supersampling).pow(2)
+    );
     println!(
         "Camera (config.toml): position {:?}, target {:?}",
         config.camera.position, config.camera.target

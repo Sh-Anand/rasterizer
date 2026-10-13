@@ -9,6 +9,8 @@ use crate::texture::Sampling;
 pub struct Config {
     pub width: u32,
     pub height: u32,
+    #[serde(default = "default_supersampling")]
+    pub supersampling: u32,
     #[serde(default)]
     pub sampling: Sampling,
     pub camera: CameraConfig,
@@ -101,7 +103,21 @@ impl Config {
         let config: Self = toml::from_str(&text)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         config.output.validate()?;
+        config.render_size()?;
         Ok(config)
+    }
+
+    pub fn render_size(&self) -> io::Result<(u32, u32)> {
+        match (
+            self.width.checked_mul(self.supersampling),
+            self.height.checked_mul(self.supersampling),
+        ) {
+            (Some(width), Some(height)) if width > 0 && height > 0 => Ok((width, height)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Supersampled image dimensions must be nonzero and fit in 32 bits",
+            )),
+        }
     }
 
     pub fn load_scene(path: impl AsRef<Path>, scene: &str) -> io::Result<Self> {
@@ -111,4 +127,8 @@ impl Config {
         }
         Ok(config)
     }
+}
+
+fn default_supersampling() -> u32 {
+    1
 }

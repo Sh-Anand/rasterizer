@@ -10,7 +10,9 @@ This keeps the implementation straightforward, but can increase vertex and trian
 
 ## Shadows
 
-One orthographic shadow map covers the full scene so off-camera geometry can cast shadows. This keeps fitting simple, but large scenes spread the available resolution thinly. We use hard shadows with a half-texel slope bias plus a configurable constant bias: too little bias causes self-shadowing artifacts; too much detaches shadows from their casters.
+One orthographic shadow map covers the full scene so off-camera geometry can cast shadows. This keeps fitting simple, but large scenes spread the available resolution thinly. Use a one-texel slope bias to cover the bilinear PCF footprint, plus a configurable constant bias: too little bias causes self-shadowing artifacts; too much detaches shadows from their casters.
+
+Use fixed 2x2 percentage-closer filtering: bilinearly blend four depth-comparison results, not depths. Apply fractional visibility to each light in runtime shading and the indirect bake's direct-light input. This reduces jagged edges but does not model an area light's physical penumbra. Keep it independent of material-texture filtering; do not generate depth mipmaps. Clamp directional-map border taps. For emissive lights, remap taps across cube faces with per-face reference depths and average the three comparisons at cube corners. Filtering changes require rebaking indirect lighting.
 
 ## Area lights
 
@@ -18,9 +20,9 @@ Use one light list for the configured directional light and emissive triangles f
 
 Approximate each triangle's illumination with one sample at its world-space centroid, weighted by its area, inverse squared distance, and the receiver and emitter cosines. Emission textures and alpha masks are also sampled at the centroid; sidedness follows the material. This is cheap but inaccurate near large triangles and depends on tessellation. Specular highlights also use the centroid, so they do not reproduce the emitter's shape and can be especially inaccurate on smooth surfaces. More samples or area integration can replace it later.
 
-Use rasterized shadow maps at each emitting triangle's centroid: five cube faces aligned to its normal for a one-sided emitter, six for a two-sided emitter. Each sample produces a hard shadow; this does not integrate visibility over the emitting area or model indirect lighting. Rendering and storage scale with the number of emitting triangles. We keep the per-triangle baseline rather than grouping emitters for now.
+Use rasterized shadow maps at each emitting triangle's centroid: five cube faces aligned to its normal for a one-sided emitter, six for a two-sided emitter. Each sample produces a filtered point-source shadow; this does not integrate visibility over the emitting area or model indirect lighting. Rendering and storage scale with the number of emitting triangles. We keep the per-triangle baseline rather than grouping emitters for now.
 
-Perspective shadow faces store linear light-view depth, normalized by their far distance, with a half-texel slope bias and the configured constant bias. Their range fits the full scene; the near plane is 0.0001 times the far distance, so very nearby occluders can be clipped.
+Perspective shadow faces store linear light-view depth, normalized by their far distance, with the same one-texel slope bias and configured constant bias. Their range fits the full scene; the near plane is 0.0001 times the far distance, so very nearby occluders can be clipped.
 
 Lighting and visibility will remain rasterization-based, including future GI; no ray tracing or shadow rays.
 
@@ -44,7 +46,7 @@ Apply normal maps only to runtime direct diffuse and specular lighting. Keep mes
 
 Use one global material-texture filter: `none` (nearest), `bilinear` (level zero), or `trilinear` (mipmapped). Override glTF filter choices but preserve wrap modes. Filter color textures in linear RGB; data maps and alpha stay linear. Rasterized passes use analytic perspective-correct UV gradients instead of GPU quad derivatives; non-rasterized point queries use level zero. Changing the filter requires rebaking indirect lighting.
 
-Use isotropic box-filtered mipmaps, without anisotropic filtering, alpha-coverage preservation, or normal-variance roughness compensation. Oblique textures can blur and distant cutouts can thin out. Leave lightmap-atlas and shadow-depth sampling unchanged; ordinary atlas mipmaps would bleed between charts.
+Use isotropic box-filtered mipmaps, without anisotropic filtering, alpha-coverage preservation, or normal-variance roughness compensation. Oblique textures can blur and distant cutouts can thin out. Exclude lightmap-atlas and shadow-depth sampling from this setting; ordinary atlas mipmaps would bleed between charts, and shadows need comparison filtering instead.
 
 Compute direct diffuse and specular together at runtime, sharing each light's direction and shadow lookup. This adds per-pixel diffuse evaluation instead of baking it, but permits camera/light-dependent Fresnel weighting. Use GGX distribution, height-correlated Smith visibility, and Schlick Fresnel, with dielectric F0 = 0.04 and metallic F0 = base color. Multiply direct diffuse reflectance by `1 - F_dielectric(V dot H)`; do not apply the metallic-tinted specular Fresnel to this term. Share the underlying `base_color * (1 - metallic)` reflectance with indirect shading. This follows the [glTF metallic-roughness mixing model](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#metal-brdf-and-dielectric-brdf), itself an approximation rather than an exactly energy-conserving layered BRDF.
 
@@ -57,3 +59,5 @@ Preserve the configured directional light's existing brightness convention: inte
 Prepare shadow maps once per process and share them between baking and runtime direct lighting. They remain resident through rendering, increasing memory use during the indirect bake. Cached-lightmap renders still rebuild these maps at startup; camera movement alone does not require new maps or a new indirect bake. Disk caching of shadows is deferred.
 
 Keep the framebuffer in linear HDR and apply manual exposure, per-channel Reinhard tone mapping (`x / (1 + x)`), then sRGB encoding only at PNG export. This simple global curve preserves highlight differences but can desaturate bright colors; no automatic exposure or filmic color transform is modeled. Output settings do not affect the lighting bake. Tone mapping can be disabled to recover clamped output.
+
+Use regular-grid supersampling for the CPU reference renderer. A scale of N renders N times the output width and height, with independent coverage, depth, and shading for N² samples per pixel. Resolve color with a box average in linear HDR before tone mapping and sRGB encoding. This reuses the single-sample rasterizer but multiplies camera-framebuffer storage and pixel shading work by N²; it is not an MSAA execution model for GPU traces. Default to 1 (off). Shadow and bake resolutions stay unchanged, so changing supersampling does not require rebaking.

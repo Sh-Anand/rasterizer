@@ -28,24 +28,49 @@ impl Framebuffer {
         })
     }
 
-    pub fn save(&self, path: impl AsRef<Path>, output: &OutputConfig) -> image::ImageResult<()> {
+    pub fn save(
+        &self,
+        path: impl AsRef<Path>,
+        output: &OutputConfig,
+        supersampling: u32,
+    ) -> image::ImageResult<()> {
         output.validate()?;
-        let pixels: Vec<[u8; 3]> = self
-            .color
-            .iter()
-            .map(|color| {
-                let mut color = color.as_dvec3().max(DVec3::ZERO) * f64::from(output.exposure);
+        if supersampling == 0
+            || !self.width.is_multiple_of(supersampling)
+            || !self.height.is_multiple_of(supersampling)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Supersampling must be nonzero and divide the framebuffer dimensions",
+            )
+            .into());
+        }
+        let width = self.width / supersampling;
+        let height = self.height / supersampling;
+        let samples = f64::from(supersampling) * f64::from(supersampling);
+        let mut pixels = Vec::with_capacity(width as usize * height as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let mut color = DVec3::ZERO;
+                for sy in y * supersampling..(y + 1) * supersampling {
+                    let start = sy as usize * self.width as usize + (x * supersampling) as usize;
+                    color += self.color[start..start + supersampling as usize]
+                        .iter()
+                        .map(|color| color.as_dvec3())
+                        .sum::<DVec3>();
+                }
+                color = (color / samples).max(DVec3::ZERO) * f64::from(output.exposure);
                 if output.tone_mapping {
                     color /= DVec3::ONE + color;
                 }
-                encode_srgb(color.as_vec3())
-            })
-            .collect();
+                pixels.push(encode_srgb(color.as_vec3()));
+            }
+        }
         image::save_buffer(
             path,
             pixels.as_flattened(),
-            self.width,
-            self.height,
+            width,
+            height,
             image::ColorType::Rgb8,
         )
     }

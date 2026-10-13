@@ -1,6 +1,6 @@
 use std::io;
 
-use glam::{Mat3, Mat4, Vec3, camera::rh};
+use glam::{IVec2, Mat3, Mat4, Vec2, Vec3, Vec4, camera::rh};
 
 use crate::{
     config::ShadowConfig,
@@ -60,16 +60,11 @@ impl LightShadow {
         let far = (radius * 1.01).max(1e-3) as f32;
         let near = far * 1e-4;
         let projection = rh::proj::opengl::perspective(std::f32::consts::FRAC_PI_2, 1.0, near, far);
-        // +X, -X, +Y, -Y, +Z, -Z in the emitter's local frame.
-        let directions = [right, -right, up, -up, normal, -normal];
-        let ups = [up, up, -normal, normal, up, up];
         let count = if light.double_sided() { 6 } else { 5 };
-        let faces = directions
-            .into_iter()
-            .zip(ups)
-            .take(count)
-            .map(|(direction, up)| {
-                let view = rh::view::look_to_mat4(position, direction, up);
+        let faces = (0..count)
+            .map(|face| {
+                let axes = basis * cube_basis(face);
+                let view = rh::view::look_to_mat4(position, axes.z_axis, axes.y_axis);
                 ShadowMap::new(
                     projection * view,
                     ShadowProjection::Perspective { far },
@@ -98,9 +93,9 @@ impl LightShadow {
         }
     }
 
-    pub fn is_shadowed(&self, world_position: Vec3) -> bool {
+    pub fn visibility(&self, world_position: Vec3) -> f32 {
         match self {
-            Self::Directional(map) => map.is_shadowed(world_position),
+            Self::Directional(map) => map.visibility(world_position),
             Self::Area {
                 position,
                 basis,
@@ -108,18 +103,33 @@ impl LightShadow {
             } => {
                 let direction = basis.transpose() * (world_position - position);
                 if !direction.is_finite() || (faces.len() == 5 && direction.z <= 0.0) {
-                    return false;
+                    return 1.0;
                 }
-                let magnitude = direction.abs();
-                let axis = if magnitude.x >= magnitude.y && magnitude.x >= magnitude.z {
-                    0
-                } else if magnitude.y >= magnitude.z {
-                    1
-                } else {
-                    2
+                let face = cube_face(direction);
+                let map = &faces[face];
+                let Some(projected) = map.project(world_position) else {
+                    return 1.0;
                 };
-                let face = 2 * axis + usize::from(direction[axis] < 0.0);
-                faces[face].is_shadowed(world_position)
+                pcf(projected.truncate(), |texel| {
+                    let outside = texel.cmplt(IVec2::ZERO) | texel.cmpge(map.size().as_ivec2());
+                    if !outside.any() {
+                        return map.compare(texel, projected.z);
+                    }
+                    let uv = (texel.as_vec2() + 0.5) / map.size();
+                    let ray = cube_basis(face) * Vec3::new(2.0 * uv.x - 1.0, 1.0 - 2.0 * uv.y, 1.0);
+                    if outside.all() {
+                        // A corner tap touches three faces; blend their comparisons.
+                        (0..3)
+                            .map(|axis| {
+                                let neighbor = 2 * axis + usize::from(ray[axis] < 0.0);
+                                cube_compare(faces, world_position, ray, neighbor)
+                            })
+                            .sum::<f32>()
+                            / 3.0
+                    } else {
+                        cube_compare(faces, world_position, ray, cube_face(ray))
+                    }
+                })
             }
         }
     }
@@ -164,10 +174,29 @@ impl ShadowMap {
         })
     }
 
-    pub fn is_shadowed(&self, world_position: Vec3) -> bool {
+    pub fn visibility(&self, world_position: Vec3) -> f32 {
+        self.project(world_position).map_or(1.0, |projected| {
+            pcf(projected.truncate(), |texel| {
+                self.compare(texel, projected.z)
+            })
+        })
+    }
+
+    fn size(&self) -> Vec2 {
+        Vec2::new(self.depth.width as f32, self.depth.height as f32)
+    }
+
+    fn reference_depth(&self, clip: Vec4) -> f32 {
+        match self.projection {
+            ShadowProjection::Orthographic => (clip.z / clip.w + 1.0) * 0.5,
+            ShadowProjection::Perspective { far } => clip.w / far,
+        }
+    }
+
+    fn project(&self, world_position: Vec3) -> Option<Vec3> {
         let clip = self.view_projection * world_position.extend(1.0);
         if !clip.is_finite() || clip.w <= 0.0 {
-            return false;
+            return None;
         }
         let ndc = clip.truncate() / clip.w;
         // Adjacent cube faces can disagree by a few ulps at their shared edge.
@@ -176,18 +205,69 @@ impl ShadowMap {
             ShadowProjection::Perspective { .. } => 1.0 + 1e-5,
         };
         if !ndc.is_finite() || ndc.z.abs() > 1.0 || ndc.truncate().abs().max_element() > xy_limit {
-            return false;
+            return None;
         }
-        let x = ((ndc.x + 1.0) * 0.5 * self.depth.width as f32) as u32;
-        let y = ((1.0 - ndc.y) * 0.5 * self.depth.height as f32) as u32;
-        let index = y.min(self.depth.height - 1) as usize * self.depth.width as usize
-            + x.min(self.depth.width - 1) as usize;
-        let depth = match self.projection {
-            ShadowProjection::Orthographic => (ndc.z + 1.0) * 0.5,
-            ShadowProjection::Perspective { far } => clip.w / far,
-        };
-        depth > self.depth.values[index] + self.bias
+        let pixel = ndc_to_uv(ndc.truncate()) * self.size() - 0.5;
+        Some(pixel.extend(self.reference_depth(clip)))
     }
+
+    fn compare(&self, texel: IVec2, depth: f32) -> f32 {
+        let x = texel.x.clamp(0, self.depth.width as i32 - 1) as usize;
+        let y = texel.y.clamp(0, self.depth.height as i32 - 1) as usize;
+        f32::from(depth <= self.depth.values[y * self.depth.width as usize + x] + self.bias)
+    }
+}
+
+fn ndc_to_uv(ndc: Vec2) -> Vec2 {
+    Vec2::new(ndc.x + 1.0, 1.0 - ndc.y) * 0.5
+}
+
+fn pcf(pixel: Vec2, sample: impl Fn(IVec2) -> f32) -> f32 {
+    let base = pixel.floor();
+    let weight = pixel - base;
+    let base = base.as_ivec2();
+    let top = sample(base) * (1.0 - weight.x) + sample(base + IVec2::X) * weight.x;
+    let bottom = sample(base + IVec2::Y) * (1.0 - weight.x) + sample(base + IVec2::ONE) * weight.x;
+    top * (1.0 - weight.y) + bottom * weight.y
+}
+
+fn cube_basis(face: usize) -> Mat3 {
+    // +X, -X, +Y, -Y, +Z, -Z in the emitter's local frame.
+    let forward = [
+        Vec3::X,
+        Vec3::NEG_X,
+        Vec3::Y,
+        Vec3::NEG_Y,
+        Vec3::Z,
+        Vec3::NEG_Z,
+    ][face];
+    let up = [Vec3::Y, Vec3::Y, Vec3::NEG_Z, Vec3::Z, Vec3::Y, Vec3::Y][face];
+    Mat3::from_cols(forward.cross(up), up, forward)
+}
+
+fn cube_face(direction: Vec3) -> usize {
+    let magnitude = direction.abs();
+    let axis = if magnitude.x >= magnitude.y && magnitude.x >= magnitude.z {
+        0
+    } else if magnitude.y >= magnitude.z {
+        1
+    } else {
+        2
+    };
+    2 * axis + usize::from(direction[axis] < 0.0)
+}
+
+fn cube_compare(faces: &[ShadowMap], world_position: Vec3, ray: Vec3, face: usize) -> f32 {
+    let Some(map) = faces.get(face) else {
+        return 1.0;
+    };
+    let ray = cube_basis(face).transpose() * ray;
+    let texel = (ndc_to_uv(ray.truncate() / ray.z) * map.size())
+        .floor()
+        .as_ivec2();
+    // Each face stores linear depth along its own view axis.
+    let depth = map.reference_depth(map.view_projection * world_position.extend(1.0));
+    map.compare(texel, depth)
 }
 
 fn light_matrix(scene: &ClipScene, direction: Vec3) -> io::Result<Mat4> {

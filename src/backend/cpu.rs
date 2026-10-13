@@ -73,15 +73,15 @@ pub(crate) fn lambertian_lighting(lights: &[RenderLight], position: Vec3, normal
 }
 
 fn visible_lights(lights: &[RenderLight], position: Vec3) -> impl Iterator<Item = LightSample> {
-    lights
-        .iter()
-        .filter(move |light| {
-            !light
-                .shadow
-                .as_ref()
-                .is_some_and(|shadow| shadow.is_shadowed(position))
-        })
-        .filter_map(move |light| light.light.sample(position))
+    lights.iter().filter_map(move |light| {
+        let mut sample = light.light.sample(position)?;
+        let visibility = light
+            .shadow
+            .as_ref()
+            .map_or(1.0, |shadow| shadow.visibility(position));
+        sample.irradiance *= visibility;
+        (visibility > 0.0).then_some(sample)
+    })
 }
 
 enum Pass<'a> {
@@ -214,7 +214,8 @@ fn draw(
                 let dc = f64::from(depths[2]) - f64::from(depths[0]);
                 let dx = (db * ac.y - dc * ab.y) / area;
                 let dy = (ab.x * dc - ac.x * db) / area;
-                let bias = (0.5 * (dx.abs() + dy.abs())) as f32;
+                // A bilinear PCF tap can be up to one texel from the receiver.
+                let bias = (dx.abs() + dy.abs()) as f32;
                 if linear_far.is_some() { -bias } else { bias }
             } else {
                 0.0
