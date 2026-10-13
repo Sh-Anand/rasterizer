@@ -32,6 +32,8 @@ Bake exactly one diffuse indirect bounce for static geometry, materials, and lig
 
 Limit GI to one diffuse bounce to keep CPU baking tractable. Second and later reflections are omitted, so enclosed spaces can be too dark and multi-bounce color bleeding is missing. Increasing bake resolution does not recover these missing light paths.
 
+TODO (deferred): Add configurable indirect-bounce counts, starting with two. Propagate the previous bounce into the next and accumulate only indirect lighting in the saved lightmap. This requires rebaking and increases bake time, but leaves runtime shading unchanged.
+
 Generate a separate lightmap UV atlas with xatlas, giving each placed mesh instance its own space without changing material UVs or source triangle identities. Two-sided surfaces have independent front/back lighting. Chart padding supports bilinear filtering; sub-texel triangles use a centroid sample. The requested resolution is approximate: many small charts can make the atlas substantially larger.
 
 For indirect lighting, rasterize a five-face hemicube at each surface sample and integrate incoming light with cosine/solid-angle weights. Captures read a temporary direct Lambertian lighting atlas, multiplied by the visible surface's `base_color * (1 - metallic)`. Discard the direct atlas after computing the bounce; do not add it to the saved map. This models only diffuse reflection: pure metals contribute no bounce, so specular indirect lighting is deliberately omitted. Exclude emission because emissive triangles already contribute to runtime direct lighting; never feed indirect results back into these captures. Single-sided backfaces block light but do not reflect it.
@@ -41,6 +43,10 @@ Keep the initial bake coarse: this CPU method is expensive, and low lightmap/hem
 The indirect bake remains Lambertian: both bounce captures and the final receiver omit angle-dependent diffuse Fresnel weighting. Its RGB lightmap does not retain incoming light directions, so removing this approximation would require storing directional lighting and doing more runtime work.
 
 Apply normal maps only to runtime direct diffuse and specular lighting. Keep mesh normals for the indirect bake, including bounce captures; normal-map detail therefore does not affect bounced lighting.
+
+## Transparency
+
+TODO (deferred): Support alpha-blended transparency; `BLEND` materials currently render as opaque. Revisit per-pixel fragment lists for the CPU reference renderer: depth-sort and composite shaded fragments to handle intersecting transparent geometry, at the cost of extra storage and sorting. Transparent shadows and bake visibility also need an explicit policy. No transparency algorithm is selected yet.
 
 ## Runtime material shading
 
