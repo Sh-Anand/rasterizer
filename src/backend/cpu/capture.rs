@@ -2,7 +2,10 @@ use std::io;
 
 use glam::{Mat4, Vec3};
 
-use super::{Pass, draw};
+use super::{
+    fragment::shade_capture,
+    rasterization::{RasterPass, rasterize},
+};
 use crate::{
     clip::clip_primitive,
     framebuffer::DepthBuffer,
@@ -109,13 +112,14 @@ impl<'a> CaptureScene<'a> {
             }
             let clipped = clip_primitive(&projected)?;
             let screen = project_primitive(&clipped, resolution, resolution)?;
-            draw(
+            rasterize(
                 std::slice::from_ref(&screen),
                 materials,
                 &mut depth,
-                Pass::Capture {
-                    color: &mut color,
-                    lightmap,
+                RasterPass::Capture,
+                |index, material, attributes, base_color, front_facing| {
+                    color[index] =
+                        shade_capture(lightmap, material, attributes, base_color, front_facing);
                 },
             );
         }

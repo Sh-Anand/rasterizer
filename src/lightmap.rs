@@ -147,7 +147,9 @@ impl BakedLighting {
 
 pub fn cache_key(asset: &GltfAsset, config: &Config) -> io::Result<[u8; 32]> {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"rasterizer-lightmap-v6");
+    // v7 fixes tangent seams in object space before vertex transformation.
+    // Atlas vertex references from the previous topology must not be reused.
+    hash.update(b"rasterizer-lightmap-v7");
     hash.update(
         &gltf::json::serialize::to_vec(asset.document.as_json()).map_err(io::Error::other)?,
     );

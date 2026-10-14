@@ -14,10 +14,11 @@ use rasterizer::{
     bake,
     clip::clip_scene,
     config::Config,
-    lighting::{DirectionalLight, Light, collect_lights},
+    geometry::prepare_scene,
+    lighting::{DirectionalLight, Light, Lighting, RenderLight, collect_lights},
     lightmap::{BakedLighting, cache_key},
     material::load_materials,
-    vertex::transform_scene,
+    vertex::camera_matrix,
     viewport::project_scene,
 };
 
@@ -149,7 +150,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (render_width, render_height) = config.render_size()?;
     let asset = GltfAsset::load(&path)
         .map_err(|error| format!("Failed to load '{}': {error}", path.display()))?;
-    let mut transformed = transform_scene(&asset, &config)
+    let prepared = prepare_scene(&asset)
+        .map_err(|error| format!("Failed to prepare '{}': {error}", path.display()))?;
+    let mut transformed = cpu::transform_scene(&prepared, camera_matrix(&config)?)
         .map_err(|error| format!("Failed to transform '{}': {error}", path.display()))?;
     let output_dir = root.join("output");
     fs::create_dir_all(&output_dir)
@@ -192,7 +195,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     if camera_light {
         let direction = Vec3::from(config.camera.position) - Vec3::from(config.camera.target);
-        lights.push(cpu::RenderLight {
+        lights.push(RenderLight {
             light: Light::Directional(DirectionalLight::new(direction.to_array(), [1.0; 3], 1.0)?),
             shadow: None,
         });
@@ -206,7 +209,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &materials,
         render_width,
         render_height,
-        cpu::Lighting {
+        Lighting {
             indirect: Some(&lighting.lightmap),
             lights: &lights,
             camera_position: config.camera.position.into(),

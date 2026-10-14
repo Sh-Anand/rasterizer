@@ -1,9 +1,8 @@
 use std::{collections::HashMap, io};
 
-use glam::{Mat3, Vec2, Vec3, Vec4};
+use glam::{Vec2, Vec3, Vec4};
 
-use super::ClipVertex;
-use crate::geometry::Triangle;
+use super::{PreparedVertex, Triangle};
 
 pub(super) fn from_vertices(
     tangents: &[Vec4],
@@ -94,21 +93,16 @@ pub(super) fn generate(
     geometry.tangents
 }
 
-pub(super) fn apply(
-    vertices: &mut Vec<ClipVertex>,
+pub(super) fn split(
+    vertices: &mut Vec<PreparedVertex>,
     triangles: &mut [Triangle],
     tangents: &[[Vec4; 3]],
-    linear: Mat3,
 ) -> io::Result<()> {
-    let sign = linear.determinant().signum();
     let mut assigned = vec![false; vertices.len()];
     let mut variants = HashMap::new();
     for (triangle, tangents) in triangles.iter_mut().zip(tangents) {
         for (index, tangent) in triangle.indices.iter_mut().zip(tangents) {
-            let tangent = (linear * tangent.truncate())
-                .try_normalize()
-                .filter(|_| tangent.w.abs() == 1.0)
-                .map_or(Vec4::ZERO, |t| t.extend(tangent.w * sign));
+            let tangent = *tangent;
             let original = *index;
             if !assigned[original as usize] {
                 vertices[original as usize].tangent = tangent;

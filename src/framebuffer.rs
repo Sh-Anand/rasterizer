@@ -4,6 +4,11 @@ use glam::{DVec3, Vec3};
 
 use crate::{config::OutputConfig, texture::encode_srgb};
 
+pub struct RenderOutput {
+    pub framebuffer: Framebuffer,
+    pub covered_fragments: u64,
+}
+
 pub struct Framebuffer {
     pub width: u32,
     pub height: u32,

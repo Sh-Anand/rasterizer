@@ -9,6 +9,7 @@ use crate::{
     backend::cpu,
     config::{BakeConfig, Config},
     coverage::rasterize_triangle,
+    lighting::{RenderLight, lambertian_lighting},
     lightmap::{BakedLighting, Lightmap, MeshLayout, cache_key, invalid},
     material::Material,
     texture::UvSample,
@@ -29,7 +30,7 @@ pub fn bake(
     scene: &mut ClipScene,
     asset: &GltfAsset,
     materials: &[Material],
-    lights: &[cpu::RenderLight],
+    lights: &[RenderLight],
     config: &Config,
 ) -> io::Result<BakedLighting> {
     let settings = &config.bake;
@@ -63,10 +64,10 @@ pub fn bake(
     for (i, sample) in samples.iter().enumerate() {
         if let Some(sample) = sample {
             baked.lightmap.front[i] =
-                cpu::lambertian_lighting(lights, sample.position, sample.normal).to_array();
+                lambertian_lighting(lights, sample.position, sample.normal).to_array();
             if sample.double_sided {
                 baked.lightmap.back[i] =
-                    cpu::lambertian_lighting(lights, sample.position, -sample.normal).to_array();
+                    lambertian_lighting(lights, sample.position, -sample.normal).to_array();
             }
         }
     }

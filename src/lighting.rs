@@ -2,7 +2,42 @@ use std::{f32::consts::PI, io};
 
 use glam::Vec3;
 
-use crate::{config::LightConfig, material::Material, texture::UvSample, vertex::ClipScene};
+use crate::{
+    config::LightConfig, lightmap::Lightmap, material::Material, shadow::LightShadow,
+    texture::UvSample, vertex::ClipScene,
+};
+
+pub struct RenderLight {
+    pub light: Light,
+    pub shadow: Option<LightShadow>,
+}
+
+pub struct Lighting<'a> {
+    pub indirect: Option<&'a Lightmap>,
+    pub lights: &'a [RenderLight],
+    pub camera_position: Vec3,
+}
+
+pub(crate) fn lambertian_lighting(lights: &[RenderLight], position: Vec3, normal: Vec3) -> Vec3 {
+    visible_lights(lights, position)
+        .map(|sample| sample.diffuse(normal))
+        .sum()
+}
+
+pub(crate) fn visible_lights(
+    lights: &[RenderLight],
+    position: Vec3,
+) -> impl Iterator<Item = LightSample> {
+    lights.iter().filter_map(move |light| {
+        let mut sample = light.light.sample(position)?;
+        let visibility = light
+            .shadow
+            .as_ref()
+            .map_or(1.0, |shadow| shadow.visibility(position));
+        sample.irradiance *= visibility;
+        (visibility > 0.0).then_some(sample)
+    })
+}
 
 pub enum Light {
     Directional(DirectionalLight),
