@@ -2,6 +2,20 @@
 
 Record design decisions and their tradeoffs, not implementation details or progress.
 
+## GPU backend
+
+Model vertex and fragment shading as distinct programmable stages, with vertex shading intended to run on the GPU. For the initial backend, execute only fragment shading on the GPU; keep vertex processing, rasterization, interpolation, depth/output handling, and the other stages on the CPU. GPU fragment work must consume generated fragments, not scan tile triangle lists or perform software coverage tests. Keep the existing CPU renderer as an independent correctness reference.
+
+Use material-batched forward rendering. For each opaque material batch, the CPU completes vertex processing, rasterization, interpolation, and depth resolution against the accumulated depth buffer before launching GPU fragment shading. Retain the final winning fragment per sample, not every fragment that temporarily passes the depth test: a closer fragment removes that sample from the earlier fragment's ownership.
+
+Surviving fragments have disjoint sample ownership within a launch. Each GPU thread shades one fragment; the CPU copies its returned color to its owned samples without further depth arbitration. With MSAA, ownership is a per-sample mask, and a fragment may retain only part of its original coverage. Drop fragments with no remaining samples. This guarantee assumes no shader-side discard or depth replacement.
+
+Finish a batch's output before processing the next material batch. Later batches may overwrite earlier batches' samples after passing depth testing. Accept this cross-material shading overdraw rather than adding a scene-wide depth prepass or visibility buffer; simplicity takes priority over eliminating wasted shading.
+
+Shade fragments independently, without quad-based lane exchange. Use analytic perspective-correct UV gradients for texture sampling instead of neighboring fragment values. This avoids helper invocations for UV derivatives, but does not reproduce native quad-packing and helper-lane overhead; shaders needing derivatives of other computed values will need explicit derivative handling.
+
+This staged split is for developing and studying shader workloads, not measuring native graphics-pipeline frame times: CPU work and fragment input/output transfers add overhead that a fully GPU-resident implementation would not have. Treat fragment-to-lane packing as an explicit model, not an exact reproduction of a vendor's hardware scheduler.
+
 ## Clipping
 
 We chose explicit clipping with synthetic ("fake") intersection vertices instead of a guard band.
