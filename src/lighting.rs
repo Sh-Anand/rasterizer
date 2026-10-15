@@ -186,13 +186,6 @@ pub fn collect_lights(
         }
         for triangle in &primitive.triangles {
             let vertices = triangle.indices.map(|i| primitive.vertices[i as usize]);
-            let uv = (vertices[0].uv + vertices[1].uv + vertices[2].uv) / 3.0;
-            if material
-                .alpha_cutoff
-                .is_some_and(|cutoff| material.base_color(UvSample::point(uv)).w < cutoff)
-            {
-                continue;
-            }
             let emissive_uv =
                 (vertices[0].emissive_uv + vertices[1].emissive_uv + vertices[2].emissive_uv) / 3.0;
             let radiance = material.emission(UvSample::point(emissive_uv));

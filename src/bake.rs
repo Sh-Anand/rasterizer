@@ -12,7 +12,6 @@ use crate::{
     lighting::{RenderLight, lambertian_lighting},
     lightmap::{BakedLighting, Lightmap, MeshLayout, cache_key, invalid},
     material::Material,
-    texture::UvSample,
 };
 
 const PADDING: u32 = 2;
@@ -109,27 +108,18 @@ fn surface_samples(
                     .map(|(v, w)| v.world_position * w)
                     .sum();
                 let normal: Vec3 = v.iter().zip(weights).map(|(v, w)| v.normal * w).sum();
-                let uv: Vec2 = v.iter().zip(weights).map(|(v, w)| v.uv * w).sum();
-                if material
-                    .alpha_cutoff
-                    .is_some_and(|cutoff| material.base_color(UvSample::point(uv)).w < cutoff)
-                {
-                    return None;
-                }
-                Some(Sample {
+                Sample {
                     position,
                     normal: normal.try_normalize().unwrap_or(geometric_normal),
                     geometric_normal,
                     double_sided: material.double_sided,
-                })
+                }
             };
             let mut covered = false;
             rasterize_triangle(v.map(|v| v.lightmap_uv * size), width, height, |fragment| {
                 let [x, y] = fragment.pixel;
-                if let Some(sample) = sample(fragment.barycentric) {
-                    samples[(y * width + x) as usize] = Some(sample);
-                    covered = true;
-                }
+                samples[(y * width + x) as usize] = Some(sample(fragment.barycentric));
+                covered = true;
             });
             // Seed uncovered sub-texel triangles at their centroid.
             if !covered {
@@ -138,7 +128,7 @@ fn surface_samples(
                 let y = (uv.y as u32).min(height - 1);
                 let index = (y * width + x) as usize;
                 if samples[index].is_none() {
-                    samples[index] = sample([1.0 / 3.0; 3]);
+                    samples[index] = Some(sample([1.0 / 3.0; 3]));
                 }
             }
         }
@@ -480,13 +470,13 @@ impl<'a> CaptureScene<'a> {
                 .map_or(&default_material, |i| &materials[i]);
             rasterize(
                 &screen,
-                material,
+                material.double_sided,
                 &mut depth,
                 RasterPass::Capture,
-                |index, material, attributes, front_facing| {
+                |index, attributes, front_facing| {
                     // Single-sided backs occlude without reflecting.
                     color[index] = if front_facing || material.double_sided {
-                        material.base_color(attributes.uv).truncate()
+                        material.base_color(attributes.uv)
                             * (1.0
                                 - material
                                     .metallic_roughness(attributes.metallic_roughness_uv)

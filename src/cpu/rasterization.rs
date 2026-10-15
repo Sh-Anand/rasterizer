@@ -20,10 +20,10 @@ pub(crate) enum RasterPass {
 
 pub(crate) fn rasterize(
     primitive: &ScreenPrimitive,
-    material: &Material,
+    double_sided: bool,
     depth_buffer: &mut DepthBuffer,
     pass: RasterPass,
-    mut emit: impl FnMut(usize, &Material, &FragmentAttributes, bool),
+    mut emit: impl FnMut(usize, &FragmentAttributes, bool),
 ) -> u64 {
     let linear_far = match pass {
         RasterPass::Shadow(ShadowProjection::Perspective { far }) => Some(far),
@@ -41,9 +41,7 @@ pub(crate) fn rasterize(
         let area = ab.truncate().perp_dot(ac.truncate());
         // Downward viewport Y reverses winding.
         let front_facing = (area < 0.0) != primitive.mirrored;
-        if area == 0.0
-            || (!front_facing && !material.double_sided && !matches!(pass, RasterPass::Capture))
-        {
+        if area == 0.0 || (!front_facing && !double_sided && !matches!(pass, RasterPass::Capture)) {
             continue;
         }
         let depths = vertices.map(|v| {
@@ -65,7 +63,8 @@ pub(crate) fn rasterize(
         } else {
             0.0
         };
-        let gradients = UvGradients::new(vertices);
+        let gradients =
+            (!matches!(pass, RasterPass::Shadow(_))).then(|| UvGradients::new(vertices));
         rasterize_triangle(
             vertices.map(|v| v.position.truncate()),
             width,
@@ -91,20 +90,11 @@ pub(crate) fn rasterize(
                 if !depth.is_finite() || depth >= depth_buffer.values[index] {
                     return;
                 }
-                if matches!(pass, RasterPass::Shadow(_)) && material.alpha_cutoff.is_none() {
-                    depth_buffer.values[index] = depth;
-                    return;
-                }
-                let attributes = interpolate_attributes(vertices, sample.barycentric, &gradients);
-                if material
-                    .alpha_cutoff
-                    .is_some_and(|cutoff| material.base_color(attributes.uv).w < cutoff)
-                {
-                    return;
-                }
                 depth_buffer.values[index] = depth;
-                if !matches!(pass, RasterPass::Shadow(_)) {
-                    emit(index, material, &attributes, front_facing);
+                if let Some(gradients) = &gradients {
+                    let attributes =
+                        interpolate_attributes(vertices, sample.barycentric, gradients);
+                    emit(index, &attributes, front_facing);
                 }
             },
         );
@@ -133,10 +123,10 @@ impl RasterizationStage for CpuRasterization {
             batch.screen_triangles += screen.triangles.len();
             batch.covered_fragments += rasterize(
                 &screen,
-                material,
+                material.double_sided,
                 depth,
                 RasterPass::Camera,
-                |sample_index, _, attributes, front_facing| {
+                |sample_index, attributes, front_facing| {
                     let fragment = Fragment {
                         sample_index,
                         attributes: *attributes,

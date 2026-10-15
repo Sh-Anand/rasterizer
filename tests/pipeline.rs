@@ -126,23 +126,14 @@ impl FragmentStage for &mut RecordingFragment {
 }
 
 #[test]
-fn batches_share_depth_use_material_order_and_skip_occluded_or_masked_work() {
+fn batches_share_depth_use_material_order_and_skip_occluded_work() {
     let scene = scene(vec![
         triangle(Some(1), 0.0),
         triangle(Some(0), 0.5),
         triangle(Some(0), 0.0),
         triangle(None, 0.75),
-        triangle(Some(2), -0.5),
     ]);
-    let materials = [
-        material(Vec3::X),
-        material(Vec3::Y),
-        Material {
-            alpha_cutoff: Some(0.5),
-            base_color_factor: Vec4::ZERO,
-            ..material(Vec3::Z)
-        },
-    ];
+    let materials = [material(Vec3::X), material(Vec3::Y)];
     let mut fragment = RecordingFragment::default();
     let mut pipeline = Pipeline::new(CpuVertex, CpuRasterization, &mut fragment);
     let result = pipeline
@@ -319,64 +310,102 @@ fn equal_depth_keeps_the_first_winner_and_collector_state_does_not_cross_batches
 }
 
 #[test]
-fn alpha_rejection_preserves_earlier_winners_inside_the_same_material_batch() {
-    let document = gltf::Gltf::from_slice(
-        br#"{
-        "asset": {"version": "2.0"},
-        "images": [{"uri": "unused.png"}],
-        "textures": [{"source": 0}],
-        "materials": [{"alphaMode": "MASK", "alphaCutoff": 0.5,
-            "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}]
-    }"#,
-    )
-    .unwrap()
-    .document;
-    let asset = GltfAsset {
-        document,
-        buffers: Vec::new(),
-        images: vec![gltf::image::Data {
-            pixels: vec![255, 255, 255, 255, 255, 255, 255, 0],
-            format: gltf::image::Format::R8G8B8A8,
-            width: 2,
-            height: 1,
-        }],
+fn alpha_modes_factors_and_texture_alpha_are_ignored() {
+    let mut map = rasterizer::lightmap::Lightmap::new(1, 1).unwrap();
+    map.front[0] = [1.0; 3];
+    let lighting = || Lighting {
+        indirect: Some(&map),
+        ..lighting()
     };
-    let materials = load_materials(&asset, Sampling::None).unwrap();
-    let mut far = triangle(Some(0), 0.5);
-    for vertex in &mut far.vertices {
-        vertex.uv = Vec2::new(0.25, 0.5);
-    }
-    let mut cutout = triangle(Some(0), 0.0);
-    for vertex in &mut cutout.vertices {
-        vertex.uv = Vec2::new((vertex.position.x + 1.0) * 0.5, 0.5);
+    let opaque = Material {
+        base_color_factor: Vec3::new(0.5, 0.75, 1.0),
+        metallic_factor: 0.0,
+        emissive_factor: Vec3::new(0.25, 0.5, 0.75),
+        ..Material::default()
+    };
+    let mut near = triangle(Some(0), -0.5);
+    for vertex in &mut near.vertices {
+        vertex.uv = Vec2::new(0.75, 0.5);
         vertex.normal_uv = Vec2::ONE;
     }
-    let mut rejected = triangle(Some(0), -0.5);
-    for vertex in &mut rejected.vertices {
-        vertex.uv = Vec2::new(0.75, 0.5);
-        vertex.normal_uv = Vec2::splat(2.0);
+    let scene = scene(vec![triangle(Some(0), 0.5), near]);
+    let expected = cpu::render_reference(&scene, &[opaque], 16, 16, lighting()).unwrap();
+    assert!(
+        expected
+            .framebuffer
+            .color
+            .contains(&Vec3::new(0.75, 1.25, 1.75))
+    );
+    let light_config = rasterizer::config::LightConfig {
+        direction: [0.0, 0.0, 1.0],
+        color: [1.0; 3],
+        intensity: 1.0,
+    };
+    let shadow_config = rasterizer::config::ShadowConfig {
+        enabled: true,
+        resolution: 16,
+        bias: 0.0,
+    };
+    let shadow = |materials: &[Material]| {
+        let lights =
+            rasterizer::lighting::collect_lights(&scene, materials, &light_config).unwrap();
+        assert_eq!(lights.len(), 3);
+        let prepared =
+            rasterizer::shadow::prepare_lights(lights, &scene, materials, &shadow_config).unwrap();
+        prepared
+            .iter()
+            .flat_map(|light| light.shadow.as_ref().unwrap().maps())
+            .flat_map(|map| map.depth.values.iter().map(|z| z.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    let expected_shadow = shadow(&[material(Vec3::new(0.25, 0.5, 0.75))]);
+    for mode in ["OPAQUE", "MASK", "BLEND"] {
+        for alpha in [0.0, 0.25, 1.0] {
+            let json = format!(
+                r#"{{
+                "asset": {{"version": "2.0"}},
+                "images": [{{"uri": "unused.png"}}],
+                "textures": [{{"source": 0}}],
+                "materials": [{{"alphaMode": "{mode}", "alphaCutoff": 0.5,
+                    "emissiveFactor": [0.25, 0.5, 0.75],
+                    "pbrMetallicRoughness": {{"baseColorFactor": [0.5, 0.75, 1.0, {alpha}],
+                        "metallicFactor": 0.0, "baseColorTexture": {{"index": 0}}}}}}]
+            }}"#
+            );
+            let asset = GltfAsset {
+                document: gltf::Gltf::from_slice(json.as_bytes()).unwrap().document,
+                buffers: Vec::new(),
+                images: vec![gltf::image::Data {
+                    pixels: vec![255, 255, 255, 255, 255, 255, 255, 0],
+                    format: gltf::image::Format::R8G8B8A8,
+                    width: 2,
+                    height: 1,
+                }],
+            };
+            for sampling in [Sampling::None, Sampling::Bilinear, Sampling::Trilinear] {
+                let materials = load_materials(&asset, sampling).unwrap();
+                for uv in [Vec2::new(0.25, 0.5), Vec2::new(0.75, 0.5)] {
+                    assert_eq!(
+                        materials[0].base_color(UvSample::point(uv)),
+                        Vec3::new(0.5, 0.75, 1.0)
+                    );
+                }
+                let (batch, _) = collect_batch(&scene.primitives, &materials[0]);
+                assert!(!batch.fragments.is_empty());
+                assert!(
+                    batch
+                        .fragments
+                        .iter()
+                        .all(|f| f.attributes.normal_uv.uv == Vec2::ONE)
+                );
+                let actual = Pipeline::new(CpuVertex, CpuRasterization, CpuFragment)
+                    .render_transformed(&scene, &materials, 16, 16, lighting())
+                    .unwrap();
+                assert_same(&actual, &expected);
+                assert_eq!(shadow(&materials), expected_shadow);
+            }
+        }
     }
-    let (far_only, _) = collect_batch(std::slice::from_ref(&far), &materials[0]);
-    let (batch, _) = collect_batch(&[far, cutout, rejected], &materials[0]);
-    assert_eq!(batch.fragments.len(), far_only.fragments.len());
-    assert!(
-        batch
-            .fragments
-            .iter()
-            .any(|fragment| fragment.attributes.normal_uv.uv == Vec2::ZERO)
-    );
-    assert!(
-        batch
-            .fragments
-            .iter()
-            .any(|fragment| fragment.attributes.normal_uv.uv == Vec2::ONE)
-    );
-    assert!(
-        batch
-            .fragments
-            .iter()
-            .all(|fragment| fragment.attributes.normal_uv.uv != Vec2::splat(2.0))
-    );
 }
 
 #[test]

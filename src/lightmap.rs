@@ -150,8 +150,8 @@ impl BakedLighting {
 
 pub fn cache_key(asset: &GltfAsset, config: &Config) -> io::Result<[u8; 32]> {
     let mut hash = blake3::Hasher::new();
-    // v7 uses object-space tangent seams; older atlas indices are incompatible.
-    hash.update(b"rasterizer-lightmap-v7");
+    // v8 treats all surfaces as opaque, including shadow and bake visibility.
+    hash.update(b"rasterizer-lightmap-v8");
     hash.update(
         &gltf::json::serialize::to_vec(asset.document.as_json()).map_err(io::Error::other)?,
     );

@@ -37,7 +37,7 @@ pub(super) fn shade(
     attributes: &FragmentAttributes,
     front_facing: bool,
 ) -> Vec3 {
-    let base_color = material.base_color(attributes.uv).truncate();
+    let base_color = material.base_color(attributes.uv);
     let normal =
         material.shading_normal(attributes.normal_uv, attributes.normal, attributes.tangent);
     let normal = if front_facing { normal } else { -normal };

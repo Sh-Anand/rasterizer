@@ -45,7 +45,7 @@ pub struct RasterizedBatch {
 }
 
 pub trait RasterizationStage {
-    /// Clip, project, interpolate, and alpha/depth-test one material batch.
+    /// Clip, project, interpolate, and depth-test one material batch.
     /// Preserve shared depth; emit final winners only for updated samples. Ties keep the first.
     fn rasterize(
         &mut self,

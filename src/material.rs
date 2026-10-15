@@ -17,7 +17,7 @@ pub fn load_materials(asset: &GltfAsset, sampling: Sampling) -> io::Result<Vec<M
 }
 
 pub struct Material {
-    pub base_color_factor: Vec4,
+    pub base_color_factor: Vec3,
     pub base_color_texture: Option<Texture>,
     pub normal_scale: f32,
     pub normal_texture: Option<Texture>,
@@ -28,14 +28,13 @@ pub struct Material {
     pub occlusion_texture: Option<Texture>,
     pub emissive_factor: Vec3,
     pub emissive_texture: Option<Texture>,
-    pub alpha_cutoff: Option<f32>,
     pub double_sided: bool,
 }
 
 impl Default for Material {
     fn default() -> Self {
         Self {
-            base_color_factor: Vec4::ONE,
+            base_color_factor: Vec3::ONE,
             base_color_texture: None,
             normal_scale: 1.0,
             normal_texture: None,
@@ -46,7 +45,6 @@ impl Default for Material {
             occlusion_texture: None,
             emissive_factor: Vec3::ZERO,
             emissive_texture: None,
-            alpha_cutoff: None,
             double_sided: false,
         }
     }
@@ -58,7 +56,7 @@ impl Material {
         let normal = material.normal_texture();
         let occlusion = material.occlusion_texture();
         Ok(Self {
-            base_color_factor: Vec4::from(pbr.base_color_factor()),
+            base_color_factor: Vec4::from(pbr.base_color_factor()).truncate(),
             base_color_texture: load_texture(pbr.base_color_texture(), textures, ColorSpace::Srgb)?,
             normal_scale: normal.as_ref().map_or(1.0, |info| info.scale()),
             normal_texture: normal
@@ -91,18 +89,16 @@ impl Material {
                 textures,
                 ColorSpace::Srgb,
             )?,
-            alpha_cutoff: (material.alpha_mode() == gltf::material::AlphaMode::Mask)
-                .then(|| material.alpha_cutoff().unwrap_or(0.5)),
             double_sided: material.double_sided(),
         })
     }
 
-    pub fn base_color(&self, uv: UvSample) -> Vec4 {
+    pub fn base_color(&self, uv: UvSample) -> Vec3 {
         self.base_color_factor
             * self
                 .base_color_texture
                 .as_ref()
-                .map_or(Vec4::ONE, |texture| texture.sample(uv))
+                .map_or(Vec3::ONE, |texture| texture.sample(uv).truncate())
     }
 
     pub fn shading_normal(&self, uv: UvSample, normal: Vec3, tangent: Vec4) -> Vec3 {

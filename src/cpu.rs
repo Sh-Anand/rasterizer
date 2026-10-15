@@ -47,10 +47,10 @@ pub fn render_reference(
         output.screen_triangles += screen.triangles.len();
         output.covered_fragments += rasterize(
             &screen,
-            material,
+            material.double_sided,
             &mut output.framebuffer.depth,
             RasterPass::Camera,
-            |index, material, attributes, front_facing| {
+            |index, attributes, front_facing| {
                 output.framebuffer.color[index] =
                     fragment::shade(&lighting, material, attributes, front_facing);
             },

@@ -369,10 +369,10 @@ fn draw_shadow_map(
         let screen = project(&primitive, shadow.depth.width, shadow.depth.height)?;
         rasterize(
             &screen,
-            material,
+            material.double_sided,
             &mut shadow.depth,
             RasterPass::Shadow(shadow.projection),
-            |_, _, _, _| {},
+            |_, _, _| {},
         );
     }
     Ok(())
