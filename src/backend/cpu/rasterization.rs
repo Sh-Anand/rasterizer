@@ -147,6 +147,11 @@ impl RasterizationStage for CpuRasterization {
         depth: &mut DepthBuffer,
     ) -> io::Result<RasterizedBatch> {
         let mut batch = RasterizedBatch::default();
+        let mut slot_for_sample = Vec::new();
+        slot_for_sample
+            .try_reserve_exact(depth.values.len())
+            .map_err(io::Error::other)?;
+        slot_for_sample.resize(depth.values.len(), usize::MAX);
         for primitive in primitives {
             let clipped = clip_primitive(primitive)?;
             let screen = project_primitive(&clipped, depth.width, depth.height)?;
@@ -158,11 +163,21 @@ impl RasterizationStage for CpuRasterization {
                 depth,
                 RasterPass::Camera,
                 |sample_index, _, attributes, front_facing| {
-                    batch.fragments.push(Fragment {
+                    let fragment = Fragment {
                         sample_index,
                         attributes: *attributes,
                         front_facing,
-                    });
+                    };
+                    // The callback runs only after depth and alpha tests succeed.
+                    // Keep the latest winner in its first allocated slot, avoiding
+                    // both stale fragments and a separate compaction pass.
+                    let slot = &mut slot_for_sample[sample_index];
+                    if *slot == usize::MAX {
+                        *slot = batch.fragments.len();
+                        batch.fragments.push(fragment);
+                    } else {
+                        batch.fragments[*slot] = fragment;
+                    }
                 },
             );
         }

@@ -16,6 +16,8 @@ Process the default material first, followed by ascending glTF material index, p
 
 Surviving fragments have disjoint sample ownership within a launch. Each GPU thread shades one fragment; the CPU copies its returned color to its owned samples without further depth arbitration. With MSAA, ownership is a per-sample mask, and a fragment may retain only part of its original coverage. Drop fragments with no remaining samples. This guarantee assumes no shader-side discard or depth replacement.
 
+For the current single-sample and supersampled rendering, each fragment record owns one render-resolution sample. Retain at most one record per sample within a material batch, replacing its attributes when a closer fragment passes depth and alpha testing. This bounds retained fragment data by the framebuffer sample count rather than by the amount of overdraw. Samples still owned by an earlier material batch produce no fragment work in the current batch.
+
 Finish a batch's output before processing the next material batch. Later batches may overwrite earlier batches' samples after passing depth testing. Accept this cross-material shading overdraw rather than adding a scene-wide depth prepass or visibility buffer; simplicity takes priority over eliminating wasted shading.
 
 Shade fragments independently, without quad-based lane exchange. Use analytic perspective-correct UV gradients for texture sampling instead of neighboring fragment values. This avoids helper invocations for UV derivatives, but does not reproduce native quad-packing and helper-lane overhead; shaders needing derivatives of other computed values will need explicit derivative handling.

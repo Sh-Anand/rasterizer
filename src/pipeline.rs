@@ -25,8 +25,8 @@ pub struct Fragment {
 
 #[derive(Default)]
 pub struct RasterizedBatch {
-    /// Accepted fragments in draw order. A sample may currently appear more than once;
-    /// the final-winner collector will remove this within-batch overdraw.
+    /// Final depth/alpha winners for samples updated by this batch.
+    /// Sample indices are unique within the batch; vector order is not draw order.
     pub fragments: Vec<Fragment>,
     pub covered_fragments: u64,
     pub screen_vertices: usize,
@@ -36,6 +36,8 @@ pub struct RasterizedBatch {
 pub trait RasterizationStage {
     /// Clip, project, interpolate, alpha-test, and depth-test one material batch.
     /// Depth is shared across batches; implementations must not clear it.
+    /// Emit only the final winner for each updated sample, excluding samples that
+    /// retain a previous batch's depth. Equal depths retain the earlier winner.
     fn rasterize(
         &mut self,
         primitives: &[&ClipPrimitive],
@@ -46,6 +48,7 @@ pub trait RasterizationStage {
 
 pub trait FragmentStage {
     /// Return one linear HDR color per input fragment, in the same order.
+    /// Each input owns a distinct sample within this batch.
     /// Completion includes any device readback; the coordinator owns color writes.
     fn shade(
         &mut self,

@@ -1,18 +1,19 @@
-use std::io;
+use std::{collections::HashSet, io};
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
 use rasterizer::{
+    asset::GltfAsset,
     backend::cpu::{self, CpuFragment, CpuRasterization, CpuVertex},
     clip::clip_scene,
     framebuffer::{DepthBuffer, RenderOutput},
     geometry::{PreparedScene, PrimitiveSource, Triangle},
     lighting::Lighting,
-    material::Material,
+    material::{Material, load_materials},
     pipeline::{
         Fragment, FragmentStage, Pipeline, RasterizationStage, RasterizedBatch, VertexStage,
     },
-    texture::UvSample,
+    texture::{Sampling, UvSample},
     vertex::{ClipPrimitive, ClipScene, ClipVertex},
     viewport::{FragmentAttributes, project_scene},
 };
@@ -102,6 +103,7 @@ fn assert_same(actual: &RenderOutput, expected: &RenderOutput) {
 #[derive(Default)]
 struct RecordingFragment {
     materials: Vec<Vec3>,
+    sample_counts: Vec<usize>,
 }
 
 impl FragmentStage for RecordingFragment {
@@ -112,7 +114,9 @@ impl FragmentStage for RecordingFragment {
         lighting: &Lighting<'_>,
     ) -> io::Result<Vec<Vec3>> {
         assert!(!fragments.is_empty());
+        assert_unique_samples(fragments);
         self.materials.push(material.emissive_factor);
+        self.sample_counts.push(fragments.len());
         CpuFragment.shade(fragments, material, lighting)
     }
 }
@@ -151,6 +155,17 @@ fn batches_share_depth_use_material_order_and_skip_occluded_or_masked_work() {
     let screen = project_scene(&clip_scene(&reference_scene).unwrap(), 8, 8).unwrap();
     let reference = cpu::render(&screen, &materials, 8, 8, lighting()).unwrap();
     assert_same(&result, &reference);
+    let visible_samples = result
+        .framebuffer
+        .depth
+        .values
+        .iter()
+        .filter(|z| z.is_finite())
+        .count();
+    assert_eq!(
+        pipeline.fragment.sample_counts,
+        [visible_samples, visible_samples]
+    );
     assert!(
         result
             .framebuffer
@@ -170,6 +185,213 @@ fn batches_share_depth_use_material_order_and_skip_occluded_or_masked_work() {
             assert!((*depth - 0.5).abs() < 1e-6);
         }
     }
+}
+
+fn assert_unique_samples(fragments: &[Fragment]) {
+    let samples: HashSet<_> = fragments
+        .iter()
+        .map(|fragment| fragment.sample_index)
+        .collect();
+    assert_eq!(samples.len(), fragments.len());
+}
+
+fn collect_batch(
+    primitives: &[ClipPrimitive],
+    material: &Material,
+) -> (RasterizedBatch, DepthBuffer) {
+    let mut depth = DepthBuffer::new(16, 16).unwrap();
+    let batch = CpuRasterization
+        .rasterize(&primitives.iter().collect::<Vec<_>>(), material, &mut depth)
+        .unwrap();
+    assert_unique_samples(&batch.fragments);
+    assert_eq!(
+        batch.fragments.len(),
+        depth.values.iter().filter(|z| z.is_finite()).count()
+    );
+    (batch, depth)
+}
+
+#[test]
+fn nearer_fragments_replace_all_attributes_and_facing_within_and_across_primitives() {
+    let far = triangle(Some(0), 0.5);
+    let mut near = triangle(Some(0), -0.5);
+    near.triangles[0].indices.swap(1, 2);
+    for vertex in &mut near.vertices {
+        vertex.uv = Vec2::new(0.25, 0.75);
+        vertex.normal_uv = Vec2::ONE;
+        vertex.normal = Vec3::X;
+        vertex.tangent = Vec4::new(0.0, 1.0, 0.0, -1.0);
+    }
+    let material = Material {
+        double_sided: true,
+        ..Material::default()
+    };
+    for combine in [false, true] {
+        let primitives = if combine {
+            let mut combined = far.clone();
+            combined.vertices.extend_from_slice(&near.vertices);
+            combined.triangles.push(Triangle {
+                indices: [3, 5, 4],
+                source_index: 1,
+            });
+            vec![combined]
+        } else {
+            vec![far.clone(), near.clone()]
+        };
+        let (batch, _) = collect_batch(&primitives, &material);
+        assert!(!batch.fragments.is_empty());
+        assert_eq!(batch.covered_fragments, 2 * batch.fragments.len() as u64);
+        for fragment in batch.fragments {
+            assert!(!fragment.front_facing);
+            assert_eq!(fragment.attributes.uv.uv, Vec2::new(0.25, 0.75));
+            assert_eq!(fragment.attributes.normal_uv.uv, Vec2::ONE);
+            assert_eq!(fragment.attributes.normal, Vec3::X);
+            assert_eq!(fragment.attributes.tangent, Vec4::new(0.0, 1.0, 0.0, -1.0));
+            assert!((fragment.attributes.world_position.z + 0.5).abs() < 1e-6);
+        }
+    }
+}
+
+#[test]
+fn partial_occlusion_retains_the_uncovered_samples_of_an_earlier_triangle() {
+    let far = triangle(Some(0), 0.5);
+    let mut near = triangle(Some(0), -0.5);
+    for vertex in &mut near.vertices {
+        vertex.position.x *= 0.5;
+        vertex.position.y *= 0.5;
+        vertex.normal_uv = Vec2::ONE;
+    }
+    let material = Material::default();
+    let (far_only, _) = collect_batch(std::slice::from_ref(&far), &material);
+    let (near_only, _) = collect_batch(std::slice::from_ref(&near), &material);
+    let (batch, _) = collect_batch(&[far, near], &material);
+    let near_samples: HashSet<_> = near_only
+        .fragments
+        .iter()
+        .map(|fragment| fragment.sample_index)
+        .collect();
+    assert!(!near_samples.is_empty());
+    assert!(near_samples.len() < far_only.fragments.len());
+    assert_eq!(batch.fragments.len(), far_only.fragments.len());
+    for fragment in batch.fragments {
+        let expected_tag = if near_samples.contains(&fragment.sample_index) {
+            Vec2::ONE
+        } else {
+            Vec2::ZERO
+        };
+        assert_eq!(fragment.attributes.normal_uv.uv, expected_tag);
+    }
+}
+
+#[test]
+fn equal_depth_keeps_the_first_winner_and_collector_state_does_not_cross_batches() {
+    let mut rasterizer = CpuRasterization;
+    let material = Material::default();
+    for (width, height) in [(8, 8), (16, 16)] {
+        let mut depth = DepthBuffer::new(width, height).unwrap();
+        let first = triangle(Some(0), 0.5);
+        let mut equal = first.clone();
+        for vertex in &mut equal.vertices {
+            vertex.normal_uv = Vec2::ONE;
+        }
+        let batch = rasterizer
+            .rasterize(&[&first, &equal], &material, &mut depth)
+            .unwrap();
+        assert_unique_samples(&batch.fragments);
+        let samples = batch.fragments.len();
+        assert!(samples > 0);
+        assert!(
+            batch
+                .fragments
+                .iter()
+                .all(|fragment| fragment.attributes.normal_uv.uv == Vec2::ZERO)
+        );
+        let previous_depth = depth.values.clone();
+        let rejected = rasterizer
+            .rasterize(&[&equal], &material, &mut depth)
+            .unwrap();
+        assert!(rejected.fragments.is_empty());
+        assert_eq!(depth.values, previous_depth);
+
+        let closer = triangle(Some(0), -0.5);
+        let next = rasterizer
+            .rasterize(&[&closer], &material, &mut depth)
+            .unwrap();
+        assert_unique_samples(&next.fragments);
+        assert_eq!(next.fragments.len(), samples);
+        let rejected = rasterizer
+            .rasterize(&[&first], &material, &mut depth)
+            .unwrap();
+        assert!(rejected.fragments.is_empty());
+        assert!(
+            rasterizer
+                .rasterize(&[], &material, &mut depth)
+                .unwrap()
+                .fragments
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn alpha_rejection_preserves_earlier_winners_inside_the_same_material_batch() {
+    let document = gltf::Gltf::from_slice(
+        br#"{
+        "asset": {"version": "2.0"},
+        "images": [{"uri": "unused.png"}],
+        "textures": [{"source": 0}],
+        "materials": [{"alphaMode": "MASK", "alphaCutoff": 0.5,
+            "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}]
+    }"#,
+    )
+    .unwrap()
+    .document;
+    let asset = GltfAsset {
+        document,
+        buffers: Vec::new(),
+        images: vec![gltf::image::Data {
+            pixels: vec![255, 255, 255, 255, 255, 255, 255, 0],
+            format: gltf::image::Format::R8G8B8A8,
+            width: 2,
+            height: 1,
+        }],
+    };
+    let materials = load_materials(&asset, Sampling::None).unwrap();
+    let mut far = triangle(Some(0), 0.5);
+    for vertex in &mut far.vertices {
+        vertex.uv = Vec2::new(0.25, 0.5);
+    }
+    let mut cutout = triangle(Some(0), 0.0);
+    for vertex in &mut cutout.vertices {
+        vertex.uv = Vec2::new((vertex.position.x + 1.0) * 0.5, 0.5);
+        vertex.normal_uv = Vec2::ONE;
+    }
+    let mut rejected = triangle(Some(0), -0.5);
+    for vertex in &mut rejected.vertices {
+        vertex.uv = Vec2::new(0.75, 0.5);
+        vertex.normal_uv = Vec2::splat(2.0);
+    }
+    let (far_only, _) = collect_batch(std::slice::from_ref(&far), &materials[0]);
+    let (batch, _) = collect_batch(&[far, cutout, rejected], &materials[0]);
+    assert_eq!(batch.fragments.len(), far_only.fragments.len());
+    assert!(
+        batch
+            .fragments
+            .iter()
+            .any(|fragment| fragment.attributes.normal_uv.uv == Vec2::ZERO)
+    );
+    assert!(
+        batch
+            .fragments
+            .iter()
+            .any(|fragment| fragment.attributes.normal_uv.uv == Vec2::ONE)
+    );
+    assert!(
+        batch
+            .fragments
+            .iter()
+            .all(|fragment| fragment.attributes.normal_uv.uv != Vec2::splat(2.0))
+    );
 }
 
 #[test]
