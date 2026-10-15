@@ -14,12 +14,16 @@ impl FragmentStage for CpuFragment {
     fn shade(
         &mut self,
         fragments: &[Fragment],
-        material: &Material,
+        materials: &[Material],
         lighting: &Lighting<'_>,
     ) -> io::Result<Vec<Vec3>> {
+        let default_material = Material::default();
         Ok(fragments
             .iter()
             .map(|fragment| {
+                let material = fragment
+                    .material_index
+                    .map_or(&default_material, |index| &materials[index]);
                 shade(
                     lighting,
                     material,

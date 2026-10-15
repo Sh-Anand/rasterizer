@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, io};
+use std::io;
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
@@ -31,12 +31,14 @@ pub struct FragmentAttributes {
 pub struct Fragment {
     /// Index in the render-resolution framebuffer.
     pub sample_index: usize,
+    /// None selects the default glTF material.
+    pub material_index: Option<usize>,
     pub attributes: FragmentAttributes,
     pub front_facing: bool,
 }
 
 #[derive(Default)]
-pub struct RasterizedBatch {
+pub struct RasterizedScene {
     /// Final winners with unique sample indices; order is unspecified.
     pub fragments: Vec<Fragment>,
     pub covered_fragments: u64,
@@ -45,14 +47,14 @@ pub struct RasterizedBatch {
 }
 
 pub trait RasterizationStage {
-    /// Clip, project, interpolate, and depth-test one material batch.
-    /// Preserve shared depth; emit final winners only for updated samples. Ties keep the first.
+    /// Clip, project, interpolate, and depth-test the scene in input order.
+    /// Emit final winners only for updated samples. Equal depths keep the first.
     fn rasterize(
         &mut self,
         primitives: &[&ClipPrimitive],
-        material: &Material,
+        materials: &[Material],
         depth: &mut DepthBuffer,
-    ) -> io::Result<RasterizedBatch>;
+    ) -> io::Result<RasterizedScene>;
 }
 
 pub trait FragmentStage {
@@ -60,7 +62,7 @@ pub trait FragmentStage {
     fn shade(
         &mut self,
         fragments: &[Fragment],
-        material: &Material,
+        materials: &[Material],
         lighting: &Lighting<'_>,
     ) -> io::Result<Vec<Vec3>>;
 }
@@ -117,48 +119,36 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
                 "Non-finite camera position",
             ));
         }
-        // Default material first, then material index; preserve order within each batch.
-        let mut batches = BTreeMap::<Option<usize>, Vec<&ClipPrimitive>>::new();
-        for primitive in &scene.primitives {
-            let index = primitive.source.material_index;
-            if index.is_some_and(|index| index >= materials.len()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Primitive material index is outside the material list",
-                ));
-            }
-            batches.entry(index).or_default().push(primitive);
+        let mut primitives: Vec<_> = scene.primitives.iter().collect();
+        if primitives.iter().any(|primitive| {
+            primitive
+                .source
+                .material_index
+                .is_some_and(|index| index >= materials.len())
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Primitive material index is outside the material list",
+            ));
         }
-        let default_material = Material::default();
-        let mut output = RenderOutput {
-            framebuffer: Framebuffer::new(width, height)?,
-            covered_fragments: 0,
-            screen_vertices: 0,
-            screen_triangles: 0,
-        };
-        for (index, primitives) in batches {
-            let material = index.map_or(&default_material, |index| &materials[index]);
-            let batch = self.rasterization.rasterize(
-                &primitives,
-                material,
-                &mut output.framebuffer.depth,
-            )?;
-            output.covered_fragments += batch.covered_fragments;
-            output.screen_vertices += batch.screen_vertices;
-            output.screen_triangles += batch.screen_triangles;
-            if batch.fragments.is_empty() {
-                continue;
-            }
-            let colors = self.fragment.shade(&batch.fragments, material, &lighting)?;
-            if colors.len() != batch.fragments.len() {
+        // Preserve equal-depth winners: default material first, then stable material order.
+        primitives.sort_by_key(|primitive| primitive.source.material_index);
+        let mut framebuffer = Framebuffer::new(width, height)?;
+        let rasterized =
+            self.rasterization
+                .rasterize(&primitives, materials, &mut framebuffer.depth)?;
+        if !rasterized.fragments.is_empty() {
+            let colors = self
+                .fragment
+                .shade(&rasterized.fragments, materials, &lighting)?;
+            if colors.len() != rasterized.fragments.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Fragment stage returned the wrong number of colors",
                 ));
             }
-            for (fragment, color) in batch.fragments.iter().zip(colors) {
-                let sample = output
-                    .framebuffer
+            for (fragment, color) in rasterized.fragments.iter().zip(colors) {
+                let sample = framebuffer
                     .color
                     .get_mut(fragment.sample_index)
                     .ok_or_else(|| {
@@ -170,6 +160,11 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
                 *sample = color;
             }
         }
-        Ok(output)
+        Ok(RenderOutput {
+            framebuffer,
+            covered_fragments: rasterized.covered_fragments,
+            screen_vertices: rasterized.screen_vertices,
+            screen_triangles: rasterized.screen_triangles,
+        })
     }
 }

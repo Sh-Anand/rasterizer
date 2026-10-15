@@ -4,7 +4,7 @@ use glam::{IVec2, Mat3, Mat4, Vec2, Vec3, Vec4, camera::rh};
 
 use crate::{
     config::ShadowConfig,
-    cpu::rasterization::{RasterPass, project, rasterize},
+    cpu::rasterization::{project, rasterize},
     framebuffer::DepthBuffer,
     geometry::ClipScene,
     lighting::{AreaLight, Light, RenderLight},
@@ -371,7 +371,7 @@ fn draw_shadow_map(
             &screen,
             material.double_sided,
             &mut shadow.depth,
-            RasterPass::Shadow(shadow.projection),
+            Some(shadow.projection),
             |_, _, _| {},
         );
     }

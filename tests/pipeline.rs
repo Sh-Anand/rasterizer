@@ -11,7 +11,7 @@ use rasterizer::{
     lighting::Lighting,
     material::{Material, load_materials},
     pipeline::{
-        Fragment, FragmentAttributes, FragmentStage, Pipeline, RasterizationStage, RasterizedBatch,
+        Fragment, FragmentAttributes, FragmentStage, Pipeline, RasterizationStage, RasterizedScene,
         VertexStage,
     },
     texture::{Sampling, UvSample},
@@ -106,7 +106,7 @@ fn reference(scene: &ClipScene, materials: &[Material], size: u32) -> RenderOutp
 
 #[derive(Default)]
 struct RecordingFragment {
-    materials: Vec<Vec3>,
+    material_indices: Vec<Option<usize>>,
     sample_counts: Vec<usize>,
 }
 
@@ -114,19 +114,20 @@ impl FragmentStage for &mut RecordingFragment {
     fn shade(
         &mut self,
         fragments: &[Fragment],
-        material: &Material,
+        materials: &[Material],
         lighting: &Lighting<'_>,
     ) -> io::Result<Vec<Vec3>> {
         assert!(!fragments.is_empty());
         assert_unique_samples(fragments);
-        self.materials.push(material.emissive_factor);
+        self.material_indices
+            .extend(fragments.iter().map(|fragment| fragment.material_index));
         self.sample_counts.push(fragments.len());
-        CpuFragment.shade(fragments, material, lighting)
+        CpuFragment.shade(fragments, materials, lighting)
     }
 }
 
 #[test]
-fn batches_share_depth_use_material_order_and_skip_occluded_work() {
+fn scene_preserves_material_order_and_shades_only_final_winners() {
     let scene = scene(vec![
         triangle(Some(1), 0.0),
         triangle(Some(0), 0.5),
@@ -139,7 +140,12 @@ fn batches_share_depth_use_material_order_and_skip_occluded_work() {
     let result = pipeline
         .render_transformed(&scene, &materials, 8, 8, lighting())
         .unwrap();
-    assert_eq!(fragment.materials, [Vec3::ZERO, Vec3::X]);
+    assert!(
+        fragment
+            .material_indices
+            .iter()
+            .all(|&index| index == Some(0))
+    );
     assert_same(&result, &reference(&scene, &materials, 8));
     let visible_samples = result
         .framebuffer
@@ -148,7 +154,7 @@ fn batches_share_depth_use_material_order_and_skip_occluded_work() {
         .iter()
         .filter(|z| z.is_finite())
         .count();
-    assert_eq!(fragment.sample_counts, [visible_samples, visible_samples]);
+    assert_eq!(fragment.sample_counts, [visible_samples]);
     assert!(visible_samples > 0);
     for (color, depth) in result
         .framebuffer
@@ -171,20 +177,24 @@ fn assert_unique_samples(fragments: &[Fragment]) {
     assert_eq!(samples.len(), fragments.len());
 }
 
-fn collect_batch(
+fn collect_fragments(
     primitives: &[ClipPrimitive],
     material: &Material,
-) -> (RasterizedBatch, DepthBuffer) {
+) -> (RasterizedScene, DepthBuffer) {
     let mut depth = DepthBuffer::new(16, 16).unwrap();
-    let batch = CpuRasterization
-        .rasterize(&primitives.iter().collect::<Vec<_>>(), material, &mut depth)
+    let rasterized = CpuRasterization
+        .rasterize(
+            &primitives.iter().collect::<Vec<_>>(),
+            std::slice::from_ref(material),
+            &mut depth,
+        )
         .unwrap();
-    assert_unique_samples(&batch.fragments);
+    assert_unique_samples(&rasterized.fragments);
     assert_eq!(
-        batch.fragments.len(),
+        rasterized.fragments.len(),
         depth.values.iter().filter(|z| z.is_finite()).count()
     );
-    (batch, depth)
+    (rasterized, depth)
 }
 
 #[test]
@@ -214,10 +224,13 @@ fn nearer_fragments_replace_all_attributes_and_facing_within_and_across_primitiv
         } else {
             vec![far.clone(), near.clone()]
         };
-        let (batch, _) = collect_batch(&primitives, &material);
-        assert!(!batch.fragments.is_empty());
-        assert_eq!(batch.covered_fragments, 2 * batch.fragments.len() as u64);
-        for fragment in batch.fragments {
+        let (rasterized, _) = collect_fragments(&primitives, &material);
+        assert!(!rasterized.fragments.is_empty());
+        assert_eq!(
+            rasterized.covered_fragments,
+            2 * rasterized.fragments.len() as u64
+        );
+        for fragment in rasterized.fragments {
             assert!(!fragment.front_facing);
             assert_eq!(fragment.attributes.uv.uv, Vec2::new(0.25, 0.75));
             assert_eq!(fragment.attributes.normal_uv.uv, Vec2::ONE);
@@ -238,9 +251,9 @@ fn partial_occlusion_retains_the_uncovered_samples_of_an_earlier_triangle() {
         vertex.normal_uv = Vec2::ONE;
     }
     let material = Material::default();
-    let (far_only, _) = collect_batch(std::slice::from_ref(&far), &material);
-    let (near_only, _) = collect_batch(std::slice::from_ref(&near), &material);
-    let (batch, _) = collect_batch(&[far, near], &material);
+    let (far_only, _) = collect_fragments(std::slice::from_ref(&far), &material);
+    let (near_only, _) = collect_fragments(std::slice::from_ref(&near), &material);
+    let (rasterized, _) = collect_fragments(&[far, near], &material);
     let near_samples: HashSet<_> = near_only
         .fragments
         .iter()
@@ -248,8 +261,8 @@ fn partial_occlusion_retains_the_uncovered_samples_of_an_earlier_triangle() {
         .collect();
     assert!(!near_samples.is_empty());
     assert!(near_samples.len() < far_only.fragments.len());
-    assert_eq!(batch.fragments.len(), far_only.fragments.len());
-    for fragment in batch.fragments {
+    assert_eq!(rasterized.fragments.len(), far_only.fragments.len());
+    for fragment in rasterized.fragments {
         let expected_tag = if near_samples.contains(&fragment.sample_index) {
             Vec2::ONE
         } else {
@@ -260,7 +273,7 @@ fn partial_occlusion_retains_the_uncovered_samples_of_an_earlier_triangle() {
 }
 
 #[test]
-fn equal_depth_keeps_the_first_winner_and_collector_state_does_not_cross_batches() {
+fn equal_depth_keeps_the_first_winner_and_collector_state_does_not_cross_calls() {
     let mut rasterizer = CpuRasterization;
     let material = Material::default();
     for (width, height) in [(8, 8), (16, 16)] {
@@ -270,38 +283,42 @@ fn equal_depth_keeps_the_first_winner_and_collector_state_does_not_cross_batches
         for vertex in &mut equal.vertices {
             vertex.normal_uv = Vec2::ONE;
         }
-        let batch = rasterizer
-            .rasterize(&[&first, &equal], &material, &mut depth)
+        let rasterized = rasterizer
+            .rasterize(
+                &[&first, &equal],
+                std::slice::from_ref(&material),
+                &mut depth,
+            )
             .unwrap();
-        assert_unique_samples(&batch.fragments);
-        let samples = batch.fragments.len();
+        assert_unique_samples(&rasterized.fragments);
+        let samples = rasterized.fragments.len();
         assert!(samples > 0);
         assert!(
-            batch
+            rasterized
                 .fragments
                 .iter()
                 .all(|fragment| fragment.attributes.normal_uv.uv == Vec2::ZERO)
         );
         let previous_depth = depth.values.clone();
         let rejected = rasterizer
-            .rasterize(&[&equal], &material, &mut depth)
+            .rasterize(&[&equal], std::slice::from_ref(&material), &mut depth)
             .unwrap();
         assert!(rejected.fragments.is_empty());
         assert_eq!(depth.values, previous_depth);
 
         let closer = triangle(Some(0), -0.5);
         let next = rasterizer
-            .rasterize(&[&closer], &material, &mut depth)
+            .rasterize(&[&closer], std::slice::from_ref(&material), &mut depth)
             .unwrap();
         assert_unique_samples(&next.fragments);
         assert_eq!(next.fragments.len(), samples);
         let rejected = rasterizer
-            .rasterize(&[&first], &material, &mut depth)
+            .rasterize(&[&first], std::slice::from_ref(&material), &mut depth)
             .unwrap();
         assert!(rejected.fragments.is_empty());
         assert!(
             rasterizer
-                .rasterize(&[], &material, &mut depth)
+                .rasterize(&[], std::slice::from_ref(&material), &mut depth)
                 .unwrap()
                 .fragments
                 .is_empty()
@@ -390,10 +407,10 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
                         Vec3::new(0.5, 0.75, 1.0)
                     );
                 }
-                let (batch, _) = collect_batch(&scene.primitives, &materials[0]);
-                assert!(!batch.fragments.is_empty());
+                let (rasterized, _) = collect_fragments(&scene.primitives, &materials[0]);
+                assert!(!rasterized.fragments.is_empty());
                 assert!(
-                    batch
+                    rasterized
                         .fragments
                         .iter()
                         .all(|f| f.attributes.normal_uv.uv == Vec2::ONE)
@@ -481,17 +498,18 @@ impl RasterizationStage for FixedRasterization {
     fn rasterize(
         &mut self,
         primitives: &[&ClipPrimitive],
-        _: &Material,
+        _: &[Material],
         depth: &mut DepthBuffer,
-    ) -> io::Result<RasterizedBatch> {
+    ) -> io::Result<RasterizedScene> {
         assert_eq!(primitives.len(), 1);
         if let Some(sample) = depth.values.get_mut(self.sample_index) {
             *sample = 0.25;
         }
         let uv = UvSample::point(Vec2::ZERO);
-        Ok(RasterizedBatch {
+        Ok(RasterizedScene {
             fragments: vec![Fragment {
                 sample_index: self.sample_index,
+                material_index: primitives[0].source.material_index,
                 front_facing: true,
                 attributes: FragmentAttributes {
                     world_position: Vec3::ZERO,
@@ -506,7 +524,7 @@ impl RasterizationStage for FixedRasterization {
                 },
             }],
             covered_fragments: 1,
-            ..RasterizedBatch::default()
+            ..RasterizedScene::default()
         })
     }
 }
@@ -540,7 +558,7 @@ impl FragmentStage for SolidFragment {
     fn shade(
         &mut self,
         fragments: &[Fragment],
-        _: &Material,
+        _: &[Material],
         _: &Lighting<'_>,
     ) -> io::Result<Vec<Vec3>> {
         assert!(fragments.len() > 1);
@@ -567,7 +585,7 @@ fn fragment_backend_can_be_replaced_independently() {
 struct BrokenFragment(bool);
 
 impl FragmentStage for BrokenFragment {
-    fn shade(&mut self, _: &[Fragment], _: &Material, _: &Lighting<'_>) -> io::Result<Vec<Vec3>> {
+    fn shade(&mut self, _: &[Fragment], _: &[Material], _: &Lighting<'_>) -> io::Result<Vec<Vec3>> {
         if self.0 {
             Err(io::Error::other("backend failure"))
         } else {

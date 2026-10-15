@@ -4,44 +4,35 @@ use glam::{DVec2, DVec3, DVec4, Vec2, Vec3, Vec4};
 
 use crate::{
     framebuffer::DepthBuffer,
-    geometry::{ClipPrimitive, ClipVertex, Triangle},
+    geometry::{ClipPrimitive, ClipVertex},
     material::Material,
-    pipeline::{Fragment, FragmentAttributes, RasterizationStage, RasterizedBatch},
+    pipeline::{Fragment, FragmentAttributes, RasterizationStage, RasterizedScene},
     shadow::ShadowProjection,
     texture::UvSample,
 };
-
-#[derive(Clone, Copy)]
-pub(crate) enum RasterPass {
-    Camera,
-    Capture,
-    Shadow(ShadowProjection),
-}
 
 pub(crate) fn rasterize(
     primitive: &ScreenPrimitive,
     double_sided: bool,
     depth_buffer: &mut DepthBuffer,
-    pass: RasterPass,
+    shadow: Option<ShadowProjection>,
     mut emit: impl FnMut(usize, &FragmentAttributes, bool),
 ) -> u64 {
-    let linear_far = match pass {
-        RasterPass::Shadow(ShadowProjection::Perspective { far }) => Some(far),
+    let linear_far = match shadow {
+        Some(ShadowProjection::Perspective { far }) => Some(far),
         _ => None,
     };
     let (width, height) = (depth_buffer.width, depth_buffer.height);
     let mut covered_fragments = 0;
     for triangle in &primitive.triangles {
-        let vertices = triangle
-            .indices
-            .map(|index| primitive.vertices[index as usize]);
+        let vertices = triangle.map(|index| primitive.vertices[index as usize]);
         let [a, b, c] = vertices.map(|v| v.position.as_dvec3());
         let ab = b - a;
         let ac = c - a;
         let area = ab.truncate().perp_dot(ac.truncate());
         // Downward viewport Y reverses winding.
         let front_facing = (area < 0.0) != primitive.mirrored;
-        if area == 0.0 || (!front_facing && !double_sided && !matches!(pass, RasterPass::Capture)) {
+        if area == 0.0 || (!front_facing && !double_sided) {
             continue;
         }
         let depths = vertices.map(|v| {
@@ -52,7 +43,7 @@ pub(crate) fn rasterize(
             }
         });
         // Projected depth and 1/w are screen-linear.
-        let depth_bias = if matches!(pass, RasterPass::Shadow(_)) {
+        let depth_bias = if shadow.is_some() {
             let db = f64::from(depths[1]) - f64::from(depths[0]);
             let dc = f64::from(depths[2]) - f64::from(depths[0]);
             let dx = (db * ac.y - dc * ab.y) / area;
@@ -63,8 +54,7 @@ pub(crate) fn rasterize(
         } else {
             0.0
         };
-        let gradients =
-            (!matches!(pass, RasterPass::Shadow(_))).then(|| UvGradients::new(vertices));
+        let gradients = shadow.is_none().then(|| UvGradients::new(vertices));
         rasterize_triangle(
             vertices.map(|v| v.position.truncate()),
             width,
@@ -108,42 +98,45 @@ impl RasterizationStage for CpuRasterization {
     fn rasterize(
         &mut self,
         primitives: &[&ClipPrimitive],
-        material: &Material,
+        materials: &[Material],
         depth: &mut DepthBuffer,
-    ) -> io::Result<RasterizedBatch> {
-        let mut batch = RasterizedBatch::default();
+    ) -> io::Result<RasterizedScene> {
+        let mut output = RasterizedScene::default();
         let mut slot_for_sample = Vec::new();
         slot_for_sample
             .try_reserve_exact(depth.values.len())
             .map_err(io::Error::other)?;
         slot_for_sample.resize(depth.values.len(), usize::MAX);
+        let default_material = Material::default();
         for primitive in primitives {
+            let material_index = primitive.source.material_index;
+            let material = material_index.map_or(&default_material, |index| &materials[index]);
             let screen = project(primitive, depth.width, depth.height)?;
-            batch.screen_vertices += screen.vertices.len();
-            batch.screen_triangles += screen.triangles.len();
-            batch.covered_fragments += rasterize(
+            output.screen_vertices += screen.vertices.len();
+            output.screen_triangles += screen.triangles.len();
+            output.covered_fragments += rasterize(
                 &screen,
                 material.double_sided,
                 depth,
-                RasterPass::Camera,
+                None,
                 |sample_index, attributes, front_facing| {
                     let fragment = Fragment {
                         sample_index,
+                        material_index,
                         attributes: *attributes,
                         front_facing,
                     };
-                    // Replace the accepted winner in place.
                     let slot = &mut slot_for_sample[sample_index];
                     if *slot == usize::MAX {
-                        *slot = batch.fragments.len();
-                        batch.fragments.push(fragment);
+                        *slot = output.fragments.len();
+                        output.fragments.push(fragment);
                     } else {
-                        batch.fragments[*slot] = fragment;
+                        output.fragments[*slot] = fragment;
                     }
                 },
             );
         }
-        Ok(batch)
+        Ok(output)
     }
 }
 
@@ -201,9 +194,12 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f64)
     }
 }
 
-fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
-    let mut output = ClipPrimitive {
-        source: primitive.source,
+pub(crate) fn project(
+    primitive: &ClipPrimitive,
+    width: u32,
+    height: u32,
+) -> io::Result<ScreenPrimitive> {
+    let mut output = ScreenPrimitive {
         mirrored: primitive.mirrored,
         vertices: Vec::new(),
         triangles: Vec::new(),
@@ -254,12 +250,14 @@ fn clip_primitive(primitive: &ClipPrimitive) -> io::Result<ClipPrimitive> {
         let end = u32::try_from(output.vertices.len() + polygon.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Too many clipped vertices"))?;
         let base = end - polygon.len() as u32;
-        output.vertices.extend_from_slice(&polygon);
+        for &vertex in &polygon {
+            let vertex = project_vertex(vertex, width as f32, height as f32)?;
+            output.vertices.push(vertex);
+        }
         for index in 1..polygon.len() as u32 - 1 {
-            output.triangles.push(Triangle {
-                indices: [base, base + index, base + index + 1],
-                source_index: triangle.source_index,
-            });
+            output
+                .triangles
+                .push([base, base + index, base + index + 1]);
         }
     }
     Ok(output)
@@ -285,7 +283,7 @@ pub(crate) struct ScreenVertex {
 pub(crate) struct ScreenPrimitive {
     pub mirrored: bool,
     pub vertices: Vec<ScreenVertex>,
-    pub triangles: Vec<Triangle>,
+    pub triangles: Vec<[u32; 3]>,
 }
 
 struct UvGradients {
@@ -332,23 +330,6 @@ impl UvGradients {
             dy: ((dy - uv * self.inv_w.y) / inv_w).as_vec2(),
         }
     }
-}
-
-pub(crate) fn project(
-    primitive: &ClipPrimitive,
-    width: u32,
-    height: u32,
-) -> io::Result<ScreenPrimitive> {
-    let clipped = clip_primitive(primitive)?;
-    Ok(ScreenPrimitive {
-        mirrored: clipped.mirrored,
-        vertices: clipped
-            .vertices
-            .into_iter()
-            .map(|vertex| project_vertex(vertex, width as f32, height as f32))
-            .collect::<io::Result<_>>()?,
-        triangles: clipped.triangles,
-    })
 }
 
 fn project_vertex(vertex: ClipVertex, width: f32, height: f32) -> io::Result<ScreenVertex> {

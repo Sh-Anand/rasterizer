@@ -14,9 +14,9 @@ use crate::{
     lighting::Lighting,
     material::Material,
 };
-use rasterization::{RasterPass, project, rasterize};
+use rasterization::{project, rasterize};
 
-/// Immediate shading in scene order, independent of material batching and collection.
+/// Immediate shading in scene order, independent of fragment collection.
 pub fn render_reference(
     scene: &ClipScene,
     materials: &[Material],
@@ -49,7 +49,7 @@ pub fn render_reference(
             &screen,
             material.double_sided,
             &mut output.framebuffer.depth,
-            RasterPass::Camera,
+            None,
             |index, attributes, front_facing| {
                 output.framebuffer.color[index] =
                     fragment::shade(&lighting, material, attributes, front_facing);

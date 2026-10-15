@@ -6,7 +6,7 @@ use xatlas_rs_v2::{ChartOptions, IndexData, MeshData, MeshDecl, PackOptions, Xat
 
 use crate::{
     config::{BakeConfig, Config},
-    cpu::rasterization::{RasterPass, project, rasterize, rasterize_triangle},
+    cpu::rasterization::{project, rasterize, rasterize_triangle},
     framebuffer::DepthBuffer,
     geometry::{ClipPrimitive, ClipScene, GltfAsset, Triangle},
     lighting::{RenderLight, lambertian_lighting},
@@ -470,9 +470,9 @@ impl<'a> CaptureScene<'a> {
                 .map_or(&default_material, |i| &materials[i]);
             rasterize(
                 &screen,
-                material.double_sided,
+                true,
                 &mut depth,
-                RasterPass::Capture,
+                None,
                 |index, attributes, front_facing| {
                     // Single-sided backs occlude without reflecting.
                     color[index] = if front_facing || material.double_sided {
