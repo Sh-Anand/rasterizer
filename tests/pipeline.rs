@@ -3,19 +3,18 @@ use std::{collections::HashSet, io};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
 use rasterizer::{
-    asset::GltfAsset,
-    backend::cpu::{self, CpuFragment, CpuRasterization, CpuVertex},
-    clip::clip_scene,
+    cpu::{self, CpuFragment, CpuRasterization, CpuVertex},
     framebuffer::{DepthBuffer, RenderOutput},
-    geometry::{PreparedScene, PrimitiveSource, Triangle},
+    geometry::{
+        ClipPrimitive, ClipScene, ClipVertex, GltfAsset, PreparedScene, PrimitiveSource, Triangle,
+    },
     lighting::Lighting,
     material::{Material, load_materials},
     pipeline::{
-        Fragment, FragmentStage, Pipeline, RasterizationStage, RasterizedBatch, VertexStage,
+        Fragment, FragmentAttributes, FragmentStage, Pipeline, RasterizationStage, RasterizedBatch,
+        VertexStage,
     },
     texture::{Sampling, UvSample},
-    vertex::{ClipPrimitive, ClipScene, ClipVertex},
-    viewport::{FragmentAttributes, project_scene},
 };
 
 fn triangle(material_index: Option<usize>, z: f32) -> ClipPrimitive {
@@ -78,26 +77,31 @@ fn assert_same(actual: &RenderOutput, expected: &RenderOutput) {
     assert_eq!(actual.covered_fragments, expected.covered_fragments);
     assert_eq!(actual.screen_vertices, expected.screen_vertices);
     assert_eq!(actual.screen_triangles, expected.screen_triangles);
-    for (a, b) in actual
-        .framebuffer
-        .color
-        .iter()
-        .zip(&expected.framebuffer.color)
-    {
-        assert_eq!(
-            a.to_array().map(f32::to_bits),
-            b.to_array().map(f32::to_bits)
-        );
-    }
-    for (a, b) in actual
-        .framebuffer
-        .depth
-        .values
-        .iter()
-        .zip(&expected.framebuffer.depth.values)
-    {
-        assert_eq!(a.to_bits(), b.to_bits());
-    }
+    let color_bits = |output: &RenderOutput| {
+        output
+            .framebuffer
+            .color
+            .iter()
+            .map(|color| color.to_array().map(f32::to_bits))
+            .collect::<Vec<_>>()
+    };
+    let depth_bits = |output: &RenderOutput| {
+        output
+            .framebuffer
+            .depth
+            .values
+            .iter()
+            .map(|depth| depth.to_bits())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(color_bits(actual), color_bits(expected));
+    assert_eq!(depth_bits(actual), depth_bits(expected));
+}
+
+fn reference(scene: &ClipScene, materials: &[Material], size: u32) -> RenderOutput {
+    let mut scene = scene.clone();
+    scene.primitives.sort_by_key(|p| p.source.material_index);
+    cpu::render_reference(&scene, materials, size, size, lighting()).unwrap()
 }
 
 #[derive(Default)]
@@ -106,7 +110,7 @@ struct RecordingFragment {
     sample_counts: Vec<usize>,
 }
 
-impl FragmentStage for RecordingFragment {
+impl FragmentStage for &mut RecordingFragment {
     fn shade(
         &mut self,
         fragments: &[Fragment],
@@ -139,22 +143,13 @@ fn batches_share_depth_use_material_order_and_skip_occluded_or_masked_work() {
             ..material(Vec3::Z)
         },
     ];
-    let mut pipeline = Pipeline {
-        vertex: CpuVertex,
-        rasterization: CpuRasterization,
-        fragment: RecordingFragment::default(),
-    };
+    let mut fragment = RecordingFragment::default();
+    let mut pipeline = Pipeline::new(CpuVertex, CpuRasterization, &mut fragment);
     let result = pipeline
         .render_transformed(&scene, &materials, 8, 8, lighting())
         .unwrap();
-    assert_eq!(pipeline.fragment.materials, [Vec3::ZERO, Vec3::X]);
-    let mut reference_scene = scene.clone();
-    reference_scene
-        .primitives
-        .sort_by_key(|p| p.source.material_index);
-    let screen = project_scene(&clip_scene(&reference_scene).unwrap(), 8, 8).unwrap();
-    let reference = cpu::render(&screen, &materials, 8, 8, lighting()).unwrap();
-    assert_same(&result, &reference);
+    assert_eq!(fragment.materials, [Vec3::ZERO, Vec3::X]);
+    assert_same(&result, &reference(&scene, &materials, 8));
     let visible_samples = result
         .framebuffer
         .depth
@@ -162,18 +157,8 @@ fn batches_share_depth_use_material_order_and_skip_occluded_or_masked_work() {
         .iter()
         .filter(|z| z.is_finite())
         .count();
-    assert_eq!(
-        pipeline.fragment.sample_counts,
-        [visible_samples, visible_samples]
-    );
-    assert!(
-        result
-            .framebuffer
-            .depth
-            .values
-            .iter()
-            .any(|z| z.is_finite())
-    );
+    assert_eq!(fragment.sample_counts, [visible_samples, visible_samples]);
+    assert!(visible_samples > 0);
     for (color, depth) in result
         .framebuffer
         .color
@@ -412,21 +397,11 @@ fn cpu_stages_preserve_clipping_mirrored_winding_and_double_sided_faces() {
             ..material(Vec3::Z)
         },
     ];
-    let mut pipeline = Pipeline {
-        vertex: CpuVertex,
-        rasterization: CpuRasterization,
-        fragment: CpuFragment,
-    };
+    let mut pipeline = Pipeline::new(CpuVertex, CpuRasterization, CpuFragment);
     let result = pipeline
         .render_transformed(&scene, &materials, 16, 16, lighting())
         .unwrap();
-    let mut reference_scene = scene.clone();
-    reference_scene
-        .primitives
-        .sort_by_key(|p| p.source.material_index);
-    let screen = project_scene(&clip_scene(&reference_scene).unwrap(), 16, 16).unwrap();
-    let reference = cpu::render(&screen, &materials, 16, 16, lighting()).unwrap();
-    assert_same(&result, &reference);
+    assert_same(&result, &reference(&scene, &materials, 16));
     assert!(result.framebuffer.color.contains(&Vec3::Z));
 }
 
@@ -435,7 +410,7 @@ struct FixedVertex {
     called: bool,
 }
 
-impl VertexStage for FixedVertex {
+impl VertexStage for &mut FixedVertex {
     fn transform(&mut self, scene: &PreparedScene, view_projection: Mat4) -> io::Result<ClipScene> {
         assert!(scene.primitives.is_empty());
         assert_eq!(view_projection, Mat4::IDENTITY);
@@ -446,14 +421,11 @@ impl VertexStage for FixedVertex {
 
 #[test]
 fn vertex_backend_can_be_replaced_independently() {
-    let mut pipeline = Pipeline {
-        vertex: FixedVertex {
-            scene: scene(vec![triangle(Some(0), 0.0)]),
-            called: false,
-        },
-        rasterization: CpuRasterization,
-        fragment: CpuFragment,
+    let mut vertex = FixedVertex {
+        scene: scene(vec![triangle(Some(0), 0.0)]),
+        called: false,
     };
+    let mut pipeline = Pipeline::new(&mut vertex, CpuRasterization, CpuFragment);
     let prepared = PreparedScene {
         scene_index: 0,
         primitives: Vec::new(),
@@ -468,7 +440,7 @@ fn vertex_backend_can_be_replaced_independently() {
             lighting(),
         )
         .unwrap();
-    assert!(pipeline.vertex.called);
+    assert!(vertex.called);
     assert!(result.framebuffer.color.contains(&Vec3::X));
 }
 
@@ -512,11 +484,11 @@ impl RasterizationStage for FixedRasterization {
 
 #[test]
 fn rasterization_backend_can_be_replaced_independently() {
-    let mut pipeline = Pipeline {
-        vertex: CpuVertex,
-        rasterization: FixedRasterization { sample_index: 3 },
-        fragment: CpuFragment,
-    };
+    let mut pipeline = Pipeline::new(
+        CpuVertex,
+        FixedRasterization { sample_index: 3 },
+        CpuFragment,
+    );
     let result = pipeline
         .render_transformed(
             &scene(vec![triangle(Some(0), 0.0)]),
@@ -549,11 +521,7 @@ impl FragmentStage for SolidFragment {
 
 #[test]
 fn fragment_backend_can_be_replaced_independently() {
-    let mut pipeline = Pipeline {
-        vertex: CpuVertex,
-        rasterization: CpuRasterization,
-        fragment: SolidFragment,
-    };
+    let mut pipeline = Pipeline::new(CpuVertex, CpuRasterization, SolidFragment);
     let result = pipeline
         .render_transformed(
             &scene(vec![triangle(Some(0), 0.0)]),
@@ -586,22 +554,18 @@ fn backend_errors_and_invalid_outputs_are_reported() {
         (false, io::ErrorKind::InvalidData),
         (true, io::ErrorKind::Other),
     ] {
-        let mut pipeline = Pipeline {
-            vertex: CpuVertex,
-            rasterization: CpuRasterization,
-            fragment: BrokenFragment(fail),
-        };
+        let mut pipeline = Pipeline::new(CpuVertex, CpuRasterization, BrokenFragment(fail));
         let error = pipeline
             .render_transformed(&scene, &[material(Vec3::X)], 8, 8, lighting())
             .err()
             .unwrap();
         assert_eq!(error.kind(), kind);
     }
-    let mut pipeline = Pipeline {
-        vertex: CpuVertex,
-        rasterization: FixedRasterization { sample_index: 64 },
-        fragment: CpuFragment,
-    };
+    let mut pipeline = Pipeline::new(
+        CpuVertex,
+        FixedRasterization { sample_index: 64 },
+        CpuFragment,
+    );
     let error = pipeline
         .render_transformed(&scene, &[material(Vec3::X)], 8, 8, lighting())
         .err()
@@ -611,11 +575,7 @@ fn backend_errors_and_invalid_outputs_are_reported() {
 
 #[test]
 fn empty_scenes_and_invalid_render_inputs_are_handled_before_shading() {
-    let mut pipeline = Pipeline {
-        vertex: CpuVertex,
-        rasterization: CpuRasterization,
-        fragment: BrokenFragment(true),
-    };
+    let mut pipeline = Pipeline::new(CpuVertex, CpuRasterization, BrokenFragment(true));
     let empty = scene(Vec::new());
     let result = pipeline
         .render_transformed(&empty, &[], 2, 2, lighting())

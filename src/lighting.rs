@@ -3,8 +3,8 @@ use std::{f32::consts::PI, io};
 use glam::Vec3;
 
 use crate::{
-    config::LightConfig, lightmap::Lightmap, material::Material, shadow::LightShadow,
-    texture::UvSample, vertex::ClipScene,
+    config::LightConfig, geometry::ClipScene, lightmap::Lightmap, material::Material,
+    shadow::LightShadow, texture::UvSample,
 };
 
 pub struct RenderLight {
@@ -20,7 +20,7 @@ pub struct Lighting<'a> {
 
 pub(crate) fn lambertian_lighting(lights: &[RenderLight], position: Vec3, normal: Vec3) -> Vec3 {
     visible_lights(lights, position)
-        .map(|sample| sample.diffuse(normal))
+        .map(|sample| sample.irradiance * (normal.dot(sample.direction).max(0.0) / PI))
         .sum()
 }
 
@@ -61,12 +61,6 @@ pub struct LightSample {
     pub irradiance: Vec3,
 }
 
-impl LightSample {
-    pub fn diffuse(&self, normal: Vec3) -> Vec3 {
-        self.irradiance * (normal.dot(self.direction).max(0.0) / PI)
-    }
-}
-
 pub struct DirectionalLight {
     direction: Vec3,
     irradiance: Vec3,
@@ -82,7 +76,7 @@ impl DirectionalLight {
             )
         })?;
         let color = Vec3::from_array(color);
-        // Preserve intensity as the response of a facing white Lambertian surface.
+        // Intensity 1 gives unit response for a facing white Lambertian surface.
         let irradiance = color * intensity * PI;
         if !color.is_finite()
             || color.min_element() < 0.0

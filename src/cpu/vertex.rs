@@ -3,34 +3,29 @@ use std::io;
 use glam::{Mat3, Mat4, Vec4};
 
 use crate::{
-    geometry::{PreparedPrimitive, PreparedScene},
+    geometry::{ClipPrimitive, ClipScene, ClipVertex, PreparedPrimitive, PreparedScene},
     pipeline::VertexStage,
-    vertex::{ClipPrimitive, ClipScene, ClipVertex},
 };
 
 pub struct CpuVertex;
 
 impl VertexStage for CpuVertex {
     fn transform(&mut self, scene: &PreparedScene, view_projection: Mat4) -> io::Result<ClipScene> {
-        transform_scene(scene, view_projection)
+        if !view_projection.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Non-finite projection matrix",
+            ));
+        }
+        Ok(ClipScene {
+            scene_index: scene.scene_index,
+            primitives: scene
+                .primitives
+                .iter()
+                .map(|primitive| transform_primitive(primitive, view_projection))
+                .collect::<io::Result<_>>()?,
+        })
     }
-}
-
-pub fn transform_scene(scene: &PreparedScene, view_projection: Mat4) -> io::Result<ClipScene> {
-    if !view_projection.is_finite() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Non-finite projection matrix",
-        ));
-    }
-    Ok(ClipScene {
-        scene_index: scene.scene_index,
-        primitives: scene
-            .primitives
-            .iter()
-            .map(|primitive| transform_primitive(primitive, view_projection))
-            .collect::<io::Result<_>>()?,
-    })
 }
 
 fn transform_primitive(
@@ -92,26 +87,4 @@ fn transform_primitive(
         vertices,
         triangles: primitive.triangles.clone(),
     })
-}
-
-pub fn reproject_scene(scene: &ClipScene, view_projection: Mat4) -> io::Result<ClipScene> {
-    if !view_projection.is_finite() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Non-finite projection matrix",
-        ));
-    }
-    let mut scene = scene.clone();
-    for primitive in &mut scene.primitives {
-        for vertex in &mut primitive.vertices {
-            vertex.position = view_projection * vertex.world_position.extend(1.0);
-            if !vertex.position.is_finite() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Non-finite reprojected position",
-                ));
-            }
-        }
-    }
-    Ok(scene)
 }

@@ -12,8 +12,6 @@ pub struct RenderOutput {
 }
 
 pub struct Framebuffer {
-    pub width: u32,
-    pub height: u32,
     /// Linear HDR RGB, before exposure and tone mapping.
     pub color: Vec<Vec3>,
     pub depth: DepthBuffer,
@@ -27,12 +25,7 @@ impl Framebuffer {
             .try_reserve_exact(depth.values.len())
             .map_err(io::Error::other)?;
         color.resize(depth.values.len(), Vec3::ZERO);
-        Ok(Self {
-            width,
-            height,
-            color,
-            depth,
-        })
+        Ok(Self { color, depth })
     }
 
     pub fn save(
@@ -43,8 +36,8 @@ impl Framebuffer {
     ) -> image::ImageResult<()> {
         output.validate()?;
         if supersampling == 0
-            || !self.width.is_multiple_of(supersampling)
-            || !self.height.is_multiple_of(supersampling)
+            || !self.depth.width.is_multiple_of(supersampling)
+            || !self.depth.height.is_multiple_of(supersampling)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -52,15 +45,16 @@ impl Framebuffer {
             )
             .into());
         }
-        let width = self.width / supersampling;
-        let height = self.height / supersampling;
+        let width = self.depth.width / supersampling;
+        let height = self.depth.height / supersampling;
         let samples = f64::from(supersampling) * f64::from(supersampling);
         let mut pixels = Vec::with_capacity(width as usize * height as usize);
         for y in 0..height {
             for x in 0..width {
                 let mut color = DVec3::ZERO;
                 for sy in y * supersampling..(y + 1) * supersampling {
-                    let start = sy as usize * self.width as usize + (x * supersampling) as usize;
+                    let start =
+                        sy as usize * self.depth.width as usize + (x * supersampling) as usize;
                     color += self.color[start..start + supersampling as usize]
                         .iter()
                         .map(|color| color.as_dvec3())

@@ -7,7 +7,10 @@ use std::{
 use bincode::{Decode, Encode};
 use glam::{Vec2, Vec3};
 
-use crate::{asset::GltfAsset, config::Config, vertex::ClipScene};
+use crate::{
+    config::Config,
+    geometry::{ClipScene, GltfAsset},
+};
 
 #[derive(Encode, Decode)]
 pub struct Lightmap {
@@ -147,8 +150,7 @@ impl BakedLighting {
 
 pub fn cache_key(asset: &GltfAsset, config: &Config) -> io::Result<[u8; 32]> {
     let mut hash = blake3::Hasher::new();
-    // v7 fixes tangent seams in object space before vertex transformation.
-    // Atlas vertex references from the previous topology must not be reused.
+    // v7 uses object-space tangent seams; older atlas indices are incompatible.
     hash.update(b"rasterizer-lightmap-v7");
     hash.update(
         &gltf::json::serialize::to_vec(asset.document.as_json()).map_err(io::Error::other)?,

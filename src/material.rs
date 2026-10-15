@@ -3,7 +3,7 @@ use std::io;
 use glam::{Vec3, Vec4};
 
 use crate::{
-    asset::GltfAsset,
+    geometry::GltfAsset,
     texture::{ColorSpace, Sampling, Texture, TextureLoader, UvSample},
 };
 
@@ -103,10 +103,6 @@ impl Material {
                 .base_color_texture
                 .as_ref()
                 .map_or(Vec4::ONE, |texture| texture.sample(uv))
-    }
-
-    pub fn metallic(&self, uv: UvSample) -> f32 {
-        self.metallic_roughness(uv).0
     }
 
     pub fn shading_normal(&self, uv: UvSample, normal: Vec3, tangent: Vec4) -> Vec3 {

@@ -1,19 +1,18 @@
 use std::{io, sync::Mutex, time::Instant};
 
-use glam::{Vec2, Vec3, camera::rh};
+use glam::{Mat4, Vec2, Vec3, camera::rh};
 use rayon::prelude::*;
 use xatlas_rs_v2::{ChartOptions, IndexData, MeshData, MeshDecl, PackOptions, Xatlas};
 
 use crate::{
-    asset::GltfAsset,
-    backend::cpu,
     config::{BakeConfig, Config},
-    coverage::rasterize_triangle,
+    cpu::rasterization::{RasterPass, project, rasterize, rasterize_triangle},
+    framebuffer::DepthBuffer,
+    geometry::{ClipPrimitive, ClipScene, GltfAsset, Triangle},
     lighting::{RenderLight, lambertian_lighting},
     lightmap::{BakedLighting, Lightmap, MeshLayout, cache_key, invalid},
     material::Material,
     texture::UvSample,
-    vertex::ClipScene,
 };
 
 const PADDING: u32 = 2;
@@ -132,7 +131,7 @@ fn surface_samples(
                     covered = true;
                 }
             });
-            // Seed sub-texel triangles at their centroid; ordinary coverage takes priority.
+            // Seed uncovered sub-texel triangles at their centroid.
             if !covered {
                 let uv = v.iter().map(|v| v.lightmap_uv).sum::<Vec2>() / 3.0 * size;
                 let x = (uv.x as u32).min(width - 1);
@@ -171,7 +170,7 @@ fn bake_indirect(
         diagonal * 1.01,
     );
     let weights = hemicube_weights(settings.hemicube_resolution);
-    let capture_scene = cpu::CaptureScene::new(scene);
+    let capture_scene = CaptureScene::new(scene);
     let progress = Mutex::new((0, Instant::now()));
     let count = samples.iter().flatten().count();
     indirect
@@ -335,7 +334,7 @@ fn hemicube_weights(resolution: u32) -> [Vec<f32>; 5] {
                     let u = 2.0 * (x as f32 + 0.5) / resolution as f32 - 1.0;
                     let v = 1.0 - 2.0 * (y as f32 + 0.5) / resolution as f32;
                     let d = direction + right * u + up * v;
-                    // cos(theta) * solid angle; normalize the quadrature so a white hemisphere gives 1.
+                    // Cosine-weighted solid angle; normalized below.
                     d.z.max(0.0) / d.length_squared().powi(2)
                 })
             })
@@ -350,7 +349,7 @@ fn hemicube_weights(resolution: u32) -> [Vec<f32>; 5] {
 
 fn dilate(map: &mut Lightmap, valid: &[bool], owners: &[u32]) {
     let mut valid = valid.to_vec();
-    // xatlas tags chart coverage, bilinear borders and padding in the high three bits.
+    // Strip xatlas coverage/padding flags.
     let chart = |i: usize| owners[i] & 0x1fff_ffff;
     for _ in 0..PADDING + 1 {
         let mut next = valid.clone();
@@ -375,5 +374,130 @@ fn dilate(map: &mut Lightmap, valid: &[bool], owners: &[u32]) {
             }
         }
         valid = next;
+    }
+}
+
+struct CaptureBatch<'a> {
+    primitive: &'a ClipPrimitive,
+    triangles: &'a [Triangle],
+    bounds: [Vec3; 2],
+}
+
+struct CaptureScene<'a> {
+    batches: Vec<CaptureBatch<'a>>,
+}
+
+impl<'a> CaptureScene<'a> {
+    fn new(scene: &'a ClipScene) -> Self {
+        let batches = scene
+            .primitives
+            .iter()
+            .flat_map(|primitive| {
+                primitive.triangles.chunks(64).map(move |triangles| {
+                    let bounds = triangles.iter().flat_map(|t| t.indices).fold(
+                        [Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)],
+                        |[min, max], i| {
+                            let p = primitive.vertices[i as usize].world_position;
+                            [min.min(p), max.max(p)]
+                        },
+                    );
+                    CaptureBatch {
+                        primitive,
+                        triangles,
+                        bounds,
+                    }
+                })
+            })
+            .collect();
+        Self { batches }
+    }
+
+    fn render(
+        &self,
+        materials: &[Material],
+        lightmap: &Lightmap,
+        view_projection: Mat4,
+        resolution: u32,
+    ) -> io::Result<Vec<Vec3>> {
+        let mut depth = DepthBuffer::new(resolution, resolution)?;
+        let mut color = vec![Vec3::ZERO; depth.values.len()];
+        let default_material = Material::default();
+        for batch in &self.batches {
+            let [min, max] = batch.bounds;
+            let corners: [_; 8] = std::array::from_fn(|i| {
+                view_projection
+                    * Vec3::new(
+                        if i & 1 == 0 { min.x } else { max.x },
+                        if i & 2 == 0 { min.y } else { max.y },
+                        if i & 4 == 0 { min.z } else { max.z },
+                    )
+                    .extend(1.0)
+            });
+            if (0..3).any(|axis| {
+                [-1.0, 1.0]
+                    .into_iter()
+                    .any(|sign| corners.iter().all(|p| p.w + sign * p[axis] < 0.0))
+            }) {
+                continue;
+            }
+            // Reject bounds containing no pixel centers.
+            if corners.iter().all(|p| p.w > 0.0)
+                && (0..2).any(|axis| {
+                    let (min, max) = corners
+                        .iter()
+                        .map(|p| (p[axis] / p.w + 1.0) * 0.5 * resolution as f32)
+                        .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), x| {
+                            (min.min(x), max.max(x))
+                        });
+                    (min - 0.5).ceil() > (max - 0.5).floor()
+                })
+            {
+                continue;
+            }
+            let mut projected = ClipPrimitive {
+                source: batch.primitive.source,
+                mirrored: batch.primitive.mirrored,
+                vertices: Vec::with_capacity(batch.triangles.len() * 3),
+                triangles: Vec::with_capacity(batch.triangles.len()),
+            };
+            for triangle in batch.triangles {
+                let base = projected.vertices.len() as u32;
+                projected.vertices.extend(triangle.indices.map(|i| {
+                    let mut v = batch.primitive.vertices[i as usize];
+                    v.position = view_projection * v.world_position.extend(1.0);
+                    v
+                }));
+                projected.triangles.push(Triangle {
+                    indices: [base, base + 1, base + 2],
+                    source_index: triangle.source_index,
+                });
+            }
+            let screen = project(&projected, resolution, resolution)?;
+            let material = batch
+                .primitive
+                .source
+                .material_index
+                .map_or(&default_material, |i| &materials[i]);
+            rasterize(
+                &screen,
+                material,
+                &mut depth,
+                RasterPass::Capture,
+                |index, material, attributes, front_facing| {
+                    // Single-sided backs occlude without reflecting.
+                    color[index] = if front_facing || material.double_sided {
+                        material.base_color(attributes.uv).truncate()
+                            * (1.0
+                                - material
+                                    .metallic_roughness(attributes.metallic_roughness_uv)
+                                    .0)
+                            * lightmap.sample(attributes.lightmap_uv, !front_facing)
+                    } else {
+                        Vec3::ZERO
+                    };
+                },
+            );
+        }
+        Ok(color)
     }
 }

@@ -1,10 +1,6 @@
-pub mod asset;
-pub mod backend;
 pub mod bake;
-pub mod brdf;
-pub mod clip;
 pub mod config;
-pub mod coverage;
+pub mod cpu;
 pub mod framebuffer;
 pub mod geometry;
 pub mod lighting;
@@ -13,5 +9,3 @@ pub mod material;
 pub mod pipeline;
 pub mod shadow;
 pub mod texture;
-pub mod vertex;
-pub mod viewport;

@@ -1,14 +1,11 @@
-use std::io;
+use std::{f32::consts::PI, io};
 
 use glam::Vec3;
 
 use crate::{
-    brdf::{Brdf, diffuse_color},
     lighting::{Lighting, visible_lights},
-    lightmap::Lightmap,
     material::Material,
-    pipeline::{Fragment, FragmentStage},
-    viewport::FragmentAttributes,
+    pipeline::{Fragment, FragmentAttributes, FragmentStage},
 };
 
 pub struct CpuFragment;
@@ -60,19 +57,44 @@ pub(super) fn shade(
     reflected + material.emission(attributes.emissive_uv)
 }
 
-pub(super) fn shade_capture(
-    lightmap: &Lightmap,
-    material: &Material,
-    attributes: &FragmentAttributes,
-    front_facing: bool,
-) -> Vec3 {
-    // Single-sided backs block light, but don't reflect it.
-    if front_facing || material.double_sided {
-        diffuse_color(
-            material.base_color(attributes.uv).truncate(),
-            material.metallic(attributes.metallic_roughness_uv),
-        ) * lightmap.sample(attributes.lightmap_uv, !front_facing)
-    } else {
-        Vec3::ZERO
+const DIELECTRIC_F0: f32 = 0.04;
+
+struct Brdf {
+    diffuse: Vec3,
+    f0: Vec3,
+    alpha_squared: f32,
+}
+
+impl Brdf {
+    fn new(base_color: Vec3, metallic: f32, roughness: f32) -> Self {
+        Self {
+            diffuse: base_color * (1.0 - metallic),
+            f0: Vec3::splat(DIELECTRIC_F0).lerp(base_color, metallic),
+            alpha_squared: roughness.clamp(0.045, 1.0).powi(4),
+        }
+    }
+
+    fn evaluate(&self, normal: Vec3, view: Vec3, light: Vec3) -> Vec3 {
+        let no_v = normal.dot(view).clamp(0.0, 1.0);
+        let no_l = normal.dot(light).clamp(0.0, 1.0);
+        if no_v == 0.0 || no_l == 0.0 {
+            return Vec3::ZERO;
+        }
+        let Some(half) = (view + light).try_normalize() else {
+            return Vec3::ZERO;
+        };
+        let no_h = normal.dot(half).clamp(0.0, 1.0);
+        let vo_h = view.dot(half).clamp(0.0, 1.0);
+        let a2 = self.alpha_squared;
+        // Cross product avoids cancellation near the GGX peak.
+        let denominator = normal.cross(half).length_squared() + a2 * no_h * no_h;
+        let distribution = a2 / (PI * denominator * denominator);
+        let visibility = 0.5
+            / (no_l * (no_v * no_v * (1.0 - a2) + a2).sqrt()
+                + no_v * (no_l * no_l * (1.0 - a2) + a2).sqrt());
+        let fresnel_weight = (1.0 - vo_h).powi(5);
+        let fresnel = self.f0 + (Vec3::ONE - self.f0) * fresnel_weight;
+        let dielectric_fresnel = DIELECTRIC_F0 + (1.0 - DIELECTRIC_F0) * fresnel_weight;
+        self.diffuse * ((1.0 - dielectric_fresnel) / PI) + fresnel * (distribution * visibility)
     }
 }

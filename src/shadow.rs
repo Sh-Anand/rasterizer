@@ -4,9 +4,11 @@ use glam::{IVec2, Mat3, Mat4, Vec2, Vec3, Vec4, camera::rh};
 
 use crate::{
     config::ShadowConfig,
+    cpu::rasterization::{RasterPass, project, rasterize},
     framebuffer::DepthBuffer,
-    lighting::{AreaLight, Light},
-    vertex::ClipScene,
+    geometry::ClipScene,
+    lighting::{AreaLight, Light, RenderLight},
+    material::Material,
 };
 
 pub enum LightShadow {
@@ -86,7 +88,7 @@ impl LightShadow {
         }
     }
 
-    pub fn maps_mut(&mut self) -> &mut [ShadowMap] {
+    fn maps_mut(&mut self) -> &mut [ShadowMap] {
         match self {
             Self::Directional(map) => std::slice::from_mut(map),
             Self::Area { faces, .. } => faces,
@@ -318,4 +320,60 @@ fn light_matrix(scene: &ClipScene, direction: Vec3) -> io::Result<Mat4> {
         -min.z + padding,
     );
     Ok(projection * view)
+}
+
+pub fn prepare_lights(
+    lights: Vec<Light>,
+    scene: &ClipScene,
+    materials: &[Material],
+    config: &ShadowConfig,
+) -> io::Result<Vec<RenderLight>> {
+    lights
+        .into_iter()
+        .map(|light| {
+            let shadow = if config.enabled {
+                let mut shadow = LightShadow::new(scene, &light, config)?;
+                for map in shadow.maps_mut() {
+                    draw_shadow_map(scene, materials, map)?;
+                }
+                Some(shadow)
+            } else {
+                None
+            };
+            Ok(RenderLight { light, shadow })
+        })
+        .collect()
+}
+
+fn draw_shadow_map(
+    scene: &ClipScene,
+    materials: &[Material],
+    shadow: &mut ShadowMap,
+) -> io::Result<()> {
+    let default_material = Material::default();
+    for primitive in &scene.primitives {
+        let mut primitive = primitive.clone();
+        for vertex in &mut primitive.vertices {
+            vertex.position = shadow.view_projection * vertex.world_position.extend(1.0);
+            if !vertex.position.is_finite() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Non-finite reprojected position",
+                ));
+            }
+        }
+        let material = primitive
+            .source
+            .material_index
+            .map_or(&default_material, |i| &materials[i]);
+        let screen = project(&primitive, shadow.depth.width, shadow.depth.height)?;
+        rasterize(
+            &screen,
+            material,
+            &mut shadow.depth,
+            RasterPass::Shadow(shadow.projection),
+            |_, _, _, _| {},
+        );
+    }
+    Ok(())
 }

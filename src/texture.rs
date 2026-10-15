@@ -24,7 +24,7 @@ pub struct UvSample {
 }
 
 impl UvSample {
-    /// A point query has no pixel footprint and samples level zero.
+    /// Level-zero sampling without a pixel footprint.
     pub fn point(uv: Vec2) -> Self {
         Self {
             uv,
@@ -35,7 +35,7 @@ impl UvSample {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ColorSpace {
+pub(crate) enum ColorSpace {
     Srgb,
     Linear,
 }
@@ -194,7 +194,7 @@ impl Texture {
         self.sample_lod(sample.uv, lod)
     }
 
-    pub fn sample_lod(&self, uv: Vec2, lod: f32) -> Vec4 {
+    fn sample_lod(&self, uv: Vec2, lod: f32) -> Vec4 {
         if self.sampling != Sampling::Trilinear {
             return self.sample_level(uv, 0);
         }

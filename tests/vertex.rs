@@ -1,6 +1,10 @@
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
-use rasterizer::{asset::GltfAsset, backend::cpu, geometry::prepare_scene};
+use rasterizer::{
+    cpu::CpuVertex,
+    geometry::{GltfAsset, prepare_scene},
+    pipeline::VertexStage,
+};
 
 const QUAD: [[f32; 3]; 4] = [
     [0.0, 0.0, 0.0],
@@ -9,8 +13,7 @@ const QUAD: [[f32; 3]; 4] = [
     [0.0, 1.0, 0.0],
 ];
 
-// Two indexed triangles with mirrored UVs, under a translated parent and a
-// mirrored, nonuniformly scaled mesh node. No image decoding is needed here.
+// Mirrored UVs and nonuniform scale under a translated parent.
 fn asset(positions: [[f32; 3]; 4], indices: [u32; 6], normals: bool, tangents: bool) -> GltfAsset {
     let mut buffer = Vec::new();
     for value in positions
@@ -98,7 +101,7 @@ fn flat_normals_are_split_before_transforming() {
     assert_eq!(primitive.vertices[0].normal, Vec3::Z);
     assert_eq!(primitive.vertices[3].normal, Vec3::Y);
 
-    let transformed = cpu::transform_scene(&prepared, Mat4::IDENTITY).unwrap();
+    let transformed = CpuVertex.transform(&prepared, Mat4::IDENTITY).unwrap();
     let vertices = &transformed.primitives[0].vertices;
     assert_eq!(vertices[0].world_position, Vec3::new(5.0, 1.0, 2.0));
     assert_eq!(vertices[1].world_position, Vec3::new(3.0, 1.0, 2.0));
@@ -126,8 +129,10 @@ fn generated_tangent_seams_are_fixed_and_reusable_across_views() {
     );
 
     let before = format!("{prepared:?}");
-    let first_view = cpu::transform_scene(&prepared, Mat4::IDENTITY).unwrap();
-    let second_view = cpu::transform_scene(&prepared, Mat4::from_translation(Vec3::X)).unwrap();
+    let first_view = CpuVertex.transform(&prepared, Mat4::IDENTITY).unwrap();
+    let second_view = CpuVertex
+        .transform(&prepared, Mat4::from_translation(Vec3::X))
+        .unwrap();
     assert_eq!(before, format!("{prepared:?}"));
     for output in [&first_view, &second_view] {
         assert_eq!(output.primitives[0].triangles, primitive.triangles);
@@ -169,7 +174,7 @@ fn supplied_frames_transform_in_world_space_and_preserve_uvs() {
     vertex.emissive_uv = Vec2::new(0.9, 1.0);
     vertex.lightmap_uv = Vec2::new(0.2, 0.8);
     let input = *vertex;
-    let transformed = cpu::transform_scene(&prepared, Mat4::IDENTITY).unwrap();
+    let transformed = CpuVertex.transform(&prepared, Mat4::IDENTITY).unwrap();
     let output = &transformed.primitives[0].vertices[0];
     assert_eq!(output.normal, Vec3::new(-0.5, 1.0 / 3.0, 0.0).normalize());
     assert_eq!(output.tangent, Vec4::new(-1.0, 0.0, 0.0, -1.0));
@@ -185,12 +190,13 @@ fn supplied_frames_transform_in_world_space_and_preserve_uvs() {
 fn degenerate_flat_geometry_keeps_zero_frames_and_nonfinite_views_are_rejected() {
     let asset = asset(QUAD, [0, 0, 0, 1, 1, 1], false, false);
     let prepared = prepare_scene(&asset).unwrap();
-    let transformed = cpu::transform_scene(&prepared, Mat4::IDENTITY).unwrap();
+    let transformed = CpuVertex.transform(&prepared, Mat4::IDENTITY).unwrap();
     for vertex in &transformed.primitives[0].vertices {
         assert_eq!(vertex.normal, Vec3::ZERO);
         assert_eq!(vertex.tangent, Vec4::ZERO);
     }
-    let error =
-        cpu::transform_scene(&prepared, Mat4::from_cols_array(&[f32::NAN; 16])).unwrap_err();
+    let error = CpuVertex
+        .transform(&prepared, Mat4::from_cols_array(&[f32::NAN; 16]))
+        .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }

@@ -9,16 +9,15 @@ use std::{
 use glam::Vec3;
 
 use rasterizer::{
-    asset::GltfAsset,
-    backend::cpu,
     bake,
     config::Config,
-    geometry::prepare_scene,
+    cpu,
+    geometry::{GltfAsset, prepare_scene},
     lighting::{DirectionalLight, Light, Lighting, RenderLight, collect_lights},
     lightmap::{BakedLighting, cache_key},
     material::load_materials,
-    pipeline::{Pipeline, VertexStage},
-    vertex::camera_matrix,
+    pipeline::Pipeline,
+    shadow::prepare_lights,
 };
 
 const USAGE: &str = "Usage: rasterizer [bake] <scene-name|path.gltf|path.glb> [--camera-light]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (direct lighting only; off by default).\nBake: cargo run --release -- bake kitchen\nRender: cargo run --release -- living-room";
@@ -151,14 +150,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("Failed to load '{}': {error}", path.display()))?;
     let prepared = prepare_scene(&asset)
         .map_err(|error| format!("Failed to prepare '{}': {error}", path.display()))?;
-    let mut pipeline = Pipeline {
-        vertex: cpu::CpuVertex,
-        rasterization: cpu::CpuRasterization,
-        fragment: cpu::CpuFragment,
-    };
+    let mut pipeline = Pipeline::new(cpu::CpuVertex, cpu::CpuRasterization, cpu::CpuFragment);
     let mut transformed = pipeline
-        .vertex
-        .transform(&prepared, camera_matrix(&config)?)
+        .transform(&prepared, config.camera_matrix()?)
         .map_err(|error| format!("Failed to transform '{}': {error}", path.display()))?;
     let output_dir = root.join("output");
     fs::create_dir_all(&output_dir)
@@ -181,7 +175,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let materials = load_materials(&asset, config.sampling)?;
     eprintln!("Preparing direct-light shadows...");
-    let mut lights = cpu::prepare_lights(
+    let mut lights = prepare_lights(
         collect_lights(&transformed, &materials, &config.light)?,
         &transformed,
         &materials,
