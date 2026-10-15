@@ -7,6 +7,8 @@ use crate::{config::OutputConfig, texture::encode_srgb};
 pub struct RenderOutput {
     pub framebuffer: Framebuffer,
     pub covered_fragments: u64,
+    pub screen_vertices: usize,
+    pub screen_triangles: usize,
 }
 
 pub struct Framebuffer {

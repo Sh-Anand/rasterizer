@@ -4,8 +4,17 @@ use glam::{Mat3, Mat4, Vec4};
 
 use crate::{
     geometry::{PreparedPrimitive, PreparedScene},
+    pipeline::VertexStage,
     vertex::{ClipPrimitive, ClipScene, ClipVertex},
 };
+
+pub struct CpuVertex;
+
+impl VertexStage for CpuVertex {
+    fn transform(&mut self, scene: &PreparedScene, view_projection: Mat4) -> io::Result<ClipScene> {
+        transform_scene(scene, view_projection)
+    }
+}
 
 pub fn transform_scene(scene: &PreparedScene, view_projection: Mat4) -> io::Result<ClipScene> {
     if !view_projection.is_finite() {

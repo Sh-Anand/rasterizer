@@ -5,7 +5,9 @@ mod fragment;
 mod rasterization;
 mod vertex;
 
-pub use vertex::{reproject_scene, transform_scene};
+pub use fragment::CpuFragment;
+pub use rasterization::CpuRasterization;
+pub use vertex::{CpuVertex, reproject_scene, transform_scene};
 
 pub(crate) use capture::CaptureScene;
 use rasterization::{RasterPass, rasterize};
@@ -40,14 +42,16 @@ pub fn render(
         materials,
         &mut framebuffer.depth,
         RasterPass::Camera,
-        |index, material, attributes, base_color, front_facing| {
+        |index, material, attributes, front_facing| {
             framebuffer.color[index] =
-                fragment::shade(&lighting, material, attributes, base_color, front_facing);
+                fragment::shade(&lighting, material, attributes, front_facing);
         },
     );
     Ok(RenderOutput {
         framebuffer,
         covered_fragments,
+        screen_vertices: scene.primitives.iter().map(|p| p.vertices.len()).sum(),
+        screen_triangles: scene.primitives.iter().map(|p| p.triangles.len()).sum(),
     })
 }
 
@@ -88,7 +92,7 @@ fn draw_shadow_map(
         materials,
         &mut shadow.depth,
         RasterPass::Shadow(shadow.projection),
-        |_, _, _, _, _| {},
+        |_, _, _, _| {},
     );
     Ok(())
 }

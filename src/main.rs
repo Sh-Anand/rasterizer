@@ -12,14 +12,13 @@ use rasterizer::{
     asset::GltfAsset,
     backend::cpu,
     bake,
-    clip::clip_scene,
     config::Config,
     geometry::prepare_scene,
     lighting::{DirectionalLight, Light, Lighting, RenderLight, collect_lights},
     lightmap::{BakedLighting, cache_key},
     material::load_materials,
+    pipeline::{Pipeline, VertexStage},
     vertex::camera_matrix,
-    viewport::project_scene,
 };
 
 const USAGE: &str = "Usage: rasterizer [bake] <scene-name|path.gltf|path.glb> [--camera-light]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (direct lighting only; off by default).\nBake: cargo run --release -- bake kitchen\nRender: cargo run --release -- living-room";
@@ -152,7 +151,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("Failed to load '{}': {error}", path.display()))?;
     let prepared = prepare_scene(&asset)
         .map_err(|error| format!("Failed to prepare '{}': {error}", path.display()))?;
-    let mut transformed = cpu::transform_scene(&prepared, camera_matrix(&config)?)
+    let mut pipeline = Pipeline {
+        vertex: cpu::CpuVertex,
+        rasterization: cpu::CpuRasterization,
+        fragment: cpu::CpuFragment,
+    };
+    let mut transformed = pipeline
+        .vertex
+        .transform(&prepared, camera_matrix(&config)?)
         .map_err(|error| format!("Failed to transform '{}': {error}", path.display()))?;
     let output_dir = root.join("output");
     fs::create_dir_all(&output_dir)
@@ -200,22 +206,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             shadow: None,
         });
     }
-    let clipped = clip_scene(&transformed)
-        .map_err(|error| format!("Failed to clip '{}': {error}", path.display()))?;
-    let screen = project_scene(&clipped, render_width, render_height)
-        .map_err(|error| format!("Failed to project '{}': {error}", path.display()))?;
-    let rendered = cpu::render(
-        &screen,
-        &materials,
-        render_width,
-        render_height,
-        Lighting {
-            indirect: Some(&lighting.lightmap),
-            lights: &lights,
-            camera_position: config.camera.position.into(),
-        },
-    )
-    .map_err(|error| format!("Failed to render '{}': {error}", path.display()))?;
+    let rendered = pipeline
+        .render_transformed(
+            &transformed,
+            &materials,
+            render_width,
+            render_height,
+            Lighting {
+                indirect: Some(&lighting.lightmap),
+                lights: &lights,
+                camera_position: config.camera.position.into(),
+            },
+        )
+        .map_err(|error| format!("Failed to render '{}': {error}", path.display()))?;
     let output_path = output_dir.join(scene_name(&path)).with_extension("png");
     rendered
         .framebuffer
@@ -271,11 +274,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         transformed.scene_index,
         transformed.primitives.len()
     );
-    let clipped_triangles: usize = clipped.primitives.iter().map(|p| p.triangles.len()).sum();
-    println!("After clipping: {clipped_triangles} triangles");
-    let screen_vertices: usize = screen.primitives.iter().map(|p| p.vertices.len()).sum();
-    let screen_triangles: usize = screen.primitives.iter().map(|p| p.triangles.len()).sum();
-    println!("Pixel-space: {screen_vertices} vertices, {screen_triangles} triangles");
+    println!("After clipping: {} triangles", rendered.screen_triangles);
+    println!(
+        "Pixel-space: {} vertices, {} triangles",
+        rendered.screen_vertices, rendered.screen_triangles
+    );
     println!(
         "Covered fragments (before depth testing): {}",
         rendered.covered_fragments

@@ -117,9 +117,8 @@ impl<'a> CaptureScene<'a> {
                 materials,
                 &mut depth,
                 RasterPass::Capture,
-                |index, material, attributes, base_color, front_facing| {
-                    color[index] =
-                        shade_capture(lightmap, material, attributes, base_color, front_facing);
+                |index, material, attributes, front_facing| {
+                    color[index] = shade_capture(lightmap, material, attributes, front_facing);
                 },
             );
         }

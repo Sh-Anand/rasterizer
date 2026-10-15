@@ -38,6 +38,7 @@ pub struct ScreenScene {
     pub primitives: Vec<ScreenPrimitive>,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct FragmentAttributes {
     pub world_position: Vec3,
     pub uv: UvSample,

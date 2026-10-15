@@ -10,6 +10,7 @@ pub mod geometry;
 pub mod lighting;
 pub mod lightmap;
 pub mod material;
+pub mod pipeline;
 pub mod shadow;
 pub mod texture;
 pub mod vertex;
