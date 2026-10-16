@@ -2,7 +2,7 @@ use std::{collections::HashMap, fs, io, path::Path};
 
 use glam::{Mat4, Vec3, camera::rh};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::texture::Sampling;
 
@@ -20,8 +20,6 @@ pub struct Config {
     scene_cameras: HashMap<String, CameraConfig>,
     pub light: LightConfig,
     pub shadow: ShadowConfig,
-    #[serde(default)]
-    pub bake: BakeConfig,
     #[serde(default)]
     pub output: OutputConfig,
 }
@@ -54,7 +52,7 @@ impl OutputConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShadowConfig {
     pub enabled: bool,
@@ -62,30 +60,12 @@ pub struct ShadowConfig {
     pub bias: f32,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LightConfig {
     pub direction: [f32; 3],
     pub color: [f32; 3],
     pub intensity: f32,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BakeConfig {
-    pub resolution: u32,
-    pub hemicube_resolution: u32,
-    pub bias: f32,
-}
-
-impl Default for BakeConfig {
-    fn default() -> Self {
-        Self {
-            resolution: 32,
-            hemicube_resolution: 16,
-            bias: 0.00001,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]

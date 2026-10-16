@@ -5,10 +5,8 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 use rasterizer::{
     cpu::{self, CpuFragment, CpuRasterization, CpuVertex},
     framebuffer::{DepthBuffer, RenderOutput},
-    geometry::{
-        ClipPrimitive, ClipScene, ClipVertex, GltfAsset, PreparedScene, PrimitiveSource, Triangle,
-    },
-    lighting::Lighting,
+    geometry::{ClipPrimitive, ClipScene, ClipVertex, GltfAsset, PreparedScene, PrimitiveSource},
+    lighting::{DirectionalLight, Light, Lighting, RenderLight},
     material::{Material, load_materials},
     pipeline::{
         Fragment, FragmentAttributes, FragmentStage, Pipeline, RasterizationStage, RasterizedScene,
@@ -37,17 +35,12 @@ fn triangle(material_index: Option<usize>, z: f32) -> ClipPrimitive {
             uv: Vec2::ZERO,
             normal_uv: Vec2::ZERO,
             metallic_roughness_uv: Vec2::ZERO,
-            occlusion_uv: Vec2::ZERO,
             emissive_uv: Vec2::ZERO,
-            lightmap_uv: Vec2::ZERO,
             normal: Vec3::Z,
             tangent: Vec4::ZERO,
         })
         .to_vec(),
-        triangles: vec![Triangle {
-            indices: [0, 1, 2],
-            source_index: 0,
-        }],
+        triangles: vec![[0, 1, 2]],
     }
 }
 
@@ -67,7 +60,6 @@ fn material(color: Vec3) -> Material {
 
 fn lighting() -> Lighting<'static> {
     Lighting {
-        indirect: None,
         lights: &[],
         camera_position: Vec3::Z,
     }
@@ -201,7 +193,7 @@ fn collect_fragments(
 fn nearer_fragments_replace_all_attributes_and_facing_within_and_across_primitives() {
     let far = triangle(Some(0), 0.5);
     let mut near = triangle(Some(0), -0.5);
-    near.triangles[0].indices.swap(1, 2);
+    near.triangles[0].swap(1, 2);
     for vertex in &mut near.vertices {
         vertex.uv = Vec2::new(0.25, 0.75);
         vertex.normal_uv = Vec2::ONE;
@@ -216,10 +208,7 @@ fn nearer_fragments_replace_all_attributes_and_facing_within_and_across_primitiv
         let primitives = if combine {
             let mut combined = far.clone();
             combined.vertices.extend_from_slice(&near.vertices);
-            combined.triangles.push(Triangle {
-                indices: [3, 5, 4],
-                source_index: 1,
-            });
+            combined.triangles.push([3, 5, 4]);
             vec![combined]
         } else {
             vec![far.clone(), near.clone()]
@@ -334,10 +323,12 @@ fn equal_depth_keeps_the_first_winner_and_collector_state_does_not_cross_calls()
 
 #[test]
 fn alpha_modes_factors_and_texture_alpha_are_ignored() {
-    let mut map = rasterizer::lightmap::Lightmap::new(1, 1).unwrap();
-    map.front[0] = [1.0; 3];
+    let lights = [RenderLight {
+        light: Light::Directional(DirectionalLight::new([0.0, 0.0, 1.0], [1.0; 3], 1.0).unwrap()),
+        shadow: None,
+    }];
     let lighting = || Lighting {
-        indirect: Some(&map),
+        lights: &lights,
         ..lighting()
     };
     let opaque = Material {
@@ -357,7 +348,8 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
         expected
             .framebuffer
             .color
-            .contains(&Vec3::new(0.75, 1.25, 1.75))
+            .iter()
+            .any(|color| color.cmpgt(Vec3::new(0.25, 0.5, 0.75)).all())
     );
     let light_config = rasterizer::config::LightConfig {
         direction: [0.0, 0.0, 1.0],
@@ -437,9 +429,9 @@ fn cpu_stages_preserve_clipping_mirrored_winding_and_double_sided_faces() {
     clipped.vertices[0].position.x = -2.0;
     let mut mirrored = triangle(Some(1), -0.5);
     mirrored.mirrored = true;
-    mirrored.triangles[0].indices.swap(1, 2);
+    mirrored.triangles[0].swap(1, 2);
     let mut back = triangle(Some(2), -0.75);
-    back.triangles[0].indices.swap(1, 2);
+    back.triangles[0].swap(1, 2);
     let scene = scene(vec![back, mirrored, clipped]);
     let materials = [
         material(Vec3::X),
@@ -524,9 +516,7 @@ impl RasterizationStage for FixedRasterization {
                     uv,
                     normal_uv: uv,
                     metallic_roughness_uv: uv,
-                    occlusion_uv: uv,
                     emissive_uv: uv,
-                    lightmap_uv: Vec2::ZERO,
                 },
             }],
             covered_fragments: 1,

@@ -95,8 +95,8 @@ fn flat_normals_are_split_before_transforming() {
     assert_eq!(primitive.source.node_index, 1);
     assert_eq!(primitive.source.material_index, Some(0));
     assert_eq!(primitive.vertices.len(), 6);
-    assert_eq!(primitive.triangles[0].indices, [0, 1, 2]);
-    assert_eq!(primitive.triangles[1].indices, [3, 4, 5]);
+    assert_eq!(primitive.triangles[0], [0, 1, 2]);
+    assert_eq!(primitive.triangles[1], [3, 4, 5]);
     assert_eq!(primitive.vertices[1].position, Vec3::X);
     assert_eq!(primitive.vertices[0].normal, Vec3::Z);
     assert_eq!(primitive.vertices[3].normal, Vec3::Y);
@@ -116,8 +116,8 @@ fn generated_tangent_seams_are_fixed_and_reusable_across_views() {
     drop(asset);
     let primitive = &prepared.primitives[0];
     assert_eq!(primitive.vertices.len(), 6);
-    let first = primitive.triangles[0].indices[0] as usize;
-    let second = primitive.triangles[1].indices[0] as usize;
+    let first = primitive.triangles[0][0] as usize;
+    let second = primitive.triangles[1][0] as usize;
     assert_ne!(first, second);
     assert_eq!(
         primitive.vertices[first].position,
@@ -170,9 +170,7 @@ fn supplied_frames_transform_in_world_space_and_preserve_uvs() {
     vertex.uv = Vec2::new(0.1, 0.2);
     vertex.normal_uv = Vec2::new(0.3, 0.4);
     vertex.metallic_roughness_uv = Vec2::new(0.5, 0.6);
-    vertex.occlusion_uv = Vec2::new(0.7, 0.8);
     vertex.emissive_uv = Vec2::new(0.9, 1.0);
-    vertex.lightmap_uv = Vec2::new(0.2, 0.8);
     let input = *vertex;
     let transformed = CpuVertex.transform(&prepared, Mat4::IDENTITY).unwrap();
     let output = &transformed.primitives[0].vertices[0];
@@ -181,9 +179,7 @@ fn supplied_frames_transform_in_world_space_and_preserve_uvs() {
     assert_eq!(output.uv, input.uv);
     assert_eq!(output.normal_uv, input.normal_uv);
     assert_eq!(output.metallic_roughness_uv, input.metallic_roughness_uv);
-    assert_eq!(output.occlusion_uv, input.occlusion_uv);
     assert_eq!(output.emissive_uv, input.emissive_uv);
-    assert_eq!(output.lightmap_uv, input.lightmap_uv);
 }
 
 #[test]

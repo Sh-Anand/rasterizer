@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use glam::{Mat4, Vec2, Vec3, Vec4};
+use glam::{Mat4, Vec3, Vec4};
 
 use crate::{
     framebuffer::{DepthBuffer, Framebuffer, RenderOutput},
@@ -24,9 +24,7 @@ pub struct FragmentAttributes {
     pub uv: UvSample,
     pub normal_uv: UvSample,
     pub metallic_roughness_uv: UvSample,
-    pub occlusion_uv: UvSample,
     pub emissive_uv: UvSample,
-    pub lightmap_uv: Vec2,
     pub normal: Vec3,
     pub tangent: Vec4,
 }
@@ -101,7 +99,7 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         &self.stats
     }
 
-    /// Transform geometry for shadow and lightmap preparation before rendering.
+    /// Transform geometry for shadow preparation and rendering.
     pub fn transform(
         &mut self,
         scene: &PreparedScene,
@@ -128,7 +126,7 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         self.render_transformed(&transformed, materials, width, height, lighting)
     }
 
-    /// Render transformed geometry with its current lightmap UVs.
+    /// Render geometry returned by the vertex stage.
     pub fn render_transformed(
         &mut self,
         scene: &ClipScene,

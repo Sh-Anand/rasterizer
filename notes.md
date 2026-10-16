@@ -6,7 +6,7 @@ Record design decisions and their tradeoffs, not implementation details or progr
 
 Model vertex and fragment shading as distinct programmable stages, with vertex shading intended to run on the GPU. For the initial backend, execute only fragment shading on the GPU; keep vertex processing, rasterization, interpolation, depth/output handling, and the other stages on the CPU. GPU fragment work must consume generated fragments, not scan tile triangle lists or perform software coverage tests. Keep the existing CPU renderer as an independent correctness reference.
 
-Prepare scene geometry independently of the camera. Decode attributes, generate missing flat normals and tangents, and split normal/tangent seams before vertex shading so every backend receives fixed topology and object-space attributes. Vertex shading applies the instance transforms and view projection without changing indices. Keep the existing matrix multiplication and normalization order for the CPU reference. Splitting tangent seams in object space can change vertex numbering compared with splitting transformed tangents, so invalidate older lightmap layouts that reference those vertices.
+Prepare scene geometry independently of the camera. Decode attributes, generate missing flat normals and tangents, and split normal/tangent seams before vertex shading so every backend receives fixed topology and object-space attributes. Vertex shading applies the instance transforms and view projection without changing indices. Keep the existing matrix multiplication and normalization order for the CPU reference.
 
 Select vertex, rasterization, and fragment backends independently. Their initial interfaces exchange host-resident geometry, fragment attributes, and linear HDR colors. Rasterization owns clipping, projection, interpolation, and depth; fragment shading owns material color evaluation. The coordinator allocates the framebuffer and scatters returned colors. Supersampling resolve, exposure, tone mapping, and export remain ordinary framebuffer operations outside the replaceable stages.
 
@@ -22,13 +22,13 @@ Shade fragments independently, without quad-based lane exchange. Use analytic pe
 
 This staged split is for developing and studying shader workloads, not measuring native graphics-pipeline frame times: CPU work and fragment input/output transfers add overhead that a fully GPU-resident implementation would not have. Treat fragment-to-lane packing as an explicit model, not an exact reproduction of a vendor's hardware scheduler.
 
-Measure stage wall time around each backend call, including transfers and synchronization needed to return host-resident results. Count vertex inputs before lightmap UV remapping and fragment inputs after scene-wide visibility resolution; SSAA fragments are render-resolution samples. Report scene triangles before clipping, and keep loading, lighting preparation, framebuffer writeback, and output times separate from shader timings.
+Measure stage wall time around each backend call, including transfers and synchronization needed to return host-resident results. Count vertices entering vertex shading and surviving fragments entering fragment shading; SSAA fragments are render-resolution samples. Report scene triangles before clipping, and keep loading, lighting preparation, framebuffer writeback, and output times separate from shader timings.
 
-Sum measured loading, geometry, materials, shadows, and lightmap work as the one-time cost for a static scene. Sum vertex shading, rasterization, fragment shading, render setup/writeback, and postprocessing as the per-render cost when the camera changes. Report PNG encoding and writing separately, outside both totals. These are grouped measurements of the current render, not a steady-state frame-loop benchmark.
+Sum measured loading, geometry, materials, and shadow preparation as the one-time cost for a static scene. Sum vertex shading, rasterization, fragment shading, render setup/writeback, and postprocessing as the per-render cost when the camera changes. Report PNG encoding and writing separately, outside both totals. These are grouped measurements of the current render, not a steady-state frame-loop benchmark.
 
 ## Clipping
 
-Use FP32 for all rendering calculations, including clipping, coverage, interpolation, texture filtering, lighting, baking, and image export.
+Use FP32 for all rendering calculations, including clipping, coverage, interpolation, texture filtering, lighting, and image export.
 
 We chose explicit clipping with synthetic ("fake") intersection vertices instead of a guard band.
 
@@ -38,7 +38,7 @@ This keeps the implementation straightforward, but can increase vertex and trian
 
 One orthographic shadow map covers the full scene so off-camera geometry can cast shadows. This keeps fitting simple, but large scenes spread the available resolution thinly. Use a one-texel slope bias to cover the bilinear PCF footprint, plus a configurable constant bias: too little bias causes self-shadowing artifacts; too much detaches shadows from their casters.
 
-Use fixed 2x2 percentage-closer filtering: bilinearly blend four depth-comparison results, not depths. Apply fractional visibility to each light in runtime shading and the indirect bake's direct-light input. This reduces jagged edges but does not model an area light's physical penumbra. Keep it independent of material-texture filtering; do not generate depth mipmaps. Clamp directional-map border taps. For emissive lights, remap taps across cube faces with per-face reference depths and average the three comparisons at cube corners. Filtering changes require rebaking indirect lighting.
+Use fixed 2x2 percentage-closer filtering: bilinearly blend four depth-comparison results, not depths. Apply fractional visibility to each light during shading. This reduces jagged edges but does not model an area light's physical penumbra. Keep it independent of material-texture filtering; do not generate depth mipmaps. Clamp directional-map border taps. For emissive lights, remap taps across cube faces with per-face reference depths and average the three comparisons at cube corners.
 
 ## Area lights
 
@@ -50,46 +50,28 @@ Use rasterized shadow maps at each emitting triangle's centroid: five cube faces
 
 Perspective shadow faces store linear light-view depth, normalized by their far distance, with the same one-texel slope bias and configured constant bias. Their range fits the full scene; the near plane is 0.0001 times the far distance, so very nearby occluders can be clipped.
 
-Lighting and visibility will remain rasterization-based, including future GI; no ray tracing or shadow rays.
-
-## Baked lighting
-
-Bake exactly one diffuse indirect bounce for static geometry, materials, and lights. The saved lightmap contains no direct lighting. Store linear floating-point indirect lighting for a white receiver; apply the receiver's `base_color * (1 - metallic)` when rendering, alongside runtime direct lighting and emission.
-
-Limit GI to one diffuse bounce to keep CPU baking tractable. Second and later reflections are omitted, so enclosed spaces can be too dark and multi-bounce color bleeding is missing. Increasing bake resolution does not recover these missing light paths.
-
-TODO (deferred): Add configurable indirect-bounce counts, starting with two. Propagate the previous bounce into the next and accumulate only indirect lighting in the saved lightmap. This requires rebaking and increases bake time, but leaves runtime shading unchanged.
-
-Generate a separate lightmap UV atlas with xatlas, giving each placed mesh instance its own space without changing material UVs or source triangle identities. Two-sided surfaces have independent front/back lighting. Chart padding supports bilinear filtering; sub-texel triangles use a centroid sample. The requested resolution is approximate: many small charts can make the atlas substantially larger.
-
-For indirect lighting, rasterize a five-face hemicube at each surface sample and integrate incoming light with cosine/solid-angle weights. Captures read a temporary direct Lambertian lighting atlas, multiplied by the visible surface's `base_color * (1 - metallic)`. Discard the direct atlas after computing the bounce; do not add it to the saved map. This models only diffuse reflection: pure metals contribute no bounce, so specular indirect lighting is deliberately omitted. Exclude emission because emissive triangles already contribute to runtime direct lighting; never feed indirect results back into these captures. Single-sided backfaces block light but do not reflect it.
-
-Keep the initial bake coarse: this CPU method is expensive, and low lightmap/hemicube resolutions can blur shadows, miss small features, and leak light. Cache the result using scene, material, light, and bake settings; camera and image-resolution changes do not require rebaking.
-
-The indirect bake remains Lambertian: both bounce captures and the final receiver omit angle-dependent diffuse Fresnel weighting. Its RGB lightmap does not retain incoming light directions, so removing this approximation would require storing directional lighting and doing more runtime work.
-
-Apply normal maps only to runtime direct diffuse and specular lighting. Keep mesh normals for the indirect bake, including bounce captures; normal-map detail therefore does not affect bounced lighting.
+Render direct diffuse and specular lighting, shadows, and surface emission only. Indirect lighting is deferred; its future implementation is undecided. Ignore material occlusion maps, which affect only indirect lighting.
 
 ## Transparency
 
-Treat every material as fully opaque. Ignore alpha mode, alpha cutoff, base-color alpha, and texture alpha in camera rendering, shadow maps, emissive-light collection, and baking. Rasterization performs no material texture sampling. Supporting cutouts or blending later requires revisiting visibility and depth ownership.
+Treat every material as fully opaque. Ignore alpha mode, alpha cutoff, base-color alpha, and texture alpha in camera rendering, shadow maps, and emissive-light collection. Rasterization performs no material texture sampling. Supporting cutouts or blending later requires revisiting visibility and depth ownership.
 
 ## Runtime material shading
 
-Use one global material-texture filter: `none` (nearest), `bilinear` (level zero), or `trilinear` (mipmapped). Override glTF filter choices but preserve wrap modes. Filter color textures in linear RGB; data maps stay linear. Alpha is ignored. Rasterized passes use analytic perspective-correct UV gradients instead of GPU quad derivatives; non-rasterized point queries use level zero. Changing the filter requires rebaking indirect lighting.
+Use one global material-texture filter: `none` (nearest), `bilinear` (level zero), or `trilinear` (mipmapped). Override glTF filter choices but preserve wrap modes. Filter color textures in linear RGB; data maps stay linear. Alpha is ignored. Rasterized passes use analytic perspective-correct UV gradients instead of GPU quad derivatives; non-rasterized point queries use level zero.
 
-Use isotropic box-filtered mipmaps, without anisotropic filtering or normal-variance roughness compensation. Oblique textures can blur. Exclude lightmap-atlas and shadow-depth sampling from this setting; ordinary atlas mipmaps would bleed between charts, and shadows need comparison filtering instead.
+Use isotropic box-filtered mipmaps, without anisotropic filtering or normal-variance roughness compensation. Oblique textures can blur. Shadow maps use comparison filtering independently of this setting.
 
-Compute direct diffuse and specular together at runtime, sharing each light's direction and shadow lookup. This adds per-pixel diffuse evaluation instead of baking it, but permits camera/light-dependent Fresnel weighting. Use GGX distribution, height-correlated Smith visibility, and Schlick Fresnel, with dielectric F0 = 0.04 and metallic F0 = base color. Multiply direct diffuse reflectance by `1 - F_dielectric(V dot H)`; do not apply the metallic-tinted specular Fresnel to this term. Share the underlying `base_color * (1 - metallic)` reflectance with indirect shading. This follows the [glTF metallic-roughness mixing model](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#metal-brdf-and-dielectric-brdf), itself an approximation rather than an exactly energy-conserving layered BRDF.
+Compute direct diffuse and specular together at runtime, sharing each light's direction and shadow lookup. Use GGX distribution, height-correlated Smith visibility, and Schlick Fresnel, with dielectric F0 = 0.04 and metallic F0 = base color. Multiply direct diffuse reflectance by `1 - F_dielectric(V dot H)`; do not apply the metallic-tinted specular Fresnel to this term. This follows the [glTF metallic-roughness mixing model](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#metal-brdf-and-dielectric-brdf), itself an approximation rather than an exactly energy-conserving layered BRDF.
 
-No specular indirect lighting, environment reflections, or microfacet multiple-scattering compensation is included. Rough metals can therefore lose energy and metals without directly visible lights can appear dark.
+No environment reflections or microfacet multiple-scattering compensation is included. Rough metals can therefore lose energy and metals without directly visible lights can appear dark.
 
 Clamp perceptual roughness to at least 0.045 for specular evaluation, avoiding a singular perfect-mirror lobe and reducing very small highlights. Zero-roughness materials are therefore approximated, not true mirrors.
 
 Preserve the configured directional light's existing brightness convention: intensity 1 gives a facing white Lambertian reference a response of 1 before Fresnel weighting. Convert it to incident irradiance with a factor of pi so diffuse and specular use the same light units.
 
-Prepare shadow maps once per process and share them between baking and runtime direct lighting. They remain resident through rendering, increasing memory use during the indirect bake. Cached-lightmap renders still rebuild these maps at startup; camera movement alone does not require new maps or a new indirect bake. Disk caching of shadows is deferred.
+Prepare shadow maps once per process. Camera movement alone does not require new maps. Disk caching of shadows is deferred.
 
-Keep the framebuffer in linear HDR and apply manual exposure, per-channel Reinhard tone mapping (`x / (1 + x)`), then sRGB encoding only at PNG export. This simple global curve preserves highlight differences but can desaturate bright colors; no automatic exposure or filmic color transform is modeled. Output settings do not affect the lighting bake. Tone mapping can be disabled to recover clamped output.
+Keep the framebuffer in linear HDR and apply manual exposure, per-channel Reinhard tone mapping (`x / (1 + x)`), then sRGB encoding only at PNG export. This simple global curve preserves highlight differences but can desaturate bright colors; no automatic exposure or filmic color transform is modeled. Tone mapping can be disabled to recover clamped output.
 
-Use regular-grid supersampling for the CPU reference renderer. A scale of N renders N times the output width and height, with independent coverage, depth, and shading for N² samples per pixel. Resolve color with a box average in linear HDR before tone mapping and sRGB encoding. This reuses the single-sample rasterizer but multiplies camera-framebuffer storage and pixel shading work by N²; it is not an MSAA execution model for GPU traces. Default to 1 (off). Shadow and bake resolutions stay unchanged, so changing supersampling does not require rebaking.
+Use regular-grid supersampling for the CPU reference renderer. A scale of N renders N times the output width and height, with independent coverage, depth, and shading for N² samples per pixel. Resolve color with a box average in linear HDR before tone mapping and sRGB encoding. This reuses the single-sample rasterizer but multiplies camera-framebuffer storage and pixel shading work by N²; it is not an MSAA execution model for GPU traces. Default to 1 (off). Shadow resolution is independent of supersampling.

@@ -180,9 +180,7 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f32)
         uv: uv(|v| v.uv),
         normal_uv: uv(|v| v.normal_uv),
         metallic_roughness_uv: uv(|v| v.metallic_roughness_uv),
-        occlusion_uv: uv(|v| v.occlusion_uv),
         emissive_uv: uv(|v| v.emissive_uv),
-        lightmap_uv: uv(|v| v.lightmap_uv),
         normal,
         tangent,
     }
@@ -202,9 +200,7 @@ pub(crate) fn project(
     let mut scratch = Vec::with_capacity(9);
 
     for triangle in &primitive.triangles {
-        let vertices = triangle
-            .indices
-            .map(|index| primitive.vertices[index as usize]);
+        let vertices = triangle.map(|index| primitive.vertices[index as usize]);
         let codes = vertices.map(|vertex| outcode(vertex.position));
         if codes[0] & codes[1] & codes[2] != 0 {
             continue;
@@ -265,9 +261,7 @@ pub(crate) struct ScreenVertex {
     pub uv: Vec2,
     pub normal_uv: Vec2,
     pub metallic_roughness_uv: Vec2,
-    pub occlusion_uv: Vec2,
     pub emissive_uv: Vec2,
-    pub lightmap_uv: Vec2,
     /// World-space normal.
     pub normal: Vec3,
     pub tangent: Vec4,
@@ -282,7 +276,7 @@ pub(crate) struct ScreenPrimitive {
 
 struct UvGradients {
     inv_w: Vec2,
-    sets: [[Vec2; 2]; 5],
+    sets: [[Vec2; 2]; 4],
 }
 
 impl UvGradients {
@@ -294,15 +288,7 @@ impl UvGradients {
         let b = Vec2::new(ac.y, -ac.x) / area;
         let c = Vec2::new(-ab.y, ab.x) / area;
         let weights: [Vec2; 3] = std::array::from_fn(|i| [-b - c, b, c][i] * vertices[i].inv_w);
-        let uvs = vertices.map(|v| {
-            [
-                v.uv,
-                v.normal_uv,
-                v.metallic_roughness_uv,
-                v.occlusion_uv,
-                v.emissive_uv,
-            ]
-        });
+        let uvs = vertices.map(|v| [v.uv, v.normal_uv, v.metallic_roughness_uv, v.emissive_uv]);
         Self {
             inv_w: weights.iter().sum(),
             sets: std::array::from_fn(|set| {
@@ -353,9 +339,7 @@ fn project_vertex(vertex: ClipVertex, width: f32, height: f32) -> io::Result<Scr
         uv: vertex.uv,
         normal_uv: vertex.normal_uv,
         metallic_roughness_uv: vertex.metallic_roughness_uv,
-        occlusion_uv: vertex.occlusion_uv,
         emissive_uv: vertex.emissive_uv,
-        lightmap_uv: vertex.lightmap_uv,
         normal: vertex.normal,
         tangent: vertex.tangent,
     })
@@ -396,19 +380,17 @@ fn interpolate_attributes(
         uv: gradients.sample(0, uv(|v| v.uv), sum),
         normal_uv: gradients.sample(1, uv(|v| v.normal_uv), sum),
         metallic_roughness_uv: gradients.sample(2, uv(|v| v.metallic_roughness_uv), sum),
-        occlusion_uv: gradients.sample(3, uv(|v| v.occlusion_uv), sum),
-        emissive_uv: gradients.sample(4, uv(|v| v.emissive_uv), sum),
-        lightmap_uv: uv(|v| v.lightmap_uv),
+        emissive_uv: gradients.sample(3, uv(|v| v.emissive_uv), sum),
         normal: (normal / sum).normalize_or_zero(),
         tangent: tangent / sum,
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CoverageSample {
-    pub pixel: [u32; 2],
+struct CoverageSample {
+    pixel: [u32; 2],
     /// Screen-space weights in the input vertex order.
-    pub barycentric: [f32; 3],
+    barycentric: [f32; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -434,7 +416,7 @@ impl Edge {
     }
 }
 
-pub(crate) fn rasterize_triangle(
+fn rasterize_triangle(
     mut vertices: [Vec2; 3],
     width: u32,
     height: u32,

@@ -3,8 +3,8 @@ use std::{f32::consts::PI, io};
 use glam::Vec3;
 
 use crate::{
-    config::LightConfig, geometry::ClipScene, lightmap::Lightmap, material::Material,
-    shadow::LightShadow, texture::UvSample,
+    config::LightConfig, geometry::ClipScene, material::Material, shadow::LightShadow,
+    texture::UvSample,
 };
 
 pub struct RenderLight {
@@ -13,15 +13,8 @@ pub struct RenderLight {
 }
 
 pub struct Lighting<'a> {
-    pub indirect: Option<&'a Lightmap>,
     pub lights: &'a [RenderLight],
     pub camera_position: Vec3,
-}
-
-pub(crate) fn lambertian_lighting(lights: &[RenderLight], position: Vec3, normal: Vec3) -> Vec3 {
-    visible_lights(lights, position)
-        .map(|sample| sample.irradiance * (normal.dot(sample.direction).max(0.0) / PI))
-        .sum()
 }
 
 pub(crate) fn visible_lights(
@@ -185,7 +178,7 @@ pub fn collect_lights(
             continue;
         }
         for triangle in &primitive.triangles {
-            let vertices = triangle.indices.map(|i| primitive.vertices[i as usize]);
+            let vertices = triangle.map(|i| primitive.vertices[i as usize]);
             let emissive_uv =
                 (vertices[0].emissive_uv + vertices[1].emissive_uv + vertices[2].emissive_uv) / 3.0;
             let radiance = material.emission(UvSample::point(emissive_uv));

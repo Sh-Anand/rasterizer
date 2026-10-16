@@ -73,9 +73,7 @@ fn transform_primitive(
                 uv: vertex.uv,
                 normal_uv: vertex.normal_uv,
                 metallic_roughness_uv: vertex.metallic_roughness_uv,
-                occlusion_uv: vertex.occlusion_uv,
                 emissive_uv: vertex.emissive_uv,
-                lightmap_uv: vertex.lightmap_uv,
                 normal,
                 tangent,
             })

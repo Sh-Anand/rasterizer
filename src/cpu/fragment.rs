@@ -48,11 +48,7 @@ pub(super) fn shade(
     let view = (lighting.camera_position - attributes.world_position).normalize_or_zero();
     let (metallic, roughness) = material.metallic_roughness(attributes.metallic_roughness_uv);
     let brdf = Brdf::new(base_color, metallic, roughness);
-    let mut reflected = lighting.indirect.map_or(Vec3::ZERO, |map| {
-        brdf.diffuse
-            * map.sample(attributes.lightmap_uv, !front_facing)
-            * material.occlusion(attributes.occlusion_uv)
-    });
+    let mut reflected = Vec3::ZERO;
     for sample in visible_lights(lighting.lights, attributes.world_position) {
         reflected += brdf.evaluate(normal, view, sample.direction)
             * sample.irradiance

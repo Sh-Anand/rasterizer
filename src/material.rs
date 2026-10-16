@@ -24,8 +24,6 @@ pub struct Material {
     pub metallic_factor: f32,
     pub roughness_factor: f32,
     pub metallic_roughness_texture: Option<Texture>,
-    pub occlusion_strength: f32,
-    pub occlusion_texture: Option<Texture>,
     pub emissive_factor: Vec3,
     pub emissive_texture: Option<Texture>,
     pub double_sided: bool,
@@ -41,8 +39,6 @@ impl Default for Material {
             metallic_factor: 1.0,
             roughness_factor: 1.0,
             metallic_roughness_texture: None,
-            occlusion_strength: 1.0,
-            occlusion_texture: None,
             emissive_factor: Vec3::ZERO,
             emissive_texture: None,
             double_sided: false,
@@ -54,7 +50,6 @@ impl Material {
     fn new(material: gltf::Material<'_>, textures: &mut TextureLoader<'_>) -> io::Result<Self> {
         let pbr = material.pbr_metallic_roughness();
         let normal = material.normal_texture();
-        let occlusion = material.occlusion_texture();
         Ok(Self {
             base_color_factor: Vec4::from(pbr.base_color_factor()).truncate(),
             base_color_texture: load_texture(pbr.base_color_texture(), textures, ColorSpace::Srgb)?,
@@ -74,15 +69,6 @@ impl Material {
                 textures,
                 ColorSpace::Linear,
             )?,
-            occlusion_strength: occlusion.as_ref().map_or(1.0, |info| info.strength()),
-            occlusion_texture: occlusion
-                .map(|info| {
-                    check_texture_transform(
-                        info.extension_value("KHR_texture_transform").is_some(),
-                    )?;
-                    textures.load(info.texture(), ColorSpace::Linear)
-                })
-                .transpose()?,
             emissive_factor: Vec3::from(material.emissive_factor()),
             emissive_texture: load_texture(
                 material.emissive_texture(),
@@ -131,12 +117,6 @@ impl Material {
             self.metallic_factor * sample.z,
             self.roughness_factor * sample.y,
         )
-    }
-
-    pub fn occlusion(&self, uv: UvSample) -> f32 {
-        self.occlusion_texture.as_ref().map_or(1.0, |texture| {
-            1.0 + self.occlusion_strength * (texture.sample(uv).x - 1.0)
-        })
     }
 
     pub fn emission(&self, uv: UvSample) -> Vec3 {

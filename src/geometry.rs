@@ -36,7 +36,7 @@ pub struct PreparedPrimitive {
     /// Allow zero normals on degenerate triangles.
     pub flat_shaded: bool,
     pub vertices: Vec<PreparedVertex>,
-    pub triangles: Vec<Triangle>,
+    pub triangles: Vec<[u32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -46,9 +46,7 @@ pub struct PreparedVertex {
     pub uv: Vec2,
     pub normal_uv: Vec2,
     pub metallic_roughness_uv: Vec2,
-    pub occlusion_uv: Vec2,
     pub emissive_uv: Vec2,
-    pub lightmap_uv: Vec2,
     /// Object-space normal; normalize after transformation.
     pub normal: Vec3,
     /// Object-space tangent; W is handedness, or zero for an unusable frame.
@@ -63,19 +61,12 @@ pub struct PrimitiveSource {
     pub material_index: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Triangle {
-    pub indices: [u32; 3],
-    /// Triangle index within the source mesh primitive.
-    pub source_index: usize,
-}
-
 #[derive(Debug, Clone)]
 pub struct ClipPrimitive {
     pub source: PrimitiveSource,
     pub mirrored: bool,
     pub vertices: Vec<ClipVertex>,
-    pub triangles: Vec<Triangle>,
+    pub triangles: Vec<[u32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,9 +76,7 @@ pub struct ClipVertex {
     pub uv: Vec2,
     pub normal_uv: Vec2,
     pub metallic_roughness_uv: Vec2,
-    pub occlusion_uv: Vec2,
     pub emissive_uv: Vec2,
-    pub lightmap_uv: Vec2,
     /// World-space normal.
     pub normal: Vec3,
     /// World-space tangent; W is handedness, or zero for an unusable frame.
@@ -201,8 +190,6 @@ fn prepare_node(
                 pbr.metallic_roughness_texture()
                     .map(|info| info.tex_coord()),
             )?;
-            let occlusion_uvs =
-                read_uvs(material.occlusion_texture().map(|info| info.tex_coord()))?;
             let emissive_uvs = read_uvs(material.emissive_texture().map(|info| info.tex_coord()))?;
             let indices: Vec<u32> = if primitive.indices().is_some() {
                 reader
@@ -224,13 +211,9 @@ fn prepare_node(
             {
                 return Err(invalid("Triangle index is outside the vertex buffer"));
             }
-            let mut triangles: Vec<Triangle> = indices
+            let mut triangles: Vec<[u32; 3]> = indices
                 .chunks_exact(3)
-                .enumerate()
-                .map(|(source_index, triangle)| Triangle {
-                    indices: [triangle[0], triangle[1], triangle[2]],
-                    source_index,
-                })
+                .map(|triangle| [triangle[0], triangle[1], triangle[2]])
                 .collect();
             let normals: Option<Vec<Vec3>> = reader
                 .read_normals()
@@ -274,9 +257,7 @@ fn prepare_node(
                     uv: uvs[i],
                     normal_uv: normal_uvs[i],
                     metallic_roughness_uv: metallic_roughness_uvs[i],
-                    occlusion_uv: occlusion_uvs[i],
                     emissive_uv: emissive_uvs[i],
-                    lightmap_uv: Vec2::ZERO,
                     normal: Vec3::ZERO,
                     tangent: Vec4::ZERO,
                 })
@@ -291,9 +272,9 @@ fn prepare_node(
                     .map_err(|_| invalid("Too many flat-shaded vertices"))?;
                 let mut flat_vertices = Vec::with_capacity(indices.len());
                 for triangle in &mut triangles {
-                    let [a, b, c] = triangle.indices.map(|index| positions[index as usize]);
+                    let [a, b, c] = triangle.map(|index| positions[index as usize]);
                     let normal = (b - a).cross(c - a);
-                    for index in &mut triangle.indices {
+                    for index in triangle {
                         let mut vertex = vertices[*index as usize];
                         vertex.normal = normal;
                         *index = flat_vertices.len() as u32;
@@ -331,7 +312,7 @@ fn prepare_node(
 fn supplied_tangents(
     tangents: &[Vec4],
     vertex_count: usize,
-    triangles: &[Triangle],
+    triangles: &[[u32; 3]],
 ) -> io::Result<Vec<[Vec4; 3]>> {
     let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
     if tangents.len() != vertex_count
@@ -344,7 +325,7 @@ fn supplied_tangents(
     triangles
         .iter()
         .map(|triangle| {
-            let [a, b, c] = triangle.indices.map(|i| tangents[i as usize]);
+            let [a, b, c] = triangle.map(|i| tangents[i as usize]);
             if a.w != b.w || a.w != c.w {
                 return Err(invalid("Triangle tangent handedness must be uniform"));
             }
@@ -357,7 +338,7 @@ struct TangentGeometry<'a> {
     positions: &'a [Vec3],
     normals: Option<&'a [Vec3]>,
     uvs: &'a [Vec2],
-    triangles: &'a [Triangle],
+    triangles: &'a [[u32; 3]],
     tangents: Vec<[Vec4; 3]>,
 }
 
@@ -371,22 +352,22 @@ impl mikktspace::Geometry for TangentGeometry<'_> {
     }
 
     fn position(&self, face: usize, vert: usize) -> [f32; 3] {
-        self.positions[self.triangles[face].indices[vert] as usize].to_array()
+        self.positions[self.triangles[face][vert] as usize].to_array()
     }
 
     fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
         let triangle = &self.triangles[face];
         let normal = if let Some(normals) = self.normals {
-            normals[triangle.indices[vert] as usize]
+            normals[triangle[vert] as usize]
         } else {
-            let [a, b, c] = triangle.indices.map(|i| self.positions[i as usize]);
+            let [a, b, c] = triangle.map(|i| self.positions[i as usize]);
             (b - a).cross(c - a)
         };
         normal.normalize_or_zero().to_array()
     }
 
     fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
-        self.uvs[self.triangles[face].indices[vert] as usize].to_array()
+        self.uvs[self.triangles[face][vert] as usize].to_array()
     }
 
     fn set_tangent_encoded(&mut self, tangent: [f32; 4], face: usize, vert: usize) {
@@ -398,7 +379,7 @@ fn generate_tangents(
     positions: &[Vec3],
     normals: Option<&[Vec3]>,
     uvs: &[Vec2],
-    triangles: &[Triangle],
+    triangles: &[[u32; 3]],
 ) -> Vec<[Vec4; 3]> {
     let mut geometry = TangentGeometry {
         positions,
@@ -408,7 +389,7 @@ fn generate_tangents(
         tangents: vec![[Vec4::ZERO; 3]; triangles.len()],
     };
     let has_surface = triangles.iter().any(|triangle| {
-        let [a, b, c] = triangle.indices.map(|i| positions[i as usize]);
+        let [a, b, c] = triangle.map(|i| positions[i as usize]);
         (b - a).cross(c - a).try_normalize().is_some()
     });
     if has_surface && !mikktspace::generate_tangents(&mut geometry) {
@@ -419,13 +400,13 @@ fn generate_tangents(
 
 fn split_tangents(
     vertices: &mut Vec<PreparedVertex>,
-    triangles: &mut [Triangle],
+    triangles: &mut [[u32; 3]],
     tangents: &[[Vec4; 3]],
 ) -> io::Result<()> {
     let mut assigned = vec![false; vertices.len()];
     let mut variants = HashMap::new();
     for (triangle, tangents) in triangles.iter_mut().zip(tangents) {
-        for (index, tangent) in triangle.indices.iter_mut().zip(tangents) {
+        for (index, tangent) in triangle.iter_mut().zip(tangents) {
             let tangent = *tangent;
             let original = *index;
             if !assigned[original as usize] {

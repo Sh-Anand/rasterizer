@@ -1,10 +1,8 @@
-pub mod bake;
 pub mod config;
 pub mod cpu;
 pub mod framebuffer;
 pub mod geometry;
 pub mod lighting;
-pub mod lightmap;
 pub mod material;
 pub mod pipeline;
 pub mod shadow;

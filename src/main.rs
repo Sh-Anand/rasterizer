@@ -10,18 +10,16 @@ use std::{
 use glam::Vec3;
 
 use rasterizer::{
-    bake,
     config::Config,
     cpu,
     geometry::{GltfAsset, prepare_scene},
     lighting::{DirectionalLight, Light, Lighting, RenderLight, collect_lights},
-    lightmap::{BakedLighting, cache_key},
     material::load_materials,
     pipeline::Pipeline,
     shadow::prepare_lights,
 };
 
-const USAGE: &str = "Usage: rasterizer [bake] <scene-name|path.gltf|path.glb> [--camera-light]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (direct lighting only; off by default).\nBake: cargo run --release -- bake kitchen\nRender: cargo run --release -- living-room";
+const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\nRender: cargo run --release -- living-room";
 
 fn scene_paths() -> io::Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -131,13 +129,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    let baking = path == "bake";
-    let path = if baking {
-        args.next()
-            .ok_or_else(|| format!("Expected a scene to bake.\n\n{USAGE}"))?
-    } else {
-        path
-    };
     if args.next().is_some() {
         return Err(format!("Expected one scene name or asset path.\n\n{USAGE}").into());
     }
@@ -159,30 +150,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let camera_matrix = config.camera_matrix()?;
     let mut frame_setup_time = started.elapsed();
-    let mut transformed = pipeline
+    let transformed = pipeline
         .transform(&prepared, camera_matrix)
         .map_err(|error| format!("Failed to transform '{}': {error}", path.display()))?;
     let output_dir = root.join("output");
     fs::create_dir_all(&output_dir)
         .map_err(|error| format!("Failed to create '{}': {error}", output_dir.display()))?;
-    let cache_path = output_dir
-        .join(scene_name(&path))
-        .with_extension("lightmap");
-    let started = Instant::now();
-    let cached = if baking {
-        None
-    } else {
-        Some(
-            BakedLighting::load(&cache_path, cache_key(&asset, &config)?).map_err(|error| {
-                format!(
-                    "Failed to load '{}': {error}\nRun: cargo run --release -- bake {}",
-                    cache_path.display(),
-                    path.display()
-                )
-            })?,
-        )
-    };
-    let mut lightmap_time = started.elapsed();
     let started = Instant::now();
     let materials = load_materials(&asset, config.sampling)?;
     let material_time = started.elapsed();
@@ -195,20 +168,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &config.shadow,
     )?;
     let shadow_time = started.elapsed();
-    let started = Instant::now();
-    let lighting = if let Some(lighting) = cached {
-        lighting.apply(&mut transformed)?;
-        lighting
-    } else {
-        let lighting = bake::bake(&mut transformed, &asset, &materials, &lights, &config)
-            .map_err(|error| format!("Failed to bake '{}': {error}", path.display()))?;
-        lighting
-            .save(&cache_path)
-            .map_err(|error| format!("Failed to save '{}': {error}", cache_path.display()))?;
-        println!("Baked {}", cache_path.display());
-        lighting
-    };
-    lightmap_time += started.elapsed();
     let started = Instant::now();
     if camera_light {
         let direction = Vec3::from(config.camera.position) - Vec3::from(config.camera.target);
@@ -226,7 +185,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             render_width,
             render_height,
             Lighting {
-                indirect: Some(&lighting.lightmap),
                 lights: &lights,
                 camera_position: config.camera.position.into(),
             },
@@ -302,14 +260,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ("Geometry preparation", preparation_time),
                 ("Material preparation", material_time),
                 ("Shadow preparation", shadow_time),
-                (
-                    if baking {
-                        "Lightmap baking + cache write"
-                    } else {
-                        "Lightmap cache load + apply"
-                    },
-                    lightmap_time,
-                ),
             ]
             .as_slice(),
         ),
@@ -344,12 +294,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         output_time.as_secs_f32() * 1000.0
     );
     println!("Wrote {}", output_path.display());
-    println!(
-        "Lighting: {}x{} baked one-bounce indirect; runtime direct diffuse + specular",
-        lighting.lightmap.width, lighting.lightmap.height
-    );
+    println!("Lighting: direct diffuse + specular");
     if camera_light {
-        println!("Camera light: white, unshadowed, direct-only");
+        println!("Camera light: white, unshadowed");
     }
 
     let extensions: Vec<_> = document.extensions_used().collect();
