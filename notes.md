@@ -24,6 +24,8 @@ This staged split is for developing and studying shader workloads, not measuring
 
 Measure stage wall time around each backend call, including transfers and synchronization needed to return host-resident results. Count vertex inputs before lightmap UV remapping and fragment inputs after scene-wide visibility resolution; SSAA fragments are render-resolution samples. Report scene triangles before clipping, and keep loading, lighting preparation, framebuffer writeback, and output times separate from shader timings.
 
+Sum measured loading, geometry, materials, shadows, and lightmap work as the one-time cost for a static scene. Sum vertex shading, rasterization, fragment shading, render setup/writeback, and postprocessing as the per-render cost when the camera changes. Report PNG encoding and writing separately, outside both totals. These are grouped measurements of the current render, not a steady-state frame-loop benchmark.
+
 ## Clipping
 
 Use FP32 for all rendering calculations, including clipping, coverage, interpolation, texture filtering, lighting, baking, and image export.

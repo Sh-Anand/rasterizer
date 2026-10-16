@@ -28,12 +28,11 @@ impl Framebuffer {
         Ok(Self { color, depth })
     }
 
-    pub fn save(
+    pub fn to_image(
         &self,
-        path: impl AsRef<Path>,
         output: &OutputConfig,
         supersampling: u32,
-    ) -> image::ImageResult<()> {
+    ) -> image::ImageResult<image::RgbImage> {
         output.validate()?;
         if supersampling == 0
             || !self.depth.width.is_multiple_of(supersampling)
@@ -48,32 +47,23 @@ impl Framebuffer {
         let width = self.depth.width / supersampling;
         let height = self.depth.height / supersampling;
         let samples = supersampling as f32 * supersampling as f32;
-        let mut pixels = Vec::with_capacity(width as usize * height as usize);
-        for y in 0..height {
-            for x in 0..width {
-                let mut color = Vec3::ZERO;
-                for sy in y * supersampling..(y + 1) * supersampling {
-                    let start =
-                        sy as usize * self.depth.width as usize + (x * supersampling) as usize;
-                    color += self.color[start..start + supersampling as usize]
-                        .iter()
-                        .copied()
-                        .sum::<Vec3>();
-                }
-                color = (color / samples).max(Vec3::ZERO) * output.exposure;
-                if output.tone_mapping {
-                    color /= Vec3::ONE + color;
-                }
-                pixels.push(encode_srgb(color));
+        let mut image = image::RgbImage::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let mut color = Vec3::ZERO;
+            for sy in y * supersampling..(y + 1) * supersampling {
+                let start = sy as usize * self.depth.width as usize + (x * supersampling) as usize;
+                color += self.color[start..start + supersampling as usize]
+                    .iter()
+                    .copied()
+                    .sum::<Vec3>();
             }
+            color = (color / samples).max(Vec3::ZERO) * output.exposure;
+            if output.tone_mapping {
+                color /= Vec3::ONE + color;
+            }
+            *pixel = image::Rgb(encode_srgb(color));
         }
-        image::save_buffer(
-            path,
-            pixels.as_flattened(),
-            width,
-            height,
-            image::ColorType::Rgb8,
-        )
+        Ok(image)
     }
 }
 

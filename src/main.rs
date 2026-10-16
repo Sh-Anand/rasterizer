@@ -4,7 +4,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::ExitCode,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use glam::Vec3;
@@ -108,7 +108,6 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let run_started = Instant::now();
     let mut camera_light = false;
     let mut positional = Vec::new();
     for arg in env::args_os().skip(1) {
@@ -157,8 +156,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("Failed to prepare '{}': {error}", path.display()))?;
     let preparation_time = started.elapsed();
     let mut pipeline = Pipeline::new(cpu::CpuVertex, cpu::CpuRasterization, cpu::CpuFragment);
+    let started = Instant::now();
+    let camera_matrix = config.camera_matrix()?;
+    let mut frame_setup_time = started.elapsed();
     let mut transformed = pipeline
-        .transform(&prepared, config.camera_matrix()?)
+        .transform(&prepared, camera_matrix)
         .map_err(|error| format!("Failed to transform '{}': {error}", path.display()))?;
     let output_dir = root.join("output");
     fs::create_dir_all(&output_dir)
@@ -207,6 +209,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         lighting
     };
     lightmap_time += started.elapsed();
+    let started = Instant::now();
     if camera_light {
         let direction = Vec3::from(config.camera.position) - Vec3::from(config.camera.target);
         lights.push(RenderLight {
@@ -214,6 +217,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             shadow: None,
         });
     }
+    frame_setup_time += started.elapsed();
     let started = Instant::now();
     let rendered = pipeline
         .render_transformed(
@@ -231,12 +235,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let render_time = started.elapsed();
     let output_path = output_dir.join(scene_name(&path)).with_extension("png");
     let started = Instant::now();
-    rendered
+    let image = rendered
         .framebuffer
-        .save(&output_path, &config.output, config.supersampling)
+        .to_image(&config.output, config.supersampling)
+        .map_err(|error| format!("Failed to postprocess '{}': {error}", path.display()))?;
+    let postprocessing_time = started.elapsed();
+    let started = Instant::now();
+    image
+        .save(&output_path)
         .map_err(|error| format!("Failed to save '{}': {error}", output_path.display()))?;
     let output_time = started.elapsed();
-    let total_time = run_started.elapsed();
 
     let document = &asset.document;
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
@@ -285,32 +293,56 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Covered fragments (before depth testing): {}",
         rendered.covered_fragments
     );
-    println!("Timings (wall clock):");
-    for (name, duration) in [
-        ("glTF loading", loading_time),
-        ("Geometry preparation", preparation_time),
-        ("Vertex shading", stats.vertex_time),
-        ("Material preparation", material_time),
-        ("Shadow preparation", shadow_time),
+    println!("Timings (wall clock, static scene with camera changes):");
+    for (category, timings) in [
         (
-            if baking {
-                "Lightmap baking + cache write"
-            } else {
-                "Lightmap cache load + apply"
-            },
-            lightmap_time,
+            "one-time cost",
+            [
+                ("glTF loading", loading_time),
+                ("Geometry preparation", preparation_time),
+                ("Material preparation", material_time),
+                ("Shadow preparation", shadow_time),
+                (
+                    if baking {
+                        "Lightmap baking + cache write"
+                    } else {
+                        "Lightmap cache load + apply"
+                    },
+                    lightmap_time,
+                ),
+            ]
+            .as_slice(),
         ),
-        ("Rasterization", stats.rasterization_time),
-        ("Fragment shading", stats.fragment_time),
         (
-            "Render setup + color writeback",
-            render_time - stats.rasterization_time - stats.fragment_time,
+            "per-render cost",
+            [
+                ("Vertex shading", stats.vertex_time),
+                ("Rasterization", stats.rasterization_time),
+                ("Fragment shading", stats.fragment_time),
+                (
+                    "Render setup + color writeback",
+                    frame_setup_time + render_time - stats.rasterization_time - stats.fragment_time,
+                ),
+                ("Postprocessing", postprocessing_time),
+            ]
+            .as_slice(),
         ),
-        ("Postprocessing + PNG write", output_time),
-        ("Total", total_time),
     ] {
-        println!("  {name}: {:.3} ms", duration.as_secs_f32() * 1000.0);
+        println!("  {category}:");
+        let mut total = Duration::ZERO;
+        for &(name, duration) in timings {
+            println!("    {name}: {:.3} ms", duration.as_secs_f32() * 1000.0);
+            total += duration;
+        }
+        println!(
+            "    Total {category}: {:.3} ms",
+            total.as_secs_f32() * 1000.0
+        );
     }
+    println!(
+        "  PNG encoding + write (excluded from totals): {:.3} ms",
+        output_time.as_secs_f32() * 1000.0
+    );
     println!("Wrote {}", output_path.display());
     println!(
         "Lighting: {}x{} baked one-bounce indirect; runtime direct diffuse + specular",
