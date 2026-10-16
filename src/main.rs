@@ -19,7 +19,7 @@ use rasterizer::{
     shadow::prepare_lights,
 };
 
-const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [-n <threads>] [--camera-light]\n\nWithout arguments, list bundled scenes.\n-n: CPU workers; -1 uses all available logical CPUs (default), 1 uses one worker.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\nRender: cargo run --release -- living-room";
+const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\nRender: cargo run --release -- living-room";
 
 fn scene_paths() -> io::Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -107,18 +107,10 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut camera_light = false;
-    let mut threads = -1;
     let mut positional = Vec::new();
-    let mut args = env::args_os().skip(1);
-    while let Some(arg) = args.next() {
+    for arg in env::args_os().skip(1) {
         if arg == "--camera-light" {
             camera_light = true;
-        } else if arg == "-n" {
-            threads = args
-                .next()
-                .and_then(|value| value.to_str()?.parse::<i32>().ok())
-                .filter(|&value| value == -1 || value > 0)
-                .ok_or("-n requires -1 or a positive worker count")?;
         } else if arg == "--help" || arg == "-h" {
             println!("{USAGE}");
             return Ok(());
@@ -146,11 +138,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load_scene(&config_path, &scene_name(&path).to_string_lossy())
         .map_err(|error| format!("Failed to load '{}': {error}", config_path.display()))?;
     let (render_width, render_height) = config.render_size()?;
-    let threads = if threads == -1 {
-        std::thread::available_parallelism()?.get()
-    } else {
-        threads as usize
-    };
+    let threads = std::thread::available_parallelism()?.get();
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()?;
