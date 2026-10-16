@@ -14,7 +14,7 @@ use crate::{
     lighting::Lighting,
     material::Material,
 };
-use rasterization::{project, rasterize};
+use rasterization::{DepthSlice, project, rasterize};
 
 /// Immediate shading in scene order, independent of fragment collection.
 pub fn render_reference(
@@ -47,10 +47,13 @@ pub fn render_reference(
         output.screen_triangles += screen.triangles.len();
         output.covered_fragments += rasterize(
             &screen,
+            &screen.triangles,
             material.double_sided,
-            width,
-            0,
-            &mut output.framebuffer.depth.values,
+            DepthSlice {
+                width,
+                y_start: 0,
+                values: &mut output.framebuffer.depth.values,
+            },
             None,
             |index, attributes, front_facing| {
                 output.framebuffer.color[index] =

@@ -13,12 +13,17 @@ use crate::{
     texture::UvSample,
 };
 
+pub(super) struct DepthSlice<'a> {
+    pub width: u32,
+    pub y_start: u32,
+    pub values: &'a mut [f32],
+}
+
 pub(super) fn rasterize(
     primitive: &ScreenPrimitive,
+    triangles: &[[u32; 3]],
     double_sided: bool,
-    width: u32,
-    y_start: u32,
-    depth_buffer: &mut [f32],
+    depth: DepthSlice<'_>,
     shadow: Option<ShadowProjection>,
     mut emit: impl FnMut(usize, &FragmentAttributes, bool),
 ) -> u64 {
@@ -26,17 +31,17 @@ pub(super) fn rasterize(
         Some(ShadowProjection::Perspective { far }) => Some(far),
         _ => None,
     };
+    let DepthSlice {
+        width,
+        y_start,
+        values: depth_buffer,
+    } = depth;
     let y_end = y_start + (depth_buffer.len() / width as usize) as u32;
     let first_sample = y_start as usize * width as usize;
     let mut covered_fragments = 0;
-    for triangle in &primitive.triangles {
+    for triangle in triangles {
         let vertices = triangle.map(|index| primitive.vertices[index as usize]);
         let [a, b, c] = vertices.map(|v| v.position);
-        if a.y.max(b.y).max(c.y) < y_start as f32 + 0.5
-            || a.y.min(b.y).min(c.y) > y_end as f32 - 0.5
-        {
-            continue;
-        }
         let ab = b - a;
         let ac = c - a;
         let area = ab.truncate().perp_dot(ac.truncate());
@@ -112,18 +117,22 @@ impl RasterizationStage for CpuRasterization {
         depth: &mut DepthBuffer,
         shadow: Option<ShadowProjection>,
     ) -> io::Result<RasterizedScene> {
-        let screens = primitives
-            .par_iter()
-            .map(|primitive| project(primitive, depth.width, depth.height))
-            .collect::<io::Result<Vec<_>>>()?;
-        let mut output = RasterizedScene {
-            screen_vertices: screens.iter().map(|screen| screen.vertices.len()).sum(),
-            screen_triangles: screens.iter().map(|screen| screen.triangles.len()).sum(),
-            ..RasterizedScene::default()
-        };
         let width = depth.width;
         let band_height = (depth.height as usize).div_ceil(rayon::current_num_threads());
         let band_samples = band_height * width as usize;
+        let screens = primitives
+            .par_iter()
+            .map(|primitive| {
+                let screen = project(primitive, width, depth.height)?;
+                let bins = screen.bins(depth.height, band_height);
+                Ok((screen, bins))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut output = RasterizedScene::default();
+        for (screen, _) in &screens {
+            output.screen_vertices += screen.vertices.len();
+            output.screen_triangles += screen.triangles.len();
+        }
         let default_material = Material::default();
         let bands = depth
             .values
@@ -138,16 +147,19 @@ impl RasterizationStage for CpuRasterization {
                         .map_err(io::Error::other)?;
                     slot_for_sample.resize(values.len(), usize::MAX);
                 }
-                for (primitive, screen) in primitives.iter().zip(&screens) {
+                for (primitive, (screen, bins)) in primitives.iter().zip(&screens) {
                     let material_index = primitive.source.material_index;
                     let material =
                         material_index.map_or(&default_material, |index| &materials[index]);
                     output.covered_fragments += rasterize(
                         screen,
+                        &bins[band],
                         material.double_sided,
-                        width,
-                        (band * band_height) as u32,
-                        values,
+                        DepthSlice {
+                            width,
+                            y_start: (band * band_height) as u32,
+                            values,
+                        },
                         shadow,
                         |sample_index, attributes, front_facing| {
                             let fragment = Fragment {
@@ -237,34 +249,67 @@ pub(super) fn project(
         vertices: Vec::new(),
         triangles: Vec::new(),
     };
+    let codes: Vec<_> = primitive
+        .vertices
+        .iter()
+        .map(|v| outcode(v.position))
+        .collect();
+    let mut projected = vec![u32::MAX; primitive.vertices.len()];
+    let mut project = |(vertex, source): (ClipVertex, Option<u32>)| -> io::Result<u32> {
+        if let Some(source) = source {
+            let index = projected[source as usize];
+            if index != u32::MAX {
+                return Ok(index);
+            }
+        }
+        let index = u32::try_from(output.vertices.len() + 1)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Too many clipped vertices"))?
+            - 1;
+        output
+            .vertices
+            .push(project_vertex(vertex, width as f32, height as f32)?);
+        if let Some(source) = source {
+            projected[source as usize] = index;
+        }
+        Ok(index)
+    };
     let mut polygon = Vec::with_capacity(9);
     let mut scratch = Vec::with_capacity(9);
 
     for triangle in &primitive.triangles {
-        let vertices = triangle.map(|index| primitive.vertices[index as usize]);
-        let codes = vertices.map(|vertex| outcode(vertex.position));
-        if codes[0] & codes[1] & codes[2] != 0 {
+        let [a, b, c] = triangle.map(|index| codes[index as usize]);
+        if a & b & c != 0 {
+            continue;
+        }
+        if a | b | c == 0
+            && triangle
+                .iter()
+                .all(|&index| primitive.vertices[index as usize].position.w > 0.0)
+        {
+            let [a, b, c] =
+                triangle.map(|index| project((primitive.vertices[index as usize], Some(index))));
+            output.triangles.push([a?, b?, c?]);
             continue;
         }
         polygon.clear();
-        polygon.extend(vertices);
-        if codes[0] | codes[1] | codes[2] != 0 {
+        polygon.extend(triangle.map(|index| (primitive.vertices[index as usize], Some(index))));
+        if a | b | c != 0 {
             for (axis, sign) in PLANES {
                 if polygon.len() < 3 {
                     break;
                 }
                 scratch.clear();
-                let mut previous = *polygon.last().unwrap();
+                let mut previous = polygon.last().unwrap().0;
                 let mut previous_distance = distance(previous.position, axis, sign);
-                for &current in &polygon {
+                for &(current, source) in &polygon {
                     let current_distance = distance(current.position, axis, sign);
                     if previous_distance < 0.0 && current_distance > 0.0 {
-                        scratch.push(intersection(previous, current, axis, sign));
+                        scratch.push((intersection(previous, current, axis, sign), None));
                     } else if current_distance < 0.0 && previous_distance > 0.0 {
-                        scratch.push(intersection(current, previous, axis, sign));
+                        scratch.push((intersection(current, previous, axis, sign), None));
                     }
                     if current_distance >= 0.0 {
-                        scratch.push(current);
+                        scratch.push((current, source));
                     }
                     previous = current;
                     previous_distance = current_distance;
@@ -274,21 +319,16 @@ pub(super) fn project(
         }
 
         // The homogeneous origin cannot undergo perspective division.
-        polygon.retain(|vertex| vertex.position.w > 0.0);
+        polygon.retain(|(vertex, _)| vertex.position.w > 0.0);
         if polygon.len() < 3 {
             continue;
         }
-        let end = u32::try_from(output.vertices.len() + polygon.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Too many clipped vertices"))?;
-        let base = end - polygon.len() as u32;
-        for &vertex in &polygon {
-            let vertex = project_vertex(vertex, width as f32, height as f32)?;
-            output.vertices.push(vertex);
-        }
-        for index in 1..polygon.len() as u32 - 1 {
-            output
-                .triangles
-                .push([base, base + index, base + index + 1]);
+        let first = project(polygon[0])?;
+        let mut previous = project(polygon[1])?;
+        for &vertex in &polygon[2..] {
+            let current = project(vertex)?;
+            output.triangles.push([first, previous, current]);
+            previous = current;
         }
     }
     Ok(output)
@@ -313,6 +353,28 @@ pub(super) struct ScreenPrimitive {
     pub mirrored: bool,
     pub vertices: Vec<ScreenVertex>,
     pub triangles: Vec<[u32; 3]>,
+}
+
+impl ScreenPrimitive {
+    fn bins(&self, height: u32, band_height: usize) -> Vec<Vec<[u32; 3]>> {
+        let mut bins = vec![Vec::new(); (height as usize).div_ceil(band_height)];
+        for &triangle in &self.triangles {
+            let y = triangle.map(|index| self.vertices[index as usize].position.y);
+            let rows = sample_range(
+                y[0].min(y[1]).min(y[2]),
+                y[0].max(y[1]).max(y[2]),
+                0..height,
+            );
+            if !rows.is_empty() {
+                for bin in &mut bins
+                    [rows.start as usize / band_height..=(rows.end as usize - 1) / band_height]
+                {
+                    bin.push(triangle);
+                }
+            }
+        }
+        bins
+    }
 }
 
 struct UvGradients {
@@ -457,6 +519,12 @@ impl Edge {
     }
 }
 
+fn sample_range(min: f32, max: f32, bounds: Range<u32>) -> Range<u32> {
+    let lo = bounds.start as f32;
+    let hi = bounds.end as f32;
+    (min - 0.5).ceil().clamp(lo, hi) as u32..((max - 0.5).floor() + 1.0).clamp(lo, hi) as u32
+}
+
 fn rasterize_triangle(
     mut vertices: [Vec2; 3],
     width: u32,
@@ -483,15 +551,11 @@ fn rasterize_triangle(
 
     let min = vertices[0].min(vertices[1]).min(vertices[2]);
     let max = vertices[0].max(vertices[1]).max(vertices[2]);
-    let x0 = (min.x - 0.5).ceil().clamp(0.0, width as f32) as u32;
-    let y0 = (min.y - 0.5)
-        .ceil()
-        .clamp(rows.start as f32, rows.end as f32) as u32;
-    let x1 = ((max.x - 0.5).floor() + 1.0).clamp(0.0, width as f32) as u32;
-    let y1 = ((max.y - 0.5).floor() + 1.0).clamp(rows.start as f32, rows.end as f32) as u32;
+    let xs = sample_range(min.x, max.x, 0..width);
+    let ys = sample_range(min.y, max.y, rows);
 
-    for y in y0..y1 {
-        for x in x0..x1 {
+    for y in ys {
+        for x in xs.clone() {
             let point = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
             let values = edges.map(|edge| edge.evaluate(point));
             if edges

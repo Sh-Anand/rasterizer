@@ -26,7 +26,9 @@ Measure stage wall time around each backend call, including transfers and synchr
 
 Sum measured loading, geometry, materials, and shadow preparation as the one-time cost for a static scene. Sum vertex shading, rasterization, fragment shading, render setup/writeback, and postprocessing as the per-render cost when the camera changes. Report PNG encoding and writing separately, outside both totals. These are grouped measurements of the current render, not a steady-state frame-loop benchmark.
 
-All CPU stages share a Rayon worker pool using all available logical CPUs. Vertex and fragment shading preserve output order. Rasterization projects primitives in parallel, then processes disjoint row bands in parallel, preserving triangle order within each band and concatenating surviving fragments. Bands share projected geometry and own their depth and fragment storage; no pixel locks are needed. The shadow-map loop remains sequential, with parallel vertex shading and rasterization inside each pass.
+All CPU stages share a Rayon worker pool using all available logical CPUs. Vertex and fragment shading preserve output order. Rasterization projects primitives in parallel, bins triangles by their covered sample rows, then processes disjoint bands in parallel. Each band retains triangle order and owns its depth and fragment storage; no pixel locks are needed. The shadow-map loop remains sequential, with parallel vertex shading and rasterization inside each pass.
+
+Project each surviving source vertex once and share its index across triangles. Clipping appends intersection vertices while retaining source indices for unchanged vertices. The reported post-clipping vertex count measures stored projected vertices, not triangle corners.
 
 ## Clipping
 
