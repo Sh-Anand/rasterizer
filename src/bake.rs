@@ -93,8 +93,8 @@ fn surface_samples(
             .map_or(&default_material, |i| &materials[i]);
         for triangle in &primitive.triangles {
             let v = triangle.indices.map(|i| primitive.vertices[i as usize]);
-            let [a, b, c] = v.map(|v| v.world_position.as_dvec3());
-            let mut geometric_normal = (b - a).cross(c - a).normalize_or_zero().as_vec3();
+            let [a, b, c] = v.map(|v| v.world_position);
+            let mut geometric_normal = (b - a).cross(c - a).normalize_or_zero();
             if primitive.mirrored {
                 geometric_normal = -geometric_normal;
             }
@@ -235,14 +235,12 @@ fn unwrap(scene: &ClipScene, resolution: u32) -> io::Result<(Vec<MeshLayout>, u3
             ..MeshDecl::default()
         })
         .collect();
-    let area: f64 = scene
+    let area: f32 = scene
         .primitives
         .iter()
         .flat_map(|p| {
             p.triangles.iter().map(|t| {
-                let [a, b, c] = t
-                    .indices
-                    .map(|i| p.vertices[i as usize].world_position.as_dvec3());
+                let [a, b, c] = t.indices.map(|i| p.vertices[i as usize].world_position);
                 (b - a).cross(c - a).length() * 0.5
             })
         })
@@ -260,7 +258,7 @@ fn unwrap(scene: &ClipScene, resolution: u32) -> io::Result<(Vec<MeshLayout>, u3
         &ChartOptions::default(),
         &PackOptions {
             resolution: 0,
-            texels_per_unit: (f64::from(resolution) / area.sqrt()) as f32,
+            texels_per_unit: resolution as f32 / area.sqrt(),
             padding: PADDING,
             create_image: true,
             ..PackOptions::default()

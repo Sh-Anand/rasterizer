@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io, sync::Arc};
 
-use glam::{DVec2, Vec2, Vec3, Vec4};
+use glam::{Vec2, Vec3, Vec4};
 use gltf::{
     image::{Data, Format},
     texture::WrappingMode,
@@ -151,22 +151,22 @@ impl MipLevel {
         let height = (self.height / 2).max(1);
         let mut pixels = Vec::with_capacity(width as usize * height as usize);
         for y in 0..height {
-            let y0 = f64::from(y) * f64::from(self.height) / f64::from(height);
-            let y1 = f64::from(y + 1) * f64::from(self.height) / f64::from(height);
+            let y0 = y as f32 * self.height as f32 / height as f32;
+            let y1 = (y + 1) as f32 * self.height as f32 / height as f32;
             for x in 0..width {
-                let x0 = f64::from(x) * f64::from(self.width) / f64::from(width);
-                let x1 = f64::from(x + 1) * f64::from(self.width) / f64::from(width);
+                let x0 = x as f32 * self.width as f32 / width as f32;
+                let x1 = (x + 1) as f32 * self.width as f32 / width as f32;
                 let mut sum = Vec4::ZERO;
                 // Area weights include all texels, including odd-sized image edges.
                 for sy in y0.floor() as u32..(y1.ceil() as u32).min(self.height) {
-                    let wy = y1.min(f64::from(sy + 1)) - y0.max(f64::from(sy));
+                    let wy = y1.min((sy + 1) as f32) - y0.max(sy as f32);
                     for sx in x0.floor() as u32..(x1.ceil() as u32).min(self.width) {
-                        let wx = x1.min(f64::from(sx + 1)) - x0.max(f64::from(sx));
+                        let wx = x1.min((sx + 1) as f32) - x0.max(sx as f32);
                         sum += self.pixels[sy as usize * self.width as usize + sx as usize]
-                            * (wx * wy) as f32;
+                            * (wx * wy);
                     }
                 }
-                pixels.push(sum / ((x1 - x0) * (y1 - y0)) as f32);
+                pixels.push(sum / ((x1 - x0) * (y1 - y0)));
             }
         }
         Self {
@@ -180,14 +180,11 @@ impl MipLevel {
 impl Texture {
     pub fn sample(&self, sample: UvSample) -> Vec4 {
         let lod = if self.sampling == Sampling::Trilinear {
-            let size = DVec2::new(
-                f64::from(self.levels[0].width),
-                f64::from(self.levels[0].height),
-            );
-            let rho_squared = (sample.dx.as_dvec2() * size)
+            let size = Vec2::new(self.levels[0].width as f32, self.levels[0].height as f32);
+            let rho_squared = (sample.dx * size)
                 .length_squared()
-                .max((sample.dy.as_dvec2() * size).length_squared());
-            (0.5 * rho_squared.log2()).max(0.0) as f32
+                .max((sample.dy * size).length_squared());
+            (0.5 * rho_squared.log2()).max(0.0)
         } else {
             0.0
         };
@@ -210,8 +207,8 @@ impl Texture {
 
     fn sample_level(&self, uv: Vec2, level: usize) -> Vec4 {
         let level = &self.levels[level];
-        let x = wrap_uv(f64::from(uv.x), self.wrap_s) * f64::from(level.width);
-        let y = wrap_uv(f64::from(uv.y), self.wrap_t) * f64::from(level.height);
+        let x = wrap_uv(uv.x, self.wrap_s) * level.width as f32;
+        let y = wrap_uv(uv.y, self.wrap_t) * level.height as f32;
         let texel = |x, y| {
             let x = wrap_index(x, level.width, self.wrap_s);
             let y = wrap_index(y, level.height, self.wrap_t);
@@ -224,15 +221,15 @@ impl Texture {
         let y = y - 0.5;
         let x0 = x.floor() as i64;
         let y0 = y.floor() as i64;
-        let tx = (x - x.floor()) as f32;
-        let ty = (y - y.floor()) as f32;
+        let tx = x - x.floor();
+        let ty = y - y.floor();
         let top = texel(x0, y0).lerp(texel(x0 + 1, y0), tx);
         let bottom = texel(x0, y0 + 1).lerp(texel(x0 + 1, y0 + 1), tx);
         top.lerp(bottom, ty)
     }
 }
 
-fn wrap_uv(value: f64, mode: WrappingMode) -> f64 {
+fn wrap_uv(value: f32, mode: WrappingMode) -> f32 {
     match mode {
         WrappingMode::ClampToEdge => value.clamp(0.0, 1.0),
         WrappingMode::Repeat => value.rem_euclid(1.0),

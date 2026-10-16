@@ -1,6 +1,6 @@
 use std::io;
 
-use glam::{DVec2, DVec3, DVec4, Vec2, Vec3, Vec4};
+use glam::{Vec2, Vec3, Vec4};
 
 use crate::{
     framebuffer::DepthBuffer,
@@ -26,7 +26,7 @@ pub(crate) fn rasterize(
     let mut covered_fragments = 0;
     for triangle in &primitive.triangles {
         let vertices = triangle.map(|index| primitive.vertices[index as usize]);
-        let [a, b, c] = vertices.map(|v| v.position.as_dvec3());
+        let [a, b, c] = vertices.map(|v| v.position);
         let ab = b - a;
         let ac = c - a;
         let area = ab.truncate().perp_dot(ac.truncate());
@@ -44,12 +44,12 @@ pub(crate) fn rasterize(
         });
         // Projected depth and 1/w are screen-linear.
         let depth_bias = if shadow.is_some() {
-            let db = f64::from(depths[1]) - f64::from(depths[0]);
-            let dc = f64::from(depths[2]) - f64::from(depths[0]);
+            let db = depths[1] - depths[0];
+            let dc = depths[2] - depths[0];
             let dx = (db * ac.y - dc * ab.y) / area;
             let dy = (ab.x * dc - ac.x * db) / area;
             // A bilinear PCF tap can be up to one texel from the receiver.
-            let bias = (dx.abs() + dy.abs()) as f32;
+            let bias = dx.abs() + dy.abs();
             if linear_far.is_some() { -bias } else { bias }
         } else {
             0.0
@@ -141,7 +141,7 @@ impl RasterizationStage for CpuRasterization {
 }
 
 // Left, right, bottom, top, near, far: w + sign * coordinate >= 0.
-const PLANES: [(usize, f64); 6] = [
+const PLANES: [(usize, f32); 6] = [
     (0, 1.0),
     (0, -1.0),
     (1, 1.0),
@@ -150,8 +150,8 @@ const PLANES: [(usize, f64); 6] = [
     (2, -1.0),
 ];
 
-fn distance(vertex: Vec4, axis: usize, sign: f64) -> f64 {
-    f64::from(vertex.w) + sign * f64::from(vertex[axis])
+fn distance(vertex: Vec4, axis: usize, sign: f32) -> f32 {
+    vertex.w + sign * vertex[axis]
 }
 
 fn outcode(vertex: Vec4) -> u8 {
@@ -164,22 +164,16 @@ fn outcode(vertex: Vec4) -> u8 {
     code
 }
 
-fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f64) -> ClipVertex {
+fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f32) -> ClipVertex {
     let a = distance(outside.position, axis, sign);
     let b = distance(inside.position, axis, sign);
     let t = a / (a - b);
-    let mut position =
-        (outside.position.as_dvec4() * (1.0 - t) + inside.position.as_dvec4() * t).as_vec4();
-    position[axis] = -sign as f32 * position.w;
-    let world_position = (outside.world_position.as_dvec3() * (1.0 - t)
-        + inside.world_position.as_dvec3() * t)
-        .as_vec3();
-    let uv = |get: fn(ClipVertex) -> Vec2| {
-        (get(outside).as_dvec2() * (1.0 - t) + get(inside).as_dvec2() * t).as_vec2()
-    };
-    let tangent =
-        (outside.tangent.as_dvec4() * (1.0 - t) + inside.tangent.as_dvec4() * t).as_vec4();
-    let normal = (outside.normal.as_dvec3() * (1.0 - t) + inside.normal.as_dvec3() * t).as_vec3();
+    let mut position = outside.position * (1.0 - t) + inside.position * t;
+    position[axis] = -sign * position.w;
+    let world_position = outside.world_position * (1.0 - t) + inside.world_position * t;
+    let uv = |get: fn(ClipVertex) -> Vec2| get(outside) * (1.0 - t) + get(inside) * t;
+    let tangent = outside.tangent * (1.0 - t) + inside.tangent * t;
+    let normal = outside.normal * (1.0 - t) + inside.normal * t;
     ClipVertex {
         position,
         world_position,
@@ -287,20 +281,19 @@ pub(crate) struct ScreenPrimitive {
 }
 
 struct UvGradients {
-    inv_w: DVec2,
-    sets: [[DVec2; 2]; 5],
+    inv_w: Vec2,
+    sets: [[Vec2; 2]; 5],
 }
 
 impl UvGradients {
     fn new(vertices: [ScreenVertex; 3]) -> Self {
-        let [a, b, c] = vertices.map(|v| v.position.truncate().as_dvec2());
+        let [a, b, c] = vertices.map(|v| v.position.truncate());
         let ab = b - a;
         let ac = c - a;
         let area = ab.perp_dot(ac);
-        let b = DVec2::new(ac.y, -ac.x) / area;
-        let c = DVec2::new(-ab.y, ab.x) / area;
-        let weights: [DVec2; 3] =
-            std::array::from_fn(|i| [-b - c, b, c][i] * f64::from(vertices[i].inv_w));
+        let b = Vec2::new(ac.y, -ac.x) / area;
+        let c = Vec2::new(-ab.y, ab.x) / area;
+        let weights: [Vec2; 3] = std::array::from_fn(|i| [-b - c, b, c][i] * vertices[i].inv_w);
         let uvs = vertices.map(|v| {
             [
                 v.uv,
@@ -314,20 +307,20 @@ impl UvGradients {
             inv_w: weights.iter().sum(),
             sets: std::array::from_fn(|set| {
                 [
-                    (0..3).map(|i| uvs[i][set].as_dvec2() * weights[i].x).sum(),
-                    (0..3).map(|i| uvs[i][set].as_dvec2() * weights[i].y).sum(),
+                    (0..3).map(|i| uvs[i][set] * weights[i].x).sum(),
+                    (0..3).map(|i| uvs[i][set] * weights[i].y).sum(),
                 ]
             }),
         }
     }
 
-    fn sample(&self, set: usize, uv: DVec2, inv_w: f64) -> UvSample {
+    fn sample(&self, set: usize, uv: Vec2, inv_w: f32) -> UvSample {
         let [dx, dy] = self.sets[set];
         UvSample {
-            uv: uv.as_vec2(),
+            uv,
             // Quotient rule for (UV/w) / (1/w).
-            dx: ((dx - uv * self.inv_w.x) / inv_w).as_vec2(),
-            dy: ((dy - uv * self.inv_w.y) / inv_w).as_vec2(),
+            dx: (dx - uv * self.inv_w.x) / inv_w,
+            dy: (dy - uv * self.inv_w.y) / inv_w,
         }
     }
 }
@@ -373,42 +366,41 @@ fn interpolate_attributes(
     barycentric: [f32; 3],
     gradients: &UvGradients,
 ) -> FragmentAttributes {
-    let weights: [f64; 3] =
-        std::array::from_fn(|i| f64::from(barycentric[i]) * f64::from(vertices[i].inv_w));
-    let world_position: DVec3 = vertices
+    let weights: [f32; 3] = std::array::from_fn(|i| barycentric[i] * vertices[i].inv_w);
+    let world_position: Vec3 = vertices
         .iter()
         .zip(weights)
-        .map(|(vertex, weight)| vertex.world_position.as_dvec3() * weight)
+        .map(|(vertex, weight)| vertex.world_position * weight)
         .sum();
-    let sum = weights.iter().sum::<f64>();
+    let sum = weights.iter().sum::<f32>();
     let uv = |get: fn(&ScreenVertex) -> Vec2| {
         vertices
             .iter()
             .zip(weights)
-            .map(|(vertex, weight)| get(vertex).as_dvec2() * weight)
-            .sum::<DVec2>()
+            .map(|(vertex, weight)| get(vertex) * weight)
+            .sum::<Vec2>()
             / sum
     };
-    let tangent: DVec4 = vertices
+    let tangent: Vec4 = vertices
         .iter()
         .zip(weights)
-        .map(|(vertex, weight)| vertex.tangent.as_dvec4() * weight)
+        .map(|(vertex, weight)| vertex.tangent * weight)
         .sum();
-    let normal: DVec3 = vertices
+    let normal: Vec3 = vertices
         .iter()
         .zip(weights)
-        .map(|(vertex, weight)| vertex.normal.as_dvec3() * weight)
+        .map(|(vertex, weight)| vertex.normal * weight)
         .sum();
     FragmentAttributes {
-        world_position: (world_position / sum).as_vec3(),
+        world_position: world_position / sum,
         uv: gradients.sample(0, uv(|v| v.uv), sum),
         normal_uv: gradients.sample(1, uv(|v| v.normal_uv), sum),
         metallic_roughness_uv: gradients.sample(2, uv(|v| v.metallic_roughness_uv), sum),
         occlusion_uv: gradients.sample(3, uv(|v| v.occlusion_uv), sum),
         emissive_uv: gradients.sample(4, uv(|v| v.emissive_uv), sum),
-        lightmap_uv: uv(|v| v.lightmap_uv).as_vec2(),
-        normal: (normal / sum).normalize_or_zero().as_vec3(),
-        tangent: (tangent / sum).as_vec4(),
+        lightmap_uv: uv(|v| v.lightmap_uv),
+        normal: (normal / sum).normalize_or_zero(),
+        tangent: tangent / sum,
     }
 }
 
@@ -421,30 +413,29 @@ pub(crate) struct CoverageSample {
 
 #[derive(Clone, Copy)]
 struct Edge {
-    a: f64,
-    b: f64,
-    c: f64,
+    start: Vec2,
+    delta: Vec2,
     inclusive: bool,
 }
 
 impl Edge {
-    fn new(start: DVec2, end: DVec2) -> Self {
+    fn new(start: Vec2, end: Vec2) -> Self {
         let delta = end - start;
         Self {
-            a: -delta.y,
-            b: delta.x,
-            c: start.x * end.y - start.y * end.x,
+            start,
+            delta,
             inclusive: delta.y < 0.0 || (delta.y == 0.0 && delta.x > 0.0),
         }
     }
 
-    fn evaluate(self, point: DVec2) -> f64 {
-        self.a * point.x + self.b * point.y + self.c
+    fn evaluate(self, point: Vec2) -> f32 {
+        // Local coordinates avoid cancellation in FP32 edge tests.
+        self.delta.perp_dot(point - self.start)
     }
 }
 
 pub(crate) fn rasterize_triangle(
-    vertices: [Vec2; 3],
+    mut vertices: [Vec2; 3],
     width: u32,
     height: u32,
     mut emit: impl FnMut(CoverageSample),
@@ -452,7 +443,6 @@ pub(crate) fn rasterize_triangle(
     if width == 0 || height == 0 || vertices.iter().any(|v| !v.is_finite()) {
         return;
     }
-    let mut vertices = vertices.map(|v| v.as_dvec2());
     let area = Edge::new(vertices[0], vertices[1]).evaluate(vertices[2]);
     if area == 0.0 {
         return;
@@ -470,14 +460,14 @@ pub(crate) fn rasterize_triangle(
 
     let min = vertices[0].min(vertices[1]).min(vertices[2]);
     let max = vertices[0].max(vertices[1]).max(vertices[2]);
-    let x0 = (min.x - 0.5).ceil().clamp(0.0, f64::from(width)) as u32;
-    let y0 = (min.y - 0.5).ceil().clamp(0.0, f64::from(height)) as u32;
-    let x1 = ((max.x - 0.5).floor() + 1.0).clamp(0.0, f64::from(width)) as u32;
-    let y1 = ((max.y - 0.5).floor() + 1.0).clamp(0.0, f64::from(height)) as u32;
+    let x0 = (min.x - 0.5).ceil().clamp(0.0, width as f32) as u32;
+    let y0 = (min.y - 0.5).ceil().clamp(0.0, height as f32) as u32;
+    let x1 = ((max.x - 0.5).floor() + 1.0).clamp(0.0, width as f32) as u32;
+    let y1 = ((max.y - 0.5).floor() + 1.0).clamp(0.0, height as f32) as u32;
 
     for y in y0..y1 {
         for x in x0..x1 {
-            let point = DVec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
+            let point = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
             let values = edges.map(|edge| edge.evaluate(point));
             if edges
                 .iter()
@@ -486,7 +476,7 @@ pub(crate) fn rasterize_triangle(
             {
                 continue;
             }
-            let mut barycentric = values.map(|value| (value * inv_area) as f32);
+            let mut barycentric = values.map(|value| value * inv_area);
             if reversed {
                 barycentric.swap(1, 2);
             }

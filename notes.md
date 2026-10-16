@@ -22,7 +22,11 @@ Shade fragments independently, without quad-based lane exchange. Use analytic pe
 
 This staged split is for developing and studying shader workloads, not measuring native graphics-pipeline frame times: CPU work and fragment input/output transfers add overhead that a fully GPU-resident implementation would not have. Treat fragment-to-lane packing as an explicit model, not an exact reproduction of a vendor's hardware scheduler.
 
+Measure stage wall time around each backend call, including transfers and synchronization needed to return host-resident results. Count vertex inputs before lightmap UV remapping and fragment inputs after scene-wide visibility resolution; SSAA fragments are render-resolution samples. Report scene triangles before clipping, and keep loading, lighting preparation, framebuffer writeback, and output times separate from shader timings.
+
 ## Clipping
+
+Use FP32 for all rendering calculations, including clipping, coverage, interpolation, texture filtering, lighting, baking, and image export.
 
 We chose explicit clipping with synthetic ("fake") intersection vertices instead of a guard band.
 

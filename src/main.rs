@@ -4,6 +4,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::ExitCode,
+    time::Instant,
 };
 
 use glam::Vec3;
@@ -107,6 +108,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let run_started = Instant::now();
     let mut camera_light = false;
     let mut positional = Vec::new();
     for arg in env::args_os().skip(1) {
@@ -146,10 +148,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load_scene(&config_path, &scene_name(&path).to_string_lossy())
         .map_err(|error| format!("Failed to load '{}': {error}", config_path.display()))?;
     let (render_width, render_height) = config.render_size()?;
+    let started = Instant::now();
     let asset = GltfAsset::load(&path)
         .map_err(|error| format!("Failed to load '{}': {error}", path.display()))?;
+    let loading_time = started.elapsed();
+    let started = Instant::now();
     let prepared = prepare_scene(&asset)
         .map_err(|error| format!("Failed to prepare '{}': {error}", path.display()))?;
+    let preparation_time = started.elapsed();
     let mut pipeline = Pipeline::new(cpu::CpuVertex, cpu::CpuRasterization, cpu::CpuFragment);
     let mut transformed = pipeline
         .transform(&prepared, config.camera_matrix()?)
@@ -160,6 +166,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cache_path = output_dir
         .join(scene_name(&path))
         .with_extension("lightmap");
+    let started = Instant::now();
     let cached = if baking {
         None
     } else {
@@ -173,14 +180,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             })?,
         )
     };
+    let mut lightmap_time = started.elapsed();
+    let started = Instant::now();
     let materials = load_materials(&asset, config.sampling)?;
+    let material_time = started.elapsed();
     eprintln!("Preparing direct-light shadows...");
+    let started = Instant::now();
     let mut lights = prepare_lights(
         collect_lights(&transformed, &materials, &config.light)?,
         &transformed,
         &materials,
         &config.shadow,
     )?;
+    let shadow_time = started.elapsed();
+    let started = Instant::now();
     let lighting = if let Some(lighting) = cached {
         lighting.apply(&mut transformed)?;
         lighting
@@ -193,6 +206,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("Baked {}", cache_path.display());
         lighting
     };
+    lightmap_time += started.elapsed();
     if camera_light {
         let direction = Vec3::from(config.camera.position) - Vec3::from(config.camera.target);
         lights.push(RenderLight {
@@ -200,6 +214,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             shadow: None,
         });
     }
+    let started = Instant::now();
     let rendered = pipeline
         .render_transformed(
             &transformed,
@@ -213,11 +228,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .map_err(|error| format!("Failed to render '{}': {error}", path.display()))?;
+    let render_time = started.elapsed();
     let output_path = output_dir.join(scene_name(&path)).with_extension("png");
+    let started = Instant::now();
     rendered
         .framebuffer
         .save(&output_path, &config.output, config.supersampling)
         .map_err(|error| format!("Failed to save '{}': {error}", output_path.display()))?;
+    let output_time = started.elapsed();
+    let total_time = run_started.elapsed();
 
     let document = &asset.document;
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
@@ -253,30 +272,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Buffers loaded: {}", asset.buffers.len());
     println!("Cameras: {}", document.cameras().len());
     println!("Animations: {}", document.animations().len());
-    let vertices: usize = transformed
-        .primitives
-        .iter()
-        .map(|p| p.vertices.len())
-        .sum();
-    let triangles: usize = transformed
-        .primitives
-        .iter()
-        .map(|p| p.triangles.len())
-        .sum();
+    let triangles: usize = prepared.primitives.iter().map(|p| p.triangles.len()).sum();
+    let stats = pipeline.stats();
+    println!("Triangles loaded (selected scene, before clipping): {triangles}");
+    println!("Vertices shaded: {}", stats.vertices_shaded);
+    println!("Surviving fragments shaded: {}", stats.fragments_shaded);
     println!(
-        "Clip-space scene {}: {} primitives, {vertices} vertices, {triangles} triangles",
-        transformed.scene_index,
-        transformed.primitives.len()
-    );
-    println!("After clipping: {} triangles", rendered.screen_triangles);
-    println!(
-        "Pixel-space: {} vertices, {} triangles",
+        "After clipping: {} vertices, {} triangles",
         rendered.screen_vertices, rendered.screen_triangles
     );
     println!(
         "Covered fragments (before depth testing): {}",
         rendered.covered_fragments
     );
+    println!("Timings (wall clock):");
+    for (name, duration) in [
+        ("glTF loading", loading_time),
+        ("Geometry preparation", preparation_time),
+        ("Vertex shading", stats.vertex_time),
+        ("Material preparation", material_time),
+        ("Shadow preparation", shadow_time),
+        (
+            if baking {
+                "Lightmap baking + cache write"
+            } else {
+                "Lightmap cache load + apply"
+            },
+            lightmap_time,
+        ),
+        ("Rasterization", stats.rasterization_time),
+        ("Fragment shading", stats.fragment_time),
+        (
+            "Render setup + color writeback",
+            render_time - stats.rasterization_time - stats.fragment_time,
+        ),
+        ("Postprocessing + PNG write", output_time),
+        ("Total", total_time),
+    ] {
+        println!("  {name}: {:.3} ms", duration.as_secs_f32() * 1000.0);
+    }
     println!("Wrote {}", output_path.display());
     println!(
         "Lighting: {}x{} baked one-bounce indirect; runtime direct diffuse + specular",

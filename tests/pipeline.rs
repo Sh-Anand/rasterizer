@@ -232,7 +232,13 @@ fn nearer_fragments_replace_all_attributes_and_facing_within_and_across_primitiv
         );
         for fragment in rasterized.fragments {
             assert!(!fragment.front_facing);
-            assert_eq!(fragment.attributes.uv.uv, Vec2::new(0.25, 0.75));
+            assert!(
+                fragment
+                    .attributes
+                    .uv
+                    .uv
+                    .abs_diff_eq(Vec2::new(0.25, 0.75), 1e-6)
+            );
             assert_eq!(fragment.attributes.normal_uv.uv, Vec2::ONE);
             assert_eq!(fragment.attributes.normal, Vec3::X);
             assert_eq!(fragment.attributes.tangent, Vec4::new(0.0, 1.0, 0.0, -1.0));

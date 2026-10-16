@@ -1,4 +1,7 @@
-use std::io;
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
@@ -67,10 +70,20 @@ pub trait FragmentStage {
     ) -> io::Result<Vec<Vec3>>;
 }
 
+#[derive(Default)]
+pub struct PipelineStats {
+    pub vertex_time: Duration,
+    pub rasterization_time: Duration,
+    pub fragment_time: Duration,
+    pub vertices_shaded: usize,
+    pub fragments_shaded: usize,
+}
+
 pub struct Pipeline<V, R, F> {
     vertex: V,
     rasterization: R,
     fragment: F,
+    stats: PipelineStats,
 }
 
 impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> {
@@ -79,7 +92,13 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
             vertex,
             rasterization,
             fragment,
+            stats: PipelineStats::default(),
         }
+    }
+
+    /// Latest stage measurements; transforming a new scene resets all statistics.
+    pub fn stats(&self) -> &PipelineStats {
+        &self.stats
     }
 
     /// Transform geometry for shadow and lightmap preparation before rendering.
@@ -88,7 +107,12 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         scene: &PreparedScene,
         view_projection: Mat4,
     ) -> io::Result<ClipScene> {
-        self.vertex.transform(scene, view_projection)
+        self.stats = PipelineStats::default();
+        let started = Instant::now();
+        let transformed = self.vertex.transform(scene, view_projection)?;
+        self.stats.vertex_time = started.elapsed();
+        self.stats.vertices_shaded = scene.primitives.iter().map(|p| p.vertices.len()).sum();
+        Ok(transformed)
     }
 
     pub fn render(
@@ -113,6 +137,9 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         height: u32,
         lighting: Lighting<'_>,
     ) -> io::Result<RenderOutput> {
+        self.stats.rasterization_time = Duration::ZERO;
+        self.stats.fragment_time = Duration::ZERO;
+        self.stats.fragments_shaded = 0;
         if !lighting.camera_position.is_finite() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -134,19 +161,24 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         // Preserve equal-depth winners: default material first, then stable material order.
         primitives.sort_by_key(|primitive| primitive.source.material_index);
         let mut framebuffer = Framebuffer::new(width, height)?;
+        let started = Instant::now();
         let rasterized =
             self.rasterization
                 .rasterize(&primitives, materials, &mut framebuffer.depth)?;
+        self.stats.rasterization_time = started.elapsed();
         if !rasterized.fragments.is_empty() {
+            let started = Instant::now();
             let colors = self
                 .fragment
                 .shade(&rasterized.fragments, materials, &lighting)?;
+            self.stats.fragment_time = started.elapsed();
             if colors.len() != rasterized.fragments.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Fragment stage returned the wrong number of colors",
                 ));
             }
+            self.stats.fragments_shaded = rasterized.fragments.len();
             for (fragment, color) in rasterized.fragments.iter().zip(colors) {
                 let sample = framebuffer
                     .color

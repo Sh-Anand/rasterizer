@@ -1,6 +1,6 @@
 use std::{io, path::Path};
 
-use glam::{DVec3, Vec3};
+use glam::Vec3;
 
 use crate::{config::OutputConfig, texture::encode_srgb};
 
@@ -47,24 +47,24 @@ impl Framebuffer {
         }
         let width = self.depth.width / supersampling;
         let height = self.depth.height / supersampling;
-        let samples = f64::from(supersampling) * f64::from(supersampling);
+        let samples = supersampling as f32 * supersampling as f32;
         let mut pixels = Vec::with_capacity(width as usize * height as usize);
         for y in 0..height {
             for x in 0..width {
-                let mut color = DVec3::ZERO;
+                let mut color = Vec3::ZERO;
                 for sy in y * supersampling..(y + 1) * supersampling {
                     let start =
                         sy as usize * self.depth.width as usize + (x * supersampling) as usize;
                     color += self.color[start..start + supersampling as usize]
                         .iter()
-                        .map(|color| color.as_dvec3())
-                        .sum::<DVec3>();
+                        .copied()
+                        .sum::<Vec3>();
                 }
-                color = (color / samples).max(DVec3::ZERO) * f64::from(output.exposure);
+                color = (color / samples).max(Vec3::ZERO) * output.exposure;
                 if output.tone_mapping {
-                    color /= DVec3::ONE + color;
+                    color /= Vec3::ONE + color;
                 }
-                pixels.push(encode_srgb(color.as_vec3()));
+                pixels.push(encode_srgb(color));
             }
         }
         image::save_buffer(

@@ -48,9 +48,9 @@ impl LightShadow {
         })?;
         let up = normal.cross(right);
         let basis = Mat3::from_cols(right, up, normal);
-        let mut radius = 0.0_f64;
+        let mut radius = 0.0_f32;
         for vertex in scene.primitives.iter().flat_map(|p| &p.vertices) {
-            let distance = (vertex.world_position.as_dvec3() - position.as_dvec3()).length();
+            let distance = (vertex.world_position - position).length();
             if !distance.is_finite() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -59,7 +59,7 @@ impl LightShadow {
             }
             radius = radius.max(distance);
         }
-        let far = (radius * 1.01).max(1e-3) as f32;
+        let far = (radius * 1.01).max(1e-3);
         let near = far * 1e-4;
         let projection = rh::proj::opengl::perspective(std::f32::consts::FRAC_PI_2, 1.0, near, far);
         let count = if light.double_sided() { 6 } else { 5 };

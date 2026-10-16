@@ -150,8 +150,8 @@ impl BakedLighting {
 
 pub fn cache_key(asset: &GltfAsset, config: &Config) -> io::Result<[u8; 32]> {
     let mut hash = blake3::Hasher::new();
-    // v8 treats all surfaces as opaque, including shadow and bake visibility.
-    hash.update(b"rasterizer-lightmap-v8");
+    // v9 uses FP32 throughout rendering and baking.
+    hash.update(b"rasterizer-lightmap-v9");
     hash.update(
         &gltf::json::serialize::to_vec(asset.document.as_json()).map_err(io::Error::other)?,
     );

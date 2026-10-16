@@ -122,10 +122,10 @@ impl AreaLight {
     }
 
     pub fn new(vertices: [Vec3; 3], radiance: Vec3, double_sided: bool) -> io::Result<Self> {
-        let [a, b, c] = vertices.map(|v| v.as_dvec3());
+        let [a, b, c] = vertices;
         let cross = (b - a).cross(c - a);
-        let position = ((a + b + c) / 3.0).as_vec3();
-        let area = (cross.length() * 0.5) as f32;
+        let position = (a + b + c) / 3.0;
+        let area = cross.length() * 0.5;
         if !position.is_finite()
             || !area.is_finite()
             || !radiance.is_finite()
@@ -138,7 +138,7 @@ impl AreaLight {
         }
         Ok(Self {
             position,
-            normal: cross.normalize_or_zero().as_vec3(),
+            normal: cross.normalize_or_zero(),
             area,
             radiance,
             double_sided,
