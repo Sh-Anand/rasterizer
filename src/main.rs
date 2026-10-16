@@ -15,11 +15,11 @@ use rasterizer::{
     geometry::{GltfAsset, prepare_scene},
     lighting::{DirectionalLight, Light, Lighting, RenderLight, collect_lights},
     material::load_materials,
-    pipeline::Pipeline,
+    pipeline::{FragmentStage, Pipeline},
     shadow::prepare_lights,
 };
 
-const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\nRender: cargo run --release -- living-room";
+const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light] [--cuda]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\n--cuda: use CUDA for fragment shading (requires the cuda feature).\nRender: cargo run --release -- living-room";
 
 fn scene_paths() -> io::Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -107,10 +107,13 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut camera_light = false;
+    let mut use_cuda = false;
     let mut positional = Vec::new();
     for arg in env::args_os().skip(1) {
         if arg == "--camera-light" {
             camera_light = true;
+        } else if arg == "--cuda" {
+            use_cuda = true;
         } else if arg == "--help" || arg == "-h" {
             println!("{USAGE}");
             return Ok(());
@@ -122,7 +125,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut args = positional.into_iter();
     let Some(path) = args.next() else {
-        if camera_light {
+        if camera_light || use_cuda {
             return Err(format!("Expected a scene.\n\n{USAGE}").into());
         }
         list_scenes().map_err(|error| format!("Failed to list scenes: {error}"))?;
@@ -131,6 +134,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.next().is_some() {
         return Err(format!("Expected one scene name or asset path.\n\n{USAGE}").into());
+    }
+    #[cfg(not(feature = "cuda"))]
+    if use_cuda {
+        return Err("CUDA support requires building with cargo oxide and --features cuda".into());
     }
     let path = resolve_scene(Path::new(&path))?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -150,7 +157,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let prepared = prepare_scene(&asset)
         .map_err(|error| format!("Failed to prepare '{}': {error}", path.display()))?;
     let preparation_time = started.elapsed();
-    let mut pipeline = Pipeline::new(cpu::CpuVertex, cpu::CpuRasterization, cpu::CpuFragment);
+    let started = Instant::now();
+    let mut cpu_fragment = cpu::CpuFragment;
+    #[cfg(feature = "cuda")]
+    let mut cuda_fragment = use_cuda
+        .then(|| rasterizer::cuda::CudaFragment::new(0))
+        .transpose()?;
+    let fragment: &mut dyn FragmentStage = &mut cpu_fragment;
+    #[cfg(feature = "cuda")]
+    let fragment: &mut dyn FragmentStage = match &mut cuda_fragment {
+        Some(cuda) => cuda,
+        None => fragment,
+    };
+    let mut pipeline = Pipeline::new(cpu::CpuVertex, cpu::CpuRasterization, fragment);
+    let fragment_setup_time = started.elapsed();
     let started = Instant::now();
     let camera_matrix = config.camera_matrix()?;
     let mut frame_setup_time = started.elapsed();
@@ -220,6 +240,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
     println!("Loaded {}", path.display());
     println!("CPU workers: {threads}");
+    println!(
+        "Fragment backend: {}",
+        if use_cuda { "CUDA" } else { "CPU" }
+    );
     println!("Resolution: {}x{}", config.width, config.height);
     println!(
         "Supersampling: {}x per axis ({} samples/pixel); render resolution: {render_width}x{render_height}",
@@ -269,6 +293,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         (
             "one-time cost",
             [
+                ("Fragment backend setup", fragment_setup_time),
                 ("glTF loading", loading_time),
                 ("Geometry preparation", preparation_time),
                 ("Material preparation", material_time),
@@ -301,6 +326,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "    Total {category}: {:.3} ms",
             total.as_secs_f32() * 1000.0
         );
+    }
+    #[cfg(feature = "cuda")]
+    if let Some(cuda) = &cuda_fragment {
+        let timings = cuda.timings();
+        println!("  CUDA fragment breakdown:");
+        for (name, duration) in [
+            ("Resource packing", timings.packing),
+            ("Allocation + upload", timings.upload),
+            (
+                "Dispatch (CUDA events, includes cold launch)",
+                timings.dispatch,
+            ),
+            ("Readback", timings.readback),
+        ] {
+            println!("    {name}: {:.3} ms", duration.as_secs_f32() * 1000.0);
+        }
     }
     println!(
         "  PNG encoding + write (excluded from totals): {:.3} ms",

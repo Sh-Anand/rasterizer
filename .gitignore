@@ -1,2 +1,5 @@
 /target/
 /output/
+/.oxide-artifacts/
+/rasterizer*.ll
+/rasterizer.ptx

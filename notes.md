@@ -14,6 +14,8 @@ Process vertices once for the scene, then resolve visibility across all material
 
 Invoke the fragment stage once for the surviving fragments, skipping empty output. Each fragment carries its material index; shading receives the full material table, with a missing index selecting the default glTF material. The GPU backend uses one dispatch with access to all referenced material and texture data.
 
+Share shading and sampling algorithms between CPU and CUDA, with owned host storage and borrowed device slices. Keep resource loading and generation on the host. See [README.md](README.md#cuda-fragment-shading) for CUDA setup, resource invalidation, and measurement scope.
+
 Preserve equal-depth winners by processing the default material first, then ascending glTF material index, with stable primitive and triangle order. Strict less-than depth testing keeps the first winner. This traversal order does not create separate shading batches; the CPU reference uses the same order for comparisons.
 
 Each single-sample or SSAA fragment owns one distinct framebuffer sample. The coordinator writes its returned color without further depth arbitration. MSAA would require per-sample ownership masks. This design assumes no shader-side discard or depth replacement.
@@ -24,7 +26,7 @@ This staged split is for developing and studying shader workloads, not measuring
 
 Measure stage wall time around each backend call, including transfers and synchronization needed to return host-resident results. Count vertices entering vertex shading and surviving fragments entering fragment shading; SSAA fragments are render-resolution samples. Report scene triangles before clipping, and keep loading, lighting preparation, framebuffer writeback, and output times separate from shader timings.
 
-Sum measured loading, geometry, materials, and shadow preparation as the one-time cost for a static scene. Sum vertex shading, rasterization, fragment shading, render setup/writeback, and postprocessing as the per-render cost when the camera changes. Report PNG encoding and writing separately, outside both totals. These are grouped measurements of the current render, not a steady-state frame-loop benchmark.
+Sum measured backend setup, loading, geometry, materials, and shadow preparation as the one-time cost for a static scene. Sum vertex shading, rasterization, fragment shading, render setup/writeback, and postprocessing as the per-render cost when the camera changes. Report PNG encoding and writing separately, outside both totals. These are grouped measurements of the current render, not a steady-state frame-loop benchmark.
 
 All CPU stages share a Rayon worker pool using all available logical CPUs. Vertex and fragment shading preserve output order. Rasterization projects primitives in parallel, bins triangles by their covered sample rows, then processes disjoint bands in parallel. Each band retains triangle order and owns its depth and fragment storage; no pixel locks are needed. The shadow-map loop remains sequential, with parallel vertex shading and rasterization inside each pass.
 

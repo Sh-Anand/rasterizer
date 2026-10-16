@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+cuda = ["dep:cuda-device", "dep:cuda-host", "dep:cuda-core", "glam/scalar-math"]
+
 [dependencies]
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f", optional = true }
+cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f", optional = true }
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f", optional = true }
 glam = "0.33"
 gltf = { version = "1.4.1", features = ["extensions"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

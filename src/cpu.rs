@@ -1,20 +1,56 @@
 use std::io;
 
-mod fragment;
+use glam::Vec3;
+use rayon::prelude::*;
+
 mod rasterization;
 mod vertex;
 
-pub use fragment::CpuFragment;
 pub use rasterization::CpuRasterization;
 pub use vertex::CpuVertex;
 
 use crate::{
+    fragment::shade,
     framebuffer::{Framebuffer, RenderOutput},
     geometry::ClipScene,
-    lighting::Lighting,
+    lighting::{Lighting, visible_lights},
     material::Material,
+    pipeline::{Fragment, FragmentStage},
+    shadow::LightShadow,
 };
 use rasterization::{DepthSlice, project, rasterize};
+
+pub struct CpuFragment;
+
+impl FragmentStage for CpuFragment {
+    fn shade(
+        &mut self,
+        fragments: &[Fragment],
+        materials: &[Material],
+        lighting: &Lighting<'_>,
+    ) -> io::Result<Vec<Vec3>> {
+        let default_material = Material::default();
+        Ok(fragments
+            .par_iter()
+            .map(|fragment| {
+                let material = fragment
+                    .material_index
+                    .map_or(&default_material, |index| &materials[index]);
+                shade(
+                    lighting.camera_position,
+                    material,
+                    &fragment.attributes,
+                    fragment.front_facing,
+                    visible_lights(
+                        lighting.lights,
+                        fragment.attributes.world_position,
+                        LightShadow::visibility,
+                    ),
+                )
+            })
+            .collect())
+    }
+}
 
 /// Immediate shading in scene order, independent of fragment collection.
 pub fn render_reference(
@@ -56,8 +92,17 @@ pub fn render_reference(
             },
             None,
             |index, attributes, front_facing| {
-                output.framebuffer.color[index] =
-                    fragment::shade(&lighting, material, attributes, front_facing);
+                output.framebuffer.color[index] = shade(
+                    lighting.camera_position,
+                    material,
+                    attributes,
+                    front_facing,
+                    visible_lights(
+                        lighting.lights,
+                        attributes.world_position,
+                        LightShadow::visibility,
+                    ),
+                );
             },
         );
     }

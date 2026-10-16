@@ -1,56 +1,27 @@
-use std::{f32::consts::PI, io};
+use std::f32::consts::PI;
 
-use glam::Vec3;
-use rayon::prelude::*;
+use glam::{Vec3, Vec4};
 
 use crate::{
-    lighting::{Lighting, visible_lights},
-    material::Material,
-    pipeline::{Fragment, FragmentAttributes, FragmentStage},
+    lighting::LightSample, material::Material, pipeline::FragmentAttributes, texture::Texture,
 };
 
-pub struct CpuFragment;
-
-impl FragmentStage for CpuFragment {
-    fn shade(
-        &mut self,
-        fragments: &[Fragment],
-        materials: &[Material],
-        lighting: &Lighting<'_>,
-    ) -> io::Result<Vec<Vec3>> {
-        let default_material = Material::default();
-        Ok(fragments
-            .par_iter()
-            .map(|fragment| {
-                let material = fragment
-                    .material_index
-                    .map_or(&default_material, |index| &materials[index]);
-                shade(
-                    lighting,
-                    material,
-                    &fragment.attributes,
-                    fragment.front_facing,
-                )
-            })
-            .collect())
-    }
-}
-
-pub(super) fn shade(
-    lighting: &Lighting<'_>,
-    material: &Material,
+pub(crate) fn shade<P: AsRef<[Vec4]>>(
+    camera_position: Vec3,
+    material: &Material<Texture<P>>,
     attributes: &FragmentAttributes,
     front_facing: bool,
+    lights: impl Iterator<Item = LightSample>,
 ) -> Vec3 {
     let base_color = material.base_color(attributes.uv);
     let normal =
         material.shading_normal(attributes.normal_uv, attributes.normal, attributes.tangent);
     let normal = if front_facing { normal } else { -normal };
-    let view = (lighting.camera_position - attributes.world_position).normalize_or_zero();
+    let view = (camera_position - attributes.world_position).normalize_or_zero();
     let (metallic, roughness) = material.metallic_roughness(attributes.metallic_roughness_uv);
     let brdf = Brdf::new(base_color, metallic, roughness);
     let mut reflected = Vec3::ZERO;
-    for sample in visible_lights(lighting.lights, attributes.world_position) {
+    for sample in lights {
         reflected += brdf.evaluate(normal, view, sample.direction)
             * sample.irradiance
             * normal.dot(sample.direction).max(0.0);

@@ -10,23 +10,24 @@ use crate::{
     pipeline::ShadowProjection,
 };
 
-pub enum LightShadow {
-    Directional(ShadowMap),
+#[derive(Clone, Copy)]
+pub enum LightShadow<M = Vec<ShadowMap>> {
+    Directional(M),
     Area {
         position: Vec3,
         basis: Mat3,
-        faces: Vec<ShadowMap>,
+        faces: M,
     },
 }
 
 impl LightShadow {
     pub fn new(scene: &ClipScene, light: &Light, config: &ShadowConfig) -> io::Result<Self> {
         match light {
-            Light::Directional(light) => Ok(Self::Directional(ShadowMap::new(
+            Light::Directional(light) => Ok(Self::Directional(vec![ShadowMap::new(
                 light_matrix(scene, light.direction())?,
                 ShadowProjection::Orthographic,
                 config,
-            )?)),
+            )?])),
             Light::Area(light) => Self::area(scene, light, config),
         }
     }
@@ -79,35 +80,68 @@ impl LightShadow {
             faces,
         })
     }
+}
 
-    pub fn maps(&self) -> &[ShadowMap] {
+impl<M> LightShadow<M> {
+    pub fn maps(&self) -> &M {
         match self {
-            Self::Directional(map) => std::slice::from_ref(map),
-            Self::Area { faces, .. } => faces,
+            Self::Directional(maps) | Self::Area { faces: maps, .. } => maps,
         }
     }
 
-    fn maps_mut(&mut self) -> &mut [ShadowMap] {
+    fn maps_mut(&mut self) -> &mut M {
         match self {
-            Self::Directional(map) => std::slice::from_mut(map),
-            Self::Area { faces, .. } => faces,
+            Self::Directional(maps) | Self::Area { faces: maps, .. } => maps,
         }
     }
 
-    pub fn visibility(&self, world_position: Vec3) -> f32 {
+    #[cfg(feature = "cuda")]
+    pub(crate) fn with_maps<N>(&self, maps: N) -> LightShadow<N> {
         match self {
-            Self::Directional(map) => map.visibility(world_position),
+            Self::Directional(_) => LightShadow::Directional(maps),
             Self::Area {
-                position,
-                basis,
-                faces,
+                position, basis, ..
+            } => LightShadow::Area {
+                position: *position,
+                basis: *basis,
+                faces: maps,
+            },
+        }
+    }
+
+    pub fn visibility<P: AsRef<[f32]>>(&self, world_position: Vec3) -> f32
+    where
+        M: AsRef<[ShadowMap<P>]>,
+    {
+        self.visibility_with(world_position, AsRef::as_ref)
+    }
+
+    pub(crate) fn visibility_with<'a, P: 'a>(
+        &'a self,
+        world_position: Vec3,
+        depth: impl Fn(&'a P) -> &'a [f32],
+    ) -> f32
+    where
+        M: AsRef<[ShadowMap<P>]>,
+    {
+        let maps = self.maps().as_ref();
+        let get_map = |face| {
+            maps.get(face)
+                .map(|map: &ShadowMap<P>| map.with_depth(depth(&map.depth.values)))
+        };
+        match self {
+            Self::Directional(_) => get_map(0).map_or(1.0, |map| map.visibility(world_position)),
+            Self::Area {
+                position, basis, ..
             } => {
                 let direction = basis.transpose() * (world_position - position);
-                if !direction.is_finite() || (faces.len() == 5 && direction.z <= 0.0) {
+                if !direction.is_finite() || (maps.len() == 5 && direction.z <= 0.0) {
                     return 1.0;
                 }
                 let face = cube_face(direction);
-                let map = &faces[face];
+                let Some(map) = get_map(face) else {
+                    return 1.0;
+                };
                 let Some(projected) = map.project(world_position) else {
                     return 1.0;
                 };
@@ -123,12 +157,12 @@ impl LightShadow {
                         (0..3)
                             .map(|axis| {
                                 let neighbor = 2 * axis + usize::from(ray[axis] < 0.0);
-                                cube_compare(faces, world_position, ray, neighbor)
+                                cube_compare(get_map, world_position, ray, neighbor)
                             })
                             .sum::<f32>()
                             / 3.0
                     } else {
-                        cube_compare(faces, world_position, ray, cube_face(ray))
+                        cube_compare(get_map, world_position, ray, cube_face(ray))
                     }
                 })
             }
@@ -136,9 +170,10 @@ impl LightShadow {
     }
 }
 
-pub struct ShadowMap {
+#[derive(Clone, Copy)]
+pub struct ShadowMap<P = Vec<f32>> {
     pub view_projection: Mat4,
-    pub depth: DepthBuffer,
+    pub depth: DepthBuffer<P>,
     pub projection: ShadowProjection,
     bias: f32,
 }
@@ -168,7 +203,24 @@ impl ShadowMap {
             bias: config.bias,
         })
     }
+}
 
+impl<P> ShadowMap<P> {
+    pub(crate) fn with_depth<Q>(&self, values: Q) -> ShadowMap<Q> {
+        ShadowMap {
+            view_projection: self.view_projection,
+            depth: DepthBuffer {
+                width: self.depth.width,
+                height: self.depth.height,
+                values,
+            },
+            projection: self.projection,
+            bias: self.bias,
+        }
+    }
+}
+
+impl<P: AsRef<[f32]>> ShadowMap<P> {
     pub fn visibility(&self, world_position: Vec3) -> f32 {
         self.project(world_position).map_or(1.0, |projected| {
             pcf(projected.truncate(), |texel| {
@@ -209,7 +261,9 @@ impl ShadowMap {
     fn compare(&self, texel: IVec2, depth: f32) -> f32 {
         let x = texel.x.clamp(0, self.depth.width as i32 - 1) as usize;
         let y = texel.y.clamp(0, self.depth.height as i32 - 1) as usize;
-        f32::from(depth <= self.depth.values[y * self.depth.width as usize + x] + self.bias)
+        f32::from(
+            depth <= self.depth.values.as_ref()[y * self.depth.width as usize + x] + self.bias,
+        )
     }
 }
 
@@ -252,8 +306,13 @@ fn cube_face(direction: Vec3) -> usize {
     2 * axis + usize::from(direction[axis] < 0.0)
 }
 
-fn cube_compare(faces: &[ShadowMap], world_position: Vec3, ray: Vec3, face: usize) -> f32 {
-    let Some(map) = faces.get(face) else {
+fn cube_compare<P: AsRef<[f32]>>(
+    get_map: impl Fn(usize) -> Option<ShadowMap<P>>,
+    world_position: Vec3,
+    ray: Vec3,
+    face: usize,
+) -> f32 {
+    let Some(map) = get_map(face) else {
         return 1.0;
     };
     let ray = cube_basis(face).transpose() * ray;

@@ -29,6 +29,7 @@ pub struct FragmentAttributes {
     pub tangent: Vec4,
 }
 
+#[derive(Clone, Copy)]
 pub struct Fragment {
     /// Index in the render-resolution framebuffer.
     pub sample_index: usize,
@@ -66,6 +67,10 @@ pub trait RasterizationStage {
 }
 
 pub trait FragmentStage {
+    /// Call after editing scene resources or replacing the scene, before shading again.
+    /// Camera and fragment changes alone need no invalidation.
+    fn invalidate_resources(&mut self) {}
+
     /// Return one linear HDR color per fragment, in input order, after any device readback.
     fn shade(
         &mut self,
@@ -73,6 +78,21 @@ pub trait FragmentStage {
         materials: &[Material],
         lighting: &Lighting<'_>,
     ) -> io::Result<Vec<Vec3>>;
+}
+
+impl<F: FragmentStage + ?Sized> FragmentStage for &mut F {
+    fn invalidate_resources(&mut self) {
+        (**self).invalidate_resources();
+    }
+
+    fn shade(
+        &mut self,
+        fragments: &[Fragment],
+        materials: &[Material],
+        lighting: &Lighting<'_>,
+    ) -> io::Result<Vec<Vec3>> {
+        (**self).shade(fragments, materials, lighting)
+    }
 }
 
 #[derive(Default)]
@@ -104,6 +124,11 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
     /// Camera-pass measurements; depth passes leave these unchanged.
     pub fn stats(&self) -> &PipelineStats {
         &self.stats
+    }
+
+    /// Refresh cached fragment resources on the next render.
+    pub fn invalidate_resources(&mut self) {
+        self.fragment.invalidate_resources();
     }
 
     /// Transform geometry for shadow preparation and rendering.

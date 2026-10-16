@@ -7,9 +7,10 @@ use crate::{
     texture::UvSample,
 };
 
-pub struct RenderLight {
+#[derive(Clone, Copy)]
+pub struct RenderLight<S = LightShadow> {
     pub light: Light,
-    pub shadow: Option<LightShadow>,
+    pub shadow: Option<S>,
 }
 
 pub struct Lighting<'a> {
@@ -17,28 +18,30 @@ pub struct Lighting<'a> {
     pub camera_position: Vec3,
 }
 
-pub(crate) fn visible_lights(
-    lights: &[RenderLight],
+pub(crate) fn visible_lights<S>(
+    lights: &[RenderLight<S>],
     position: Vec3,
+    visibility: impl Fn(&S, Vec3) -> f32,
 ) -> impl Iterator<Item = LightSample> {
     lights.iter().filter_map(move |light| {
         let mut sample = light.light.sample(position)?;
         let visibility = light
             .shadow
             .as_ref()
-            .map_or(1.0, |shadow| shadow.visibility(position));
+            .map_or(1.0, |shadow| visibility(shadow, position));
         sample.irradiance *= visibility;
         (visibility > 0.0).then_some(sample)
     })
 }
 
+#[derive(Clone, Copy)]
 pub enum Light {
     Directional(DirectionalLight),
     Area(AreaLight),
 }
 
 impl Light {
-    pub fn sample(&self, position: Vec3) -> Option<LightSample> {
+    pub fn sample(self, position: Vec3) -> Option<LightSample> {
         match self {
             Self::Directional(light) => Some(LightSample {
                 direction: light.direction,
@@ -54,6 +57,7 @@ pub struct LightSample {
     pub irradiance: Vec3,
 }
 
+#[derive(Clone, Copy)]
 pub struct DirectionalLight {
     direction: Vec3,
     irradiance: Vec3,
@@ -93,6 +97,7 @@ impl DirectionalLight {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct AreaLight {
     position: Vec3,
     normal: Vec3,
@@ -138,7 +143,7 @@ impl AreaLight {
         })
     }
 
-    fn sample(&self, position: Vec3) -> Option<LightSample> {
+    fn sample(self, position: Vec3) -> Option<LightSample> {
         let offset = self.position - position;
         let distance_squared = offset.length_squared();
         if distance_squared == 0.0 || !distance_squared.is_finite() {

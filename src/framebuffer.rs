@@ -67,10 +67,11 @@ impl Framebuffer {
     }
 }
 
-pub struct DepthBuffer {
+#[derive(Clone, Copy)]
+pub struct DepthBuffer<P = Vec<f32>> {
     pub width: u32,
     pub height: u32,
-    pub values: Vec<f32>,
+    pub values: P,
 }
 
 impl DepthBuffer {
