@@ -1,6 +1,7 @@
-use std::io;
+use std::{io, ops::Range};
 
 use glam::{Vec2, Vec3, Vec4};
+use rayon::prelude::*;
 
 use crate::{
     framebuffer::DepthBuffer,
@@ -15,7 +16,9 @@ use crate::{
 pub(super) fn rasterize(
     primitive: &ScreenPrimitive,
     double_sided: bool,
-    depth_buffer: &mut DepthBuffer,
+    width: u32,
+    y_start: u32,
+    depth_buffer: &mut [f32],
     shadow: Option<ShadowProjection>,
     mut emit: impl FnMut(usize, &FragmentAttributes, bool),
 ) -> u64 {
@@ -23,11 +26,17 @@ pub(super) fn rasterize(
         Some(ShadowProjection::Perspective { far }) => Some(far),
         _ => None,
     };
-    let (width, height) = (depth_buffer.width, depth_buffer.height);
+    let y_end = y_start + (depth_buffer.len() / width as usize) as u32;
+    let first_sample = y_start as usize * width as usize;
     let mut covered_fragments = 0;
     for triangle in &primitive.triangles {
         let vertices = triangle.map(|index| primitive.vertices[index as usize]);
         let [a, b, c] = vertices.map(|v| v.position);
+        if a.y.max(b.y).max(c.y) < y_start as f32 + 0.5
+            || a.y.min(b.y).min(c.y) > y_end as f32 - 0.5
+        {
+            continue;
+        }
         let ab = b - a;
         let ac = c - a;
         let area = ab.truncate().perp_dot(ac.truncate());
@@ -59,7 +68,7 @@ pub(super) fn rasterize(
         rasterize_triangle(
             vertices.map(|v| v.position.truncate()),
             width,
-            height,
+            y_start..y_end,
             |sample| {
                 covered_fragments += 1;
                 let depth = depths
@@ -77,15 +86,15 @@ pub(super) fn rasterize(
                     depth
                 };
                 let [x, y] = sample.pixel;
-                let index = y as usize * width as usize + x as usize;
-                if !depth.is_finite() || depth >= depth_buffer.values[index] {
+                let index = (y - y_start) as usize * width as usize + x as usize;
+                if !depth.is_finite() || depth >= depth_buffer[index] {
                     return;
                 }
-                depth_buffer.values[index] = depth;
+                depth_buffer[index] = depth;
                 if let Some(gradients) = &gradients {
                     let attributes =
                         interpolate_attributes(vertices, sample.barycentric, gradients);
-                    emit(index, &attributes, front_facing);
+                    emit(first_sample + index, &attributes, front_facing);
                 }
             },
         );
@@ -103,42 +112,70 @@ impl RasterizationStage for CpuRasterization {
         depth: &mut DepthBuffer,
         shadow: Option<ShadowProjection>,
     ) -> io::Result<RasterizedScene> {
-        let mut output = RasterizedScene::default();
-        let mut slot_for_sample = Vec::new();
-        if shadow.is_none() {
-            slot_for_sample
-                .try_reserve_exact(depth.values.len())
-                .map_err(io::Error::other)?;
-            slot_for_sample.resize(depth.values.len(), usize::MAX);
-        }
+        let screens = primitives
+            .par_iter()
+            .map(|primitive| project(primitive, depth.width, depth.height))
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut output = RasterizedScene {
+            screen_vertices: screens.iter().map(|screen| screen.vertices.len()).sum(),
+            screen_triangles: screens.iter().map(|screen| screen.triangles.len()).sum(),
+            ..RasterizedScene::default()
+        };
+        let width = depth.width;
+        let band_height = (depth.height as usize).div_ceil(rayon::current_num_threads());
+        let band_samples = band_height * width as usize;
         let default_material = Material::default();
-        for primitive in primitives {
-            let material_index = primitive.source.material_index;
-            let material = material_index.map_or(&default_material, |index| &materials[index]);
-            let screen = project(primitive, depth.width, depth.height)?;
-            output.screen_vertices += screen.vertices.len();
-            output.screen_triangles += screen.triangles.len();
-            output.covered_fragments += rasterize(
-                &screen,
-                material.double_sided,
-                depth,
-                shadow,
-                |sample_index, attributes, front_facing| {
-                    let fragment = Fragment {
-                        sample_index,
-                        material_index,
-                        attributes: *attributes,
-                        front_facing,
-                    };
-                    let slot = &mut slot_for_sample[sample_index];
-                    if *slot == usize::MAX {
-                        *slot = output.fragments.len();
-                        output.fragments.push(fragment);
-                    } else {
-                        output.fragments[*slot] = fragment;
-                    }
-                },
-            );
+        let bands = depth
+            .values
+            .par_chunks_mut(band_samples)
+            .enumerate()
+            .map(|(band, values)| {
+                let mut output = RasterizedScene::default();
+                let mut slot_for_sample = Vec::new();
+                if shadow.is_none() {
+                    slot_for_sample
+                        .try_reserve_exact(values.len())
+                        .map_err(io::Error::other)?;
+                    slot_for_sample.resize(values.len(), usize::MAX);
+                }
+                for (primitive, screen) in primitives.iter().zip(&screens) {
+                    let material_index = primitive.source.material_index;
+                    let material =
+                        material_index.map_or(&default_material, |index| &materials[index]);
+                    output.covered_fragments += rasterize(
+                        screen,
+                        material.double_sided,
+                        width,
+                        (band * band_height) as u32,
+                        values,
+                        shadow,
+                        |sample_index, attributes, front_facing| {
+                            let fragment = Fragment {
+                                sample_index,
+                                material_index,
+                                attributes: *attributes,
+                                front_facing,
+                            };
+                            let slot = &mut slot_for_sample[sample_index - band * band_samples];
+                            if *slot == usize::MAX {
+                                *slot = output.fragments.len();
+                                output.fragments.push(fragment);
+                            } else {
+                                output.fragments[*slot] = fragment;
+                            }
+                        },
+                    );
+                }
+                Ok(output)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        output
+            .fragments
+            .try_reserve_exact(bands.iter().map(|band| band.fragments.len()).sum())
+            .map_err(io::Error::other)?;
+        for band in bands {
+            output.covered_fragments += band.covered_fragments;
+            output.fragments.extend(band.fragments);
         }
         Ok(output)
     }
@@ -423,10 +460,10 @@ impl Edge {
 fn rasterize_triangle(
     mut vertices: [Vec2; 3],
     width: u32,
-    height: u32,
+    rows: Range<u32>,
     mut emit: impl FnMut(CoverageSample),
 ) {
-    if width == 0 || height == 0 || vertices.iter().any(|v| !v.is_finite()) {
+    if width == 0 || rows.is_empty() || vertices.iter().any(|v| !v.is_finite()) {
         return;
     }
     let area = Edge::new(vertices[0], vertices[1]).evaluate(vertices[2]);
@@ -447,9 +484,11 @@ fn rasterize_triangle(
     let min = vertices[0].min(vertices[1]).min(vertices[2]);
     let max = vertices[0].max(vertices[1]).max(vertices[2]);
     let x0 = (min.x - 0.5).ceil().clamp(0.0, width as f32) as u32;
-    let y0 = (min.y - 0.5).ceil().clamp(0.0, height as f32) as u32;
+    let y0 = (min.y - 0.5)
+        .ceil()
+        .clamp(rows.start as f32, rows.end as f32) as u32;
     let x1 = ((max.x - 0.5).floor() + 1.0).clamp(0.0, width as f32) as u32;
-    let y1 = ((max.y - 0.5).floor() + 1.0).clamp(0.0, height as f32) as u32;
+    let y1 = ((max.y - 0.5).floor() + 1.0).clamp(rows.start as f32, rows.end as f32) as u32;
 
     for y in y0..y1 {
         for x in x0..x1 {

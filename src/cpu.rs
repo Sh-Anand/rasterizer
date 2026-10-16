@@ -48,7 +48,9 @@ pub fn render_reference(
         output.covered_fragments += rasterize(
             &screen,
             material.double_sided,
-            &mut output.framebuffer.depth,
+            width,
+            0,
+            &mut output.framebuffer.depth.values,
             None,
             |index, attributes, front_facing| {
                 output.framebuffer.color[index] =
