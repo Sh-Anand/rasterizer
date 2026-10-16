@@ -1,6 +1,7 @@
 use std::io;
 
 use glam::{Mat3, Mat4, Vec4};
+use rayon::prelude::*;
 
 use crate::{
     geometry::{ClipPrimitive, ClipScene, ClipVertex, PreparedPrimitive, PreparedScene},
@@ -21,7 +22,7 @@ impl VertexStage for CpuVertex {
             scene_index: scene.scene_index,
             primitives: scene
                 .primitives
-                .iter()
+                .par_iter()
                 .map(|primitive| transform_primitive(primitive, view_projection))
                 .collect::<io::Result<_>>()?,
         })
@@ -48,7 +49,7 @@ fn transform_primitive(
     let sign = linear.determinant().signum();
     let vertices = primitive
         .vertices
-        .iter()
+        .par_iter()
         .map(|vertex| {
             let position = mvp * vertex.position.extend(1.0);
             let world_position = primitive.model.transform_point3(vertex.position);

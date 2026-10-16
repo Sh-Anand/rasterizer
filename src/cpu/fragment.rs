@@ -1,6 +1,7 @@
 use std::{f32::consts::PI, io};
 
 use glam::Vec3;
+use rayon::prelude::*;
 
 use crate::{
     lighting::{Lighting, visible_lights},
@@ -19,7 +20,7 @@ impl FragmentStage for CpuFragment {
     ) -> io::Result<Vec<Vec3>> {
         let default_material = Material::default();
         Ok(fragments
-            .iter()
+            .par_iter()
             .map(|fragment| {
                 let material = fragment
                     .material_index
