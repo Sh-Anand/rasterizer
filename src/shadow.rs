@@ -4,11 +4,10 @@ use glam::{IVec2, Mat3, Mat4, Vec2, Vec3, Vec4, camera::rh};
 
 use crate::{
     config::ShadowConfig,
-    cpu::rasterization::{project, rasterize},
     framebuffer::DepthBuffer,
     geometry::ClipScene,
     lighting::{AreaLight, Light, RenderLight},
-    material::Material,
+    pipeline::ShadowProjection,
 };
 
 pub enum LightShadow {
@@ -135,12 +134,6 @@ impl LightShadow {
             }
         }
     }
-}
-
-#[derive(Clone, Copy)]
-pub enum ShadowProjection {
-    Orthographic,
-    Perspective { far: f32 },
 }
 
 pub struct ShadowMap {
@@ -325,8 +318,8 @@ fn light_matrix(scene: &ClipScene, direction: Vec3) -> io::Result<Mat4> {
 pub fn prepare_lights(
     lights: Vec<Light>,
     scene: &ClipScene,
-    materials: &[Material],
     config: &ShadowConfig,
+    mut render_depth: impl FnMut(&mut ShadowMap) -> io::Result<()>,
 ) -> io::Result<Vec<RenderLight>> {
     lights
         .into_iter()
@@ -334,7 +327,7 @@ pub fn prepare_lights(
             let shadow = if config.enabled {
                 let mut shadow = LightShadow::new(scene, &light, config)?;
                 for map in shadow.maps_mut() {
-                    draw_shadow_map(scene, materials, map)?;
+                    render_depth(map)?;
                 }
                 Some(shadow)
             } else {
@@ -343,37 +336,4 @@ pub fn prepare_lights(
             Ok(RenderLight { light, shadow })
         })
         .collect()
-}
-
-fn draw_shadow_map(
-    scene: &ClipScene,
-    materials: &[Material],
-    shadow: &mut ShadowMap,
-) -> io::Result<()> {
-    let default_material = Material::default();
-    for primitive in &scene.primitives {
-        let mut primitive = primitive.clone();
-        for vertex in &mut primitive.vertices {
-            vertex.position = shadow.view_projection * vertex.world_position.extend(1.0);
-            if !vertex.position.is_finite() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Non-finite reprojected position",
-                ));
-            }
-        }
-        let material = primitive
-            .source
-            .material_index
-            .map_or(&default_material, |i| &materials[i]);
-        let screen = project(&primitive, shadow.depth.width, shadow.depth.height)?;
-        rasterize(
-            &screen,
-            material.double_sided,
-            &mut shadow.depth,
-            Some(shadow.projection),
-            |_, _, _| {},
-        );
-    }
-    Ok(())
 }

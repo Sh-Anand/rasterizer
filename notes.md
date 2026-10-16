@@ -36,6 +36,8 @@ This keeps the implementation straightforward, but can increase vertex and trian
 
 ## Shadows
 
+Generate shadow maps through the camera pipeline's selected vertex and rasterization backends. Depth passes use the existing shadow depth/bias rules, skip fragment collection and shading, and write directly into the map's depth buffer. Keep light-view construction and visibility filtering in the shadow module. Attribute transformation is shared with camera rendering; a position-only vertex path is deferred. Shadow work belongs to one-time preparation and leaves camera-pass statistics unchanged.
+
 One orthographic shadow map covers the full scene so off-camera geometry can cast shadows. This keeps fitting simple, but large scenes spread the available resolution thinly. Use a one-texel slope bias to cover the bilinear PCF footprint, plus a configurable constant bias: too little bias causes self-shadowing artifacts; too much detaches shadows from their casters.
 
 Use fixed 2x2 percentage-closer filtering: bilinearly blend four depth-comparison results, not depths. Apply fractional visibility to each light during shading. This reduces jagged edges but does not model an area light's physical penumbra. Keep it independent of material-texture filtering; do not generate depth mipmaps. Clamp directional-map border taps. For emissive lights, remap taps across cube faces with per-face reference depths and average the three comparisons at cube corners.

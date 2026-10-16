@@ -10,7 +10,7 @@ use rasterizer::{
     material::{Material, load_materials},
     pipeline::{
         Fragment, FragmentAttributes, FragmentStage, Pipeline, RasterizationStage, RasterizedScene,
-        VertexStage,
+        ShadowProjection, VertexStage,
     },
     texture::{Sampling, UvSample},
 };
@@ -179,6 +179,7 @@ fn collect_fragments(
             &primitives.iter().collect::<Vec<_>>(),
             std::slice::from_ref(material),
             &mut depth,
+            None,
         )
         .unwrap();
     assert_unique_samples(&rasterized.fragments);
@@ -283,6 +284,7 @@ fn equal_depth_keeps_the_first_winner_and_collector_state_does_not_cross_calls()
                 &[&first, &equal],
                 std::slice::from_ref(&material),
                 &mut depth,
+                None,
             )
             .unwrap();
         assert_unique_samples(&rasterized.fragments);
@@ -296,24 +298,29 @@ fn equal_depth_keeps_the_first_winner_and_collector_state_does_not_cross_calls()
         );
         let previous_depth = depth.values.clone();
         let rejected = rasterizer
-            .rasterize(&[&equal], std::slice::from_ref(&material), &mut depth)
+            .rasterize(&[&equal], std::slice::from_ref(&material), &mut depth, None)
             .unwrap();
         assert!(rejected.fragments.is_empty());
         assert_eq!(depth.values, previous_depth);
 
         let closer = triangle(Some(0), -0.5);
         let next = rasterizer
-            .rasterize(&[&closer], std::slice::from_ref(&material), &mut depth)
+            .rasterize(
+                &[&closer],
+                std::slice::from_ref(&material),
+                &mut depth,
+                None,
+            )
             .unwrap();
         assert_unique_samples(&next.fragments);
         assert_eq!(next.fragments.len(), samples);
         let rejected = rasterizer
-            .rasterize(&[&first], std::slice::from_ref(&material), &mut depth)
+            .rasterize(&[&first], std::slice::from_ref(&material), &mut depth, None)
             .unwrap();
         assert!(rejected.fragments.is_empty());
         assert!(
             rasterizer
-                .rasterize(&[], std::slice::from_ref(&material), &mut depth)
+                .rasterize(&[], std::slice::from_ref(&material), &mut depth, None)
                 .unwrap()
                 .fragments
                 .is_empty()
@@ -365,8 +372,25 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
         let lights =
             rasterizer::lighting::collect_lights(&scene, materials, &light_config).unwrap();
         assert_eq!(lights.len(), 3);
-        let prepared =
-            rasterizer::shadow::prepare_lights(lights, &scene, materials, &shadow_config).unwrap();
+        let mut vertex = FixedVertex {
+            scene: scene.clone(),
+            called: false,
+        };
+        let prepared_scene = PreparedScene {
+            scene_index: 0,
+            primitives: Vec::new(),
+        };
+        let mut pipeline = Pipeline::new(&mut vertex, CpuRasterization, BrokenFragment(true));
+        let prepared = rasterizer::shadow::prepare_lights(lights, &scene, &shadow_config, |map| {
+            pipeline.render_depth(
+                &prepared_scene,
+                map.view_projection,
+                materials,
+                &mut map.depth,
+                map.projection,
+            )
+        })
+        .unwrap();
         prepared
             .iter()
             .flat_map(|light| light.shadow.as_ref().unwrap().maps())
@@ -457,9 +481,16 @@ struct FixedVertex {
 impl VertexStage for &mut FixedVertex {
     fn transform(&mut self, scene: &PreparedScene, view_projection: Mat4) -> io::Result<ClipScene> {
         assert!(scene.primitives.is_empty());
-        assert_eq!(view_projection, Mat4::IDENTITY);
         self.called = true;
-        Ok(self.scene.clone())
+        let mut transformed = self.scene.clone();
+        for vertex in transformed
+            .primitives
+            .iter_mut()
+            .flat_map(|p| &mut p.vertices)
+        {
+            vertex.position = view_projection * vertex.world_position.extend(1.0);
+        }
+        Ok(transformed)
     }
 }
 
@@ -498,10 +529,14 @@ impl RasterizationStage for FixedRasterization {
         primitives: &[&ClipPrimitive],
         _: &[Material],
         depth: &mut DepthBuffer,
+        shadow: Option<ShadowProjection>,
     ) -> io::Result<RasterizedScene> {
         assert_eq!(primitives.len(), 1);
         if let Some(sample) = depth.values.get_mut(self.sample_index) {
             *sample = 0.25;
+        }
+        if shadow.is_some() {
+            return Ok(RasterizedScene::default());
         }
         let uv = UvSample::point(Vec2::ZERO);
         Ok(RasterizedScene {

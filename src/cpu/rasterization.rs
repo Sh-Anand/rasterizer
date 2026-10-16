@@ -6,12 +6,13 @@ use crate::{
     framebuffer::DepthBuffer,
     geometry::{ClipPrimitive, ClipVertex},
     material::Material,
-    pipeline::{Fragment, FragmentAttributes, RasterizationStage, RasterizedScene},
-    shadow::ShadowProjection,
+    pipeline::{
+        Fragment, FragmentAttributes, RasterizationStage, RasterizedScene, ShadowProjection,
+    },
     texture::UvSample,
 };
 
-pub(crate) fn rasterize(
+pub(super) fn rasterize(
     primitive: &ScreenPrimitive,
     double_sided: bool,
     depth_buffer: &mut DepthBuffer,
@@ -100,13 +101,16 @@ impl RasterizationStage for CpuRasterization {
         primitives: &[&ClipPrimitive],
         materials: &[Material],
         depth: &mut DepthBuffer,
+        shadow: Option<ShadowProjection>,
     ) -> io::Result<RasterizedScene> {
         let mut output = RasterizedScene::default();
         let mut slot_for_sample = Vec::new();
-        slot_for_sample
-            .try_reserve_exact(depth.values.len())
-            .map_err(io::Error::other)?;
-        slot_for_sample.resize(depth.values.len(), usize::MAX);
+        if shadow.is_none() {
+            slot_for_sample
+                .try_reserve_exact(depth.values.len())
+                .map_err(io::Error::other)?;
+            slot_for_sample.resize(depth.values.len(), usize::MAX);
+        }
         let default_material = Material::default();
         for primitive in primitives {
             let material_index = primitive.source.material_index;
@@ -118,7 +122,7 @@ impl RasterizationStage for CpuRasterization {
                 &screen,
                 material.double_sided,
                 depth,
-                None,
+                shadow,
                 |sample_index, attributes, front_facing| {
                     let fragment = Fragment {
                         sample_index,
@@ -186,7 +190,7 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f32)
     }
 }
 
-pub(crate) fn project(
+pub(super) fn project(
     primitive: &ClipPrimitive,
     width: u32,
     height: u32,
@@ -254,7 +258,7 @@ pub(crate) fn project(
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ScreenVertex {
+pub(super) struct ScreenVertex {
     pub position: Vec3,
     pub world_position: Vec3,
     pub inv_w: f32,
@@ -268,7 +272,7 @@ pub(crate) struct ScreenVertex {
 }
 
 #[derive(Debug)]
-pub(crate) struct ScreenPrimitive {
+pub(super) struct ScreenPrimitive {
     pub mirrored: bool,
     pub vertices: Vec<ScreenVertex>,
     pub triangles: Vec<[u32; 3]>,

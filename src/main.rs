@@ -164,8 +164,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut lights = prepare_lights(
         collect_lights(&transformed, &materials, &config.light)?,
         &transformed,
-        &materials,
         &config.shadow,
+        |map| {
+            pipeline.render_depth(
+                &prepared,
+                map.view_projection,
+                &materials,
+                &mut map.depth,
+                map.projection,
+            )
+        },
     )?;
     let shadow_time = started.elapsed();
     let started = Instant::now();

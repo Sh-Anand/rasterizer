@@ -47,14 +47,21 @@ pub struct RasterizedScene {
     pub screen_triangles: usize,
 }
 
+#[derive(Clone, Copy)]
+pub enum ShadowProjection {
+    Orthographic,
+    Perspective { far: f32 },
+}
+
 pub trait RasterizationStage {
-    /// Clip, project, interpolate, and depth-test the scene in input order.
-    /// Emit final winners only for updated samples. Equal depths keep the first.
+    /// Clip, project, and depth-test in input order. Equal depths keep the first.
+    /// None collects final fragments; Some writes biased shadow depth only.
     fn rasterize(
         &mut self,
         primitives: &[&ClipPrimitive],
         materials: &[Material],
         depth: &mut DepthBuffer,
+        shadow: Option<ShadowProjection>,
     ) -> io::Result<RasterizedScene>;
 }
 
@@ -94,7 +101,7 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         }
     }
 
-    /// Latest stage measurements; transforming a new scene resets all statistics.
+    /// Camera-pass measurements; depth passes leave these unchanged.
     pub fn stats(&self) -> &PipelineStats {
         &self.stats
     }
@@ -111,6 +118,21 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         self.stats.vertex_time = started.elapsed();
         self.stats.vertices_shaded = scene.primitives.iter().map(|p| p.vertices.len()).sum();
         Ok(transformed)
+    }
+
+    pub fn render_depth(
+        &mut self,
+        scene: &PreparedScene,
+        view_projection: Mat4,
+        materials: &[Material],
+        depth: &mut DepthBuffer,
+        projection: ShadowProjection,
+    ) -> io::Result<()> {
+        let transformed = self.vertex.transform(scene, view_projection)?;
+        let primitives = checked_primitives(&transformed, materials)?;
+        self.rasterization
+            .rasterize(&primitives, materials, depth, Some(projection))?;
+        Ok(())
     }
 
     pub fn render(
@@ -144,25 +166,14 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
                 "Non-finite camera position",
             ));
         }
-        let mut primitives: Vec<_> = scene.primitives.iter().collect();
-        if primitives.iter().any(|primitive| {
-            primitive
-                .source
-                .material_index
-                .is_some_and(|index| index >= materials.len())
-        }) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Primitive material index is outside the material list",
-            ));
-        }
+        let mut primitives = checked_primitives(scene, materials)?;
         // Preserve equal-depth winners: default material first, then stable material order.
         primitives.sort_by_key(|primitive| primitive.source.material_index);
         let mut framebuffer = Framebuffer::new(width, height)?;
         let started = Instant::now();
         let rasterized =
             self.rasterization
-                .rasterize(&primitives, materials, &mut framebuffer.depth)?;
+                .rasterize(&primitives, materials, &mut framebuffer.depth, None)?;
         self.stats.rasterization_time = started.elapsed();
         if !rasterized.fragments.is_empty() {
             let started = Instant::now();
@@ -197,4 +208,22 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
             screen_triangles: rasterized.screen_triangles,
         })
     }
+}
+
+fn checked_primitives<'a>(
+    scene: &'a ClipScene,
+    materials: &[Material],
+) -> io::Result<Vec<&'a ClipPrimitive>> {
+    if scene.primitives.iter().any(|primitive| {
+        primitive
+            .source
+            .material_index
+            .is_some_and(|index| index >= materials.len())
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Primitive material index is outside the material list",
+        ));
+    }
+    Ok(scene.primitives.iter().collect())
 }

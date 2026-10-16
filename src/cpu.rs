@@ -1,7 +1,7 @@
 use std::io;
 
 mod fragment;
-pub(crate) mod rasterization;
+mod rasterization;
 mod vertex;
 
 pub use fragment::CpuFragment;
