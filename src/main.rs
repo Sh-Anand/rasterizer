@@ -15,11 +15,11 @@ use rasterizer::{
     geometry::{GltfAsset, prepare_scene},
     lighting::{DirectionalLight, Light, Lighting, RenderLight, collect_lights},
     material::load_materials,
-    pipeline::{FragmentStage, Pipeline},
+    pipeline::{FragmentStage, Pipeline, VertexStage},
     shadow::prepare_lights,
 };
 
-const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light] [--cuda]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\n--cuda: use CUDA for fragment shading (requires the cuda feature).\nRender: cargo run --release -- living-room";
+const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light] [--cuda] [--cuda-vertex] [--cuda-rasterization]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\n--cuda: use CUDA for fragment shading (requires the cuda feature).\n--cuda-vertex: use CUDA for vertex shading, including shadow passes.\n--cuda-rasterization: keep vertex, rasterization, fragment and shadow work on CUDA.\nRender: cargo run --release -- living-room";
 
 fn scene_paths() -> io::Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -108,12 +108,20 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut camera_light = false;
     let mut use_cuda = false;
+    let mut use_cuda_vertex = false;
+    let mut use_cuda_rasterization = false;
     let mut positional = Vec::new();
     for arg in env::args_os().skip(1) {
         if arg == "--camera-light" {
             camera_light = true;
         } else if arg == "--cuda" {
             use_cuda = true;
+        } else if arg == "--cuda-rasterization" {
+            use_cuda_rasterization = true;
+            use_cuda = true;
+            use_cuda_vertex = true;
+        } else if arg == "--cuda-vertex" {
+            use_cuda_vertex = true;
         } else if arg == "--help" || arg == "-h" {
             println!("{USAGE}");
             return Ok(());
@@ -125,7 +133,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut args = positional.into_iter();
     let Some(path) = args.next() else {
-        if camera_light || use_cuda {
+        if camera_light || use_cuda || use_cuda_vertex {
             return Err(format!("Expected a scene.\n\n{USAGE}").into());
         }
         list_scenes().map_err(|error| format!("Failed to list scenes: {error}"))?;
@@ -136,7 +144,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("Expected one scene name or asset path.\n\n{USAGE}").into());
     }
     #[cfg(not(feature = "cuda"))]
-    if use_cuda {
+    if use_cuda || use_cuda_vertex {
         return Err("CUDA support requires building with cargo oxide and --features cuda".into());
     }
     let path = resolve_scene(Path::new(&path))?;
@@ -158,25 +166,56 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("Failed to prepare '{}': {error}", path.display()))?;
     let preparation_time = started.elapsed();
     let started = Instant::now();
+    let mut cpu_vertex = cpu::CpuVertex;
     let mut cpu_fragment = cpu::CpuFragment;
     #[cfg(feature = "cuda")]
-    let mut cuda_fragment = use_cuda
-        .then(|| rasterizer::cuda::CudaFragment::new(0))
+    let cuda_device = (use_cuda || use_cuda_vertex)
+        .then(|| rasterizer::cuda::CudaDevice::new(0))
         .transpose()?;
+    #[cfg(feature = "cuda")]
+    let mut cuda_vertex = cuda_device
+        .as_ref()
+        .filter(|_| use_cuda_vertex)
+        .map(|device| rasterizer::cuda::CudaVertex::with_device(device.clone()));
+    #[cfg(feature = "cuda")]
+    let mut cuda_fragment = cuda_device
+        .as_ref()
+        .filter(|_| use_cuda)
+        .map(|device| rasterizer::cuda::CudaFragment::with_device(device.clone()));
+    #[cfg(feature = "cuda")]
+    let mut resident = use_cuda_rasterization.then(|| {
+        Pipeline::new(
+            cuda_vertex.take().unwrap(),
+            rasterizer::cuda::CudaRasterization::with_device(cuda_device.as_ref().unwrap().clone()),
+            cuda_fragment.take().unwrap(),
+        )
+    });
+    let vertex: &mut dyn VertexStage = &mut cpu_vertex;
     let fragment: &mut dyn FragmentStage = &mut cpu_fragment;
+    #[cfg(feature = "cuda")]
+    let vertex: &mut dyn VertexStage = match &mut cuda_vertex {
+        Some(cuda) => cuda,
+        None => vertex,
+    };
     #[cfg(feature = "cuda")]
     let fragment: &mut dyn FragmentStage = match &mut cuda_fragment {
         Some(cuda) => cuda,
         None => fragment,
     };
-    let mut pipeline = Pipeline::new(cpu::CpuVertex, cpu::CpuRasterization, fragment);
-    let fragment_setup_time = started.elapsed();
+    let mut pipeline = Pipeline::new(vertex, cpu::CpuRasterization, fragment);
+    let backend_setup_time = started.elapsed();
     let started = Instant::now();
     let camera_matrix = config.camera_matrix()?;
-    let mut frame_setup_time = started.elapsed();
-    let transformed = pipeline
-        .transform(&prepared, camera_matrix)
-        .map_err(|error| format!("Failed to transform '{}': {error}", path.display()))?;
+    let frame_setup_time = started.elapsed();
+    let transformed = if use_cuda_rasterization {
+        None
+    } else {
+        Some(
+            pipeline
+                .transform(&prepared, camera_matrix)
+                .map_err(|error| format!("Failed to transform '{}': {error}", path.display()))?,
+        )
+    };
     let output_dir = root.join("output");
     fs::create_dir_all(&output_dir)
         .map_err(|error| format!("Failed to create '{}': {error}", output_dir.display()))?;
@@ -185,34 +224,56 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let material_time = started.elapsed();
     eprintln!("Preparing direct-light shadows...");
     let started = Instant::now();
-    let mut lights = prepare_lights(
-        collect_lights(&transformed, &materials, &config.light)?,
-        &transformed,
-        &config.shadow,
-        |map| {
-            pipeline.render_depth(
-                &prepared,
-                map.view_projection,
-                &materials,
-                &mut map.depth,
-                map.projection,
-            )
-        },
-    )?;
+    let source_lights = collect_lights(&prepared, &materials, &config.light)?;
+    let unshadowed = if camera_light {
+        let direction = Vec3::from(config.camera.position) - Vec3::from(config.camera.target);
+        vec![Light::Directional(DirectionalLight::new(
+            direction.to_array(),
+            [1.0; 3],
+            1.0,
+        )?)]
+    } else {
+        Vec::new()
+    };
+    let mut lights = Vec::new();
+    if !use_cuda_rasterization {
+        lights = prepare_lights(
+            source_lights.clone(),
+            &prepared.world_positions()?,
+            &config.shadow,
+            |map| {
+                let mut depth =
+                    rasterizer::framebuffer::DepthBuffer::new(map.depth.width, map.depth.height)?;
+                pipeline.render_depth(
+                    &prepared,
+                    map.view_projection,
+                    &materials,
+                    &mut depth,
+                    map.projection,
+                )?;
+                Ok(depth.values)
+            },
+        )?;
+        lights.extend(unshadowed.iter().map(|&light| RenderLight {
+            light,
+            shadow: None,
+        }));
+    }
+    #[cfg(feature = "cuda")]
+    if let Some(pipeline) = &mut resident {
+        pipeline.prepare_cuda_lights(
+            &prepared,
+            &materials,
+            source_lights,
+            &config.shadow,
+            &unshadowed,
+        )?;
+    }
     let shadow_time = started.elapsed();
     let started = Instant::now();
-    if camera_light {
-        let direction = Vec3::from(config.camera.position) - Vec3::from(config.camera.target);
-        lights.push(RenderLight {
-            light: Light::Directional(DirectionalLight::new(direction.to_array(), [1.0; 3], 1.0)?),
-            shadow: None,
-        });
-    }
-    frame_setup_time += started.elapsed();
-    let started = Instant::now();
-    let rendered = pipeline
-        .render_transformed(
-            &transformed,
+    let rendered = if let Some(transformed) = &transformed {
+        pipeline.render_transformed(
+            transformed,
             &materials,
             render_width,
             render_height,
@@ -220,8 +281,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 lights: &lights,
                 camera_position: config.camera.position.into(),
             },
-        )
-        .map_err(|error| format!("Failed to render '{}': {error}", path.display()))?;
+        )?
+    } else {
+        #[cfg(feature = "cuda")]
+        {
+            resident.as_mut().unwrap().render_cuda(
+                &prepared,
+                camera_matrix,
+                &materials,
+                render_width,
+                render_height,
+                config.camera.position.into(),
+            )?
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            unreachable!()
+        }
+    };
     let render_time = started.elapsed();
     let output_path = output_dir.join(scene_name(&path)).with_extension("png");
     let started = Instant::now();
@@ -241,8 +318,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loaded {}", path.display());
     println!("CPU workers: {threads}");
     println!(
+        "Vertex backend: {}",
+        if use_cuda_vertex { "CUDA" } else { "CPU" }
+    );
+    println!(
         "Fragment backend: {}",
         if use_cuda { "CUDA" } else { "CPU" }
+    );
+    println!(
+        "Rasterization backend: {}",
+        if use_cuda_rasterization {
+            "CUDA"
+        } else {
+            "CPU"
+        }
     );
     println!("Resolution: {}x{}", config.width, config.height);
     println!(
@@ -277,6 +366,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Animations: {}", document.animations().len());
     let triangles: usize = prepared.primitives.iter().map(|p| p.triangles.len()).sum();
     let stats = pipeline.stats();
+    #[cfg(feature = "cuda")]
+    let stats = resident.as_ref().map_or(stats, Pipeline::stats);
     println!("Triangles loaded (selected scene, before clipping): {triangles}");
     println!("Vertices shaded: {}", stats.vertices_shaded);
     println!("Surviving fragments shaded: {}", stats.fragments_shaded);
@@ -288,12 +379,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Covered fragments (before depth testing): {}",
         rendered.covered_fragments
     );
-    println!("Timings (wall clock, static scene with camera changes):");
+    println!("Timings (static scene with camera changes):");
+    if use_cuda_rasterization {
+        println!(
+            "  CUDA stage times use events; remaining wall time includes uploads, readback and host setup."
+        );
+    }
     for (category, timings) in [
         (
             "one-time cost",
             [
-                ("Fragment backend setup", fragment_setup_time),
+                ("Backend setup", backend_setup_time),
                 ("glTF loading", loading_time),
                 ("Geometry preparation", preparation_time),
                 ("Material preparation", material_time),
@@ -309,7 +405,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ("Fragment shading", stats.fragment_time),
                 (
                     "Render setup + color writeback",
-                    frame_setup_time + render_time - stats.rasterization_time - stats.fragment_time,
+                    (frame_setup_time + render_time).saturating_sub(
+                        stats.rasterization_time
+                            + stats.fragment_time
+                            + if use_cuda_rasterization {
+                                stats.vertex_time
+                            } else {
+                                Duration::ZERO
+                            },
+                    ),
                 ),
                 ("Postprocessing", postprocessing_time),
             ]

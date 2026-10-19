@@ -3,7 +3,7 @@ use std::{f32::consts::PI, io};
 use glam::Vec3;
 
 use crate::{
-    config::LightConfig, geometry::ClipScene, material::Material, shadow::LightShadow,
+    config::LightConfig, geometry::PreparedScene, material::Material, shadow::LightShadow,
     texture::UvSample,
 };
 
@@ -165,7 +165,7 @@ impl AreaLight {
 }
 
 pub fn collect_lights(
-    scene: &ClipScene,
+    scene: &PreparedScene,
     materials: &[Material],
     config: &LightConfig,
 ) -> io::Result<Vec<Light>> {
@@ -190,7 +190,7 @@ pub fn collect_lights(
             if radiance == Vec3::ZERO {
                 continue;
             }
-            let mut positions = vertices.map(|v| v.world_position);
+            let mut positions = vertices.map(|v| primitive.model.transform_point3(v.position));
             if primitive.mirrored {
                 positions.swap(1, 2);
             }

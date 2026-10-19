@@ -5,7 +5,6 @@ use glam::{IVec2, Mat3, Mat4, Vec2, Vec3, Vec4, camera::rh};
 use crate::{
     config::ShadowConfig,
     framebuffer::DepthBuffer,
-    geometry::ClipScene,
     lighting::{AreaLight, Light, RenderLight},
     pipeline::ShadowProjection,
 };
@@ -20,19 +19,19 @@ pub enum LightShadow<M = Vec<ShadowMap>> {
     },
 }
 
-impl LightShadow {
-    pub fn new(scene: &ClipScene, light: &Light, config: &ShadowConfig) -> io::Result<Self> {
+impl LightShadow<Vec<ShadowMap<()>>> {
+    pub fn new(positions: &[Vec3], light: &Light, config: &ShadowConfig) -> io::Result<Self> {
         match light {
             Light::Directional(light) => Ok(Self::Directional(vec![ShadowMap::new(
-                light_matrix(scene, light.direction())?,
+                light_matrix(positions, light.direction())?,
                 ShadowProjection::Orthographic,
                 config,
             )?])),
-            Light::Area(light) => Self::area(scene, light, config),
+            Light::Area(light) => Self::area(positions, light, config),
         }
     }
 
-    fn area(scene: &ClipScene, light: &AreaLight, config: &ShadowConfig) -> io::Result<Self> {
+    fn area(positions: &[Vec3], light: &AreaLight, config: &ShadowConfig) -> io::Result<Self> {
         let position = light.position();
         let normal = light.normal();
         let up = if normal.y.abs() > 0.99 {
@@ -49,8 +48,8 @@ impl LightShadow {
         let up = normal.cross(right);
         let basis = Mat3::from_cols(right, up, normal);
         let mut radius = 0.0_f32;
-        for vertex in scene.primitives.iter().flat_map(|p| &p.vertices) {
-            let distance = (vertex.world_position - position).length();
+        for &vertex in positions {
+            let distance = (vertex - position).length();
             if !distance.is_finite() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -89,13 +88,6 @@ impl<M> LightShadow<M> {
         }
     }
 
-    fn maps_mut(&mut self) -> &mut M {
-        match self {
-            Self::Directional(maps) | Self::Area { faces: maps, .. } => maps,
-        }
-    }
-
-    #[cfg(feature = "cuda")]
     pub(crate) fn with_maps<N>(&self, maps: N) -> LightShadow<N> {
         match self {
             Self::Directional(_) => LightShadow::Directional(maps),
@@ -178,12 +170,18 @@ pub struct ShadowMap<P = Vec<f32>> {
     bias: f32,
 }
 
-impl ShadowMap {
+impl ShadowMap<()> {
     fn new(
         view_projection: Mat4,
         projection: ShadowProjection,
         config: &ShadowConfig,
     ) -> io::Result<Self> {
+        if config.resolution == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Depth buffer dimensions must be nonzero",
+            ));
+        }
         if !(0.0..=1.0).contains(&config.bias) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -198,7 +196,11 @@ impl ShadowMap {
         }
         Ok(Self {
             view_projection,
-            depth: DepthBuffer::new(config.resolution, config.resolution)?,
+            depth: DepthBuffer {
+                width: config.resolution,
+                height: config.resolution,
+                values: (),
+            },
             projection,
             bias: config.bias,
         })
@@ -324,16 +326,10 @@ fn cube_compare<P: AsRef<[f32]>>(
     map.compare(texel, depth)
 }
 
-fn light_matrix(scene: &ClipScene, direction: Vec3) -> io::Result<Mat4> {
-    let positions = || {
-        scene
-            .primitives
-            .iter()
-            .flat_map(|p| p.vertices.iter().map(|v| v.world_position))
-    };
+fn light_matrix(positions: &[Vec3], direction: Vec3) -> io::Result<Mat4> {
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
-    for position in positions() {
+    for &position in positions {
         if !position.is_finite() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -358,7 +354,7 @@ fn light_matrix(scene: &ClipScene, direction: Vec3) -> io::Result<Mat4> {
     let view = rh::view::look_to_mat4(eye, -direction, up);
     min = Vec3::splat(f32::INFINITY);
     max = Vec3::splat(f32::NEG_INFINITY);
-    for position in positions() {
+    for &position in positions {
         let position = view.transform_point3(position);
         min = min.min(position);
         max = max.max(position);
@@ -374,21 +370,24 @@ fn light_matrix(scene: &ClipScene, direction: Vec3) -> io::Result<Mat4> {
     Ok(projection * view)
 }
 
-pub fn prepare_lights(
+#[allow(clippy::type_complexity)]
+pub fn prepare_lights<P>(
     lights: Vec<Light>,
-    scene: &ClipScene,
+    positions: &[Vec3],
     config: &ShadowConfig,
-    mut render_depth: impl FnMut(&mut ShadowMap) -> io::Result<()>,
-) -> io::Result<Vec<RenderLight>> {
+    mut render_depth: impl FnMut(&ShadowMap<()>) -> io::Result<P>,
+) -> io::Result<Vec<RenderLight<LightShadow<Vec<ShadowMap<P>>>>>> {
     lights
         .into_iter()
         .map(|light| {
             let shadow = if config.enabled {
-                let mut shadow = LightShadow::new(scene, &light, config)?;
-                for map in shadow.maps_mut() {
-                    render_depth(map)?;
-                }
-                Some(shadow)
+                let layout = LightShadow::new(positions, &light, config)?;
+                let maps = layout
+                    .maps()
+                    .iter()
+                    .map(|map| Ok(map.with_depth(render_depth(map)?)))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Some(layout.with_maps(maps))
             } else {
                 None
             };

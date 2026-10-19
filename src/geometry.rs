@@ -69,7 +69,7 @@ pub struct ClipPrimitive {
     pub triangles: Vec<[u32; 3]>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct ClipVertex {
     pub position: Vec4,
     pub world_position: Vec3,
@@ -87,6 +87,88 @@ pub struct ClipVertex {
 pub struct ClipScene {
     pub scene_index: usize,
     pub primitives: Vec<ClipPrimitive>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct VertexTransform {
+    model: Mat4,
+    mvp: Mat4,
+    normal: Mat3,
+    linear: Mat3,
+    sign: f32,
+    #[cfg(feature = "cuda")]
+    pub(crate) flat_shaded: bool,
+}
+
+impl VertexTransform {
+    pub(crate) fn new(primitive: &PreparedPrimitive, view_projection: Mat4) -> Self {
+        let linear = Mat3::from_mat4(primitive.model);
+        Self {
+            model: primitive.model,
+            mvp: view_projection * primitive.model,
+            normal: primitive.normal_matrix,
+            linear,
+            sign: linear.determinant().signum(),
+            #[cfg(feature = "cuda")]
+            flat_shaded: primitive.flat_shaded,
+        }
+    }
+
+    pub(crate) fn apply(&self, vertex: &PreparedVertex) -> ClipVertex {
+        let tangent = (self.linear * vertex.tangent.truncate())
+            .try_normalize()
+            .filter(|_| vertex.tangent.w.abs() == 1.0)
+            .map_or(Vec4::ZERO, |t| t.extend(vertex.tangent.w * self.sign));
+        ClipVertex {
+            position: self.mvp * vertex.position.extend(1.0),
+            world_position: self.model.transform_point3(vertex.position),
+            uv: vertex.uv,
+            normal_uv: vertex.normal_uv,
+            metallic_roughness_uv: vertex.metallic_roughness_uv,
+            emissive_uv: vertex.emissive_uv,
+            normal: (self.normal * vertex.normal).normalize_or_zero(),
+            tangent,
+        }
+    }
+}
+
+impl ClipVertex {
+    pub(crate) fn invalid(&self, flat_shaded: bool) -> u32 {
+        if !self.position.is_finite() || !self.world_position.is_finite() {
+            1
+        } else if !flat_shaded && self.normal == Vec3::ZERO {
+            2
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn checked(self, primitive: &PreparedPrimitive) -> io::Result<Self> {
+        let message = match self.invalid(primitive.flat_shaded) {
+            1 => "Non-finite vertex position",
+            2 => "Invalid vertex normal",
+            _ => return Ok(self),
+        };
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Node {}, mesh {}, primitive {}: {message}",
+                primitive.source.node_index,
+                primitive.source.mesh_index,
+                primitive.source.primitive_index,
+            ),
+        ))
+    }
+}
+
+pub(crate) fn check_view_projection(view_projection: Mat4) -> io::Result<()> {
+    if !view_projection.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Non-finite projection matrix",
+        ));
+    }
+    Ok(())
 }
 
 pub fn prepare_scene(asset: &GltfAsset) -> io::Result<PreparedScene> {
@@ -431,4 +513,27 @@ fn split_tangents(
         }
     }
     Ok(())
+}
+
+impl PreparedScene {
+    pub fn world_positions(&self) -> io::Result<Vec<Vec3>> {
+        self.primitives
+            .iter()
+            .flat_map(|p| {
+                p.vertices
+                    .iter()
+                    .map(|v| p.model.transform_point3(v.position))
+            })
+            .map(|p| {
+                if p.is_finite() {
+                    Ok(p)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Non-finite shadow caster position",
+                    ))
+                }
+            })
+            .collect()
+    }
 }

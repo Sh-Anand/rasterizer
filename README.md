@@ -9,11 +9,11 @@ cargo test --release
 Settings are in `config.toml`; images are written to `output/`. `--camera-light`
 adds an unshadowed light aligned with the camera.
 
-## CUDA fragment shading
+## CUDA backends
 
 The optional `cuda` feature uses NVIDIA cuda-oxide, pinned in `Cargo.toml`.
-Vertex processing, rasterization, shadow generation, and postprocessing stay on
-the CPU. The shader, texture filters, BRDF, and shadow filters are shared Rust.
+Vertex transforms, clipping, rasterization math, fragment shading, texture filters,
+BRDF, and shadow filters are shared Rust. Postprocessing stays on the CPU.
 
 Select CUDA 13.4 explicitly (the default `nvcc` may be older). LLVM/Clang 22
 must also be installed:
@@ -34,7 +34,10 @@ cargo +nightly-2026-10-11 install --locked --git https://github.com/NVIDIA/cuda-
   --rev e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f cargo-oxide
 cargo +nightly-2026-10-11 oxide build --arch sm_89 --no-fmad --features cuda \
   --cargo-target-dir target/cuda -- --release
-target/cuda/release/rasterizer living-room --cuda
+target/cuda/release/rasterizer living-room --cuda                # GPU fragments
+target/cuda/release/rasterizer living-room --cuda-vertex         # GPU vertices
+target/cuda/release/rasterizer living-room --cuda-vertex --cuda  # CPU rasterization
+target/cuda/release/rasterizer living-room --cuda-rasterization # resident GPU pipeline
 cargo +nightly-2026-10-11 oxide test --arch sm_89 --no-fmad \
   --cargo-target-dir target/cuda -- --release --features cuda -j1
 ```
@@ -44,20 +47,41 @@ filenames between test targets.
 
 Use `--no-fmad` for comparisons with CPU arithmetic: contraction can move shadow
 filter results beyond the comparison tolerance. CUDA builds enable glam
-`scalar-math` for CPU code too; normal builds retain CPU SIMD. Omit `--cuda` to
-run the CPU fragment backend in the same scalar build.
+`scalar-math` for CPU code too; normal builds retain CPU SIMD. All stages default
+to CPU. `--cuda` and `--cuda-vertex` select individual stages;
+`--cuda-rasterization` selects all three CUDA stages, including shadow rendering.
 
-The backend uploads textures and shadow depths directly from their existing
-host slices, then retains scene resources and buffer capacity across renders.
-Call `Pipeline::invalidate_resources()` (or the fragment stage's method directly)
-after changing materials, textures, lights, or shadow depths, and when replacing a
-scene. CPU stages need no refresh; the shared method is a no-op there. Camera and
-fragment changes need no invalidation. Different material/light slice addresses
-or lengths also trigger a refresh; pointer identity alone cannot detect in-place
-edits or reused allocations.
+The backends retain uploaded geometry, materials, textures, shadows, and buffer
+capacity across calls. CUDA stages share one `CudaDevice` (context, stream and
+kernel module). Call `Pipeline::invalidate_resources()` after editing resources
+in place or replacing a scene; pointer/length checks cannot detect all changes.
+Camera movement alone needs no invalidation.
 
-Reported fragment wall time includes resource uploads on the first render and
-after invalidation. Later renders transfer fragments and RGB results only. A fresh
-CLI invocation still pays setup and scene uploads. The CUDA event interval measures
-dispatch, including cold launch delay; it is not pure kernel execution or a
-GPU-resident frame-time benchmark. `cuda::CudaFragment` implements `FragmentStage`.
+`CudaVertex` and `CudaFragment` implement the existing host stage interfaces for
+mixed CPU/CUDA rendering. Their `timings()` separate packing, allocation/upload,
+CUDA dispatch and readback. These paths return vertices or colors to the CPU.
+
+For resident rendering, construct `Pipeline::new(CudaVertex::with_device(...),
+CudaRasterization::with_device(...), CudaFragment::with_device(...))` with the same
+device. Call `prepare_cuda_lights(scene, materials, lights, shadow_config,
+unshadowed_lights)` once and again after invalidation, then call
+`render_cuda(scene, view_projection, materials, width, height, camera_position)`
+for each frame. Light discovery and shadow fitting use prepared host geometry.
+Transformed vertices, visibility, fragment attributes and shadow depths stay on
+the GPU; only final RGB/depth and small error/statistics counters return to the
+CPU. Dimensions must be nonzero and their product must fit `u32`.
+
+The resident rasterizer handles small triangles per thread and distributes large
+triangles through a bounded work queue. Atomic depth/owner selection preserves
+stable material/triangle order for equal depths. A per-pixel pass interpolates
+only final winners. Clipping, coverage, depth and interpolation reuse the CPU
+math. Storage includes dense fragment slots (about 80.6 MB at 800×600) and an
+8-byte queue entry per input triangle; no global clipped-geometry pool is needed.
+
+The CLI reports wall times for host stage interfaces and CUDA event intervals
+for resident stages. Resident setup/readback is the remaining frame wall time;
+shadow preparation includes its uploads and GPU passes. Event intervals can
+include host launch delays and are not pure kernel execution time. A fresh CLI
+invocation pays context setup, uploads and shadow generation; use repeated
+renders in one process to measure cached performance. PNG encoding and writing
+are reported separately.

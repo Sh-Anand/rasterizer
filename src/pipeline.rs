@@ -14,11 +14,24 @@ use crate::{
 };
 
 pub trait VertexStage {
+    /// Call after editing prepared geometry or replacing the scene.
+    fn invalidate_resources(&mut self) {}
+
     /// Preserve topology and source identities.
     fn transform(&mut self, scene: &PreparedScene, view_projection: Mat4) -> io::Result<ClipScene>;
 }
 
-#[derive(Debug, Clone, Copy)]
+impl<V: VertexStage + ?Sized> VertexStage for &mut V {
+    fn invalidate_resources(&mut self) {
+        (**self).invalidate_resources();
+    }
+
+    fn transform(&mut self, scene: &PreparedScene, view_projection: Mat4) -> io::Result<ClipScene> {
+        (**self).transform(scene, view_projection)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
 pub struct FragmentAttributes {
     pub world_position: Vec3,
     pub uv: UvSample,
@@ -29,7 +42,7 @@ pub struct FragmentAttributes {
     pub tangent: Vec4,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub struct Fragment {
     /// Index in the render-resolution framebuffer.
     pub sample_index: usize,
@@ -105,13 +118,13 @@ pub struct PipelineStats {
 }
 
 pub struct Pipeline<V, R, F> {
-    vertex: V,
-    rasterization: R,
-    fragment: F,
-    stats: PipelineStats,
+    pub(crate) vertex: V,
+    pub(crate) rasterization: R,
+    pub(crate) fragment: F,
+    pub(crate) stats: PipelineStats,
 }
 
-impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> {
+impl<V, R, F> Pipeline<V, R, F> {
     pub fn new(vertex: V, rasterization: R, fragment: F) -> Self {
         Self {
             vertex,
@@ -122,15 +135,22 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
     }
 
     /// Camera-pass measurements; depth passes leave these unchanged.
+    /// Host stage calls use wall time; resident CUDA stages use stream events.
     pub fn stats(&self) -> &PipelineStats {
         &self.stats
     }
+}
 
-    /// Refresh cached fragment resources on the next render.
+impl<V: VertexStage, R, F: FragmentStage> Pipeline<V, R, F> {
+    /// Invalidate cached geometry and shading resources.
+    /// Resident CUDA requires prepare_cuda_lights again before rendering.
     pub fn invalidate_resources(&mut self) {
+        self.vertex.invalidate_resources();
         self.fragment.invalidate_resources();
     }
+}
 
+impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> {
     /// Transform geometry for shadow preparation and rendering.
     pub fn transform(
         &mut self,

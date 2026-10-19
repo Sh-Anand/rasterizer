@@ -16,7 +16,7 @@ pub enum Sampling {
     Trilinear,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct UvSample {
     pub uv: Vec2,
     pub dx: Vec2,

@@ -11,3 +11,4 @@ pub mod shadow;
 pub mod texture;
 
 mod fragment;
+mod rasterization;

@@ -51,6 +51,37 @@ fn scene(primitives: Vec<ClipPrimitive>) -> ClipScene {
     }
 }
 
+fn prepare_identity(scene: &ClipScene) -> PreparedScene {
+    PreparedScene {
+        scene_index: 0,
+        primitives: scene
+            .primitives
+            .iter()
+            .map(|p| rasterizer::geometry::PreparedPrimitive {
+                source: p.source,
+                model: Mat4::IDENTITY,
+                normal_matrix: glam::Mat3::IDENTITY,
+                mirrored: p.mirrored,
+                flat_shaded: false,
+                triangles: p.triangles.clone(),
+                vertices: p
+                    .vertices
+                    .iter()
+                    .map(|v| rasterizer::geometry::PreparedVertex {
+                        position: v.world_position,
+                        uv: v.uv,
+                        normal_uv: v.normal_uv,
+                        metallic_roughness_uv: v.metallic_roughness_uv,
+                        emissive_uv: v.emissive_uv,
+                        normal: v.normal,
+                        tangent: v.tangent,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 fn material(color: Vec3) -> Material {
     Material {
         emissive_factor: color,
@@ -368,9 +399,11 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
         resolution: 16,
         bias: 0.0,
     };
+    let prepared_lighting = prepare_identity(&scene);
     let shadow = |materials: &[Material]| {
         let lights =
-            rasterizer::lighting::collect_lights(&scene, materials, &light_config).unwrap();
+            rasterizer::lighting::collect_lights(&prepared_lighting, materials, &light_config)
+                .unwrap();
         assert_eq!(lights.len(), 3);
         let mut vertex = FixedVertex {
             scene: scene.clone(),
@@ -381,15 +414,22 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
             primitives: Vec::new(),
         };
         let mut pipeline = Pipeline::new(&mut vertex, CpuRasterization, BrokenFragment(true));
-        let prepared = rasterizer::shadow::prepare_lights(lights, &scene, &shadow_config, |map| {
-            pipeline.render_depth(
-                &prepared_scene,
-                map.view_projection,
-                materials,
-                &mut map.depth,
-                map.projection,
-            )
-        })
+        let prepared = rasterizer::shadow::prepare_lights(
+            lights,
+            &prepared_lighting.world_positions().unwrap(),
+            &shadow_config,
+            |map| {
+                let mut depth = DepthBuffer::new(map.depth.width, map.depth.height)?;
+                pipeline.render_depth(
+                    &prepared_scene,
+                    map.view_projection,
+                    materials,
+                    &mut depth,
+                    map.projection,
+                )?;
+                Ok(depth.values)
+            },
+        )
         .unwrap();
         prepared
             .iter()
@@ -684,4 +724,66 @@ fn empty_scenes_and_invalid_render_inputs_are_handled_before_shading() {
             )
             .is_err()
     );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn resident_cuda_preserves_visibility_clipping_and_resource_lifetimes() {
+    use rasterizer::{
+        config::ShadowConfig,
+        cuda::{CudaDevice, CudaFragment, CudaRasterization, CudaVertex},
+    };
+    let device = CudaDevice::new(0).unwrap();
+    let mut gpu = Pipeline::new(
+        CudaVertex::with_device(device.clone()),
+        CudaRasterization::with_device(device.clone()),
+        CudaFragment::with_device(device),
+    );
+    let mut cpu = Pipeline::new(CpuVertex, CpuRasterization, CpuFragment);
+    let mut clipped = triangle(Some(0), -0.25);
+    clipped.vertices[0].world_position.x = -2.0;
+    let mut scene = prepare_identity(&scene(vec![
+        triangle(Some(1), 0.0),
+        triangle(Some(0), 0.0),
+        triangle(None, 0.0),
+        clipped,
+    ]));
+    let mut materials = [material(Vec3::X), material(Vec3::Y)];
+    let shadow = ShadowConfig {
+        enabled: false,
+        resolution: 16,
+        bias: 0.0,
+    };
+    for pass in 0..3 {
+        gpu.prepare_cuda_lights(&scene, &materials, vec![], &shadow, &[])
+            .unwrap();
+        for (width, height) in [(65, 67), (17, 11), (65, 67)] {
+            let expected = cpu
+                .render(
+                    &scene,
+                    Mat4::IDENTITY,
+                    &materials,
+                    width,
+                    height,
+                    lighting(),
+                )
+                .unwrap();
+            let actual = gpu
+                .render_cuda(&scene, Mat4::IDENTITY, &materials, width, height, Vec3::Z)
+                .unwrap();
+            assert_same(&actual, &expected);
+            assert_eq!(gpu.stats().fragments_shaded, cpu.stats().fragments_shaded);
+        }
+        gpu.invalidate_resources();
+        assert!(
+            gpu.render_cuda(&scene, Mat4::IDENTITY, &materials, 8, 8, Vec3::Z)
+                .is_err()
+        );
+        materials[0].emissive_factor = Vec3::Z;
+        if pass == 0 {
+            scene.primitives[3].vertices[0].position.x = 0.0;
+        } else {
+            scene.primitives.clear();
+        }
+    }
 }
