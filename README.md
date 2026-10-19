@@ -1,13 +1,19 @@
 # Rasterizer
 
 ```sh
-cargo run --release                       # list bundled scenes
-cargo run --release -- living-room        # CPU rendering
+./run.sh                                 # list bundled scenes
+./run.sh living-room                     # all GPU (default)
+./run.sh gpu living-room                 # all GPU explicitly
+./run.sh cpu living-room                 # all CPU
 cargo test --release
 ```
 
 Settings are in `config.toml`; images are written to `output/`. `--camera-light`
 adds an unshadowed light aligned with the camera.
+The runner builds in release mode, with separate `target/cpu` and `target/gpu`
+directories. GPU mode requires the one-time CUDA setup below; it selects CUDA
+13.4 and the pinned nightly automatically. Postprocessing stays on the CPU.
+Plain `cargo run --release -- living-room` still uses CPU rendering.
 
 ## CUDA backends
 
@@ -47,8 +53,8 @@ filenames between test targets.
 
 Use `--no-fmad` for comparisons with CPU arithmetic: contraction can move shadow
 filter results beyond the comparison tolerance. CUDA builds enable glam
-`scalar-math` for CPU code too; normal builds retain CPU SIMD. All stages default
-to CPU. `--cuda` and `--cuda-vertex` select individual stages;
+`scalar-math` for CPU code too; normal builds retain CPU SIMD. The renderer binary
+defaults to CPU. `--cuda` and `--cuda-vertex` select individual stages;
 `--cuda-rasterization` selects all three CUDA stages, including shadow rendering.
 
 The backends retain uploaded geometry, materials, textures, shadows, and buffer
