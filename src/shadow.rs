@@ -4,34 +4,49 @@ use glam::{IVec2, Mat3, Mat4, Vec2, Vec3, Vec4, camera::rh};
 
 use crate::{
     config::ShadowConfig,
-    framebuffer::DepthBuffer,
     lighting::{AreaLight, Light, RenderLight},
     pipeline::ShadowProjection,
 };
 
+/// Shadow maps of one light, as a range of the shared map list.
 #[derive(Clone, Copy)]
-pub enum LightShadow<M = Vec<ShadowMap>> {
-    Directional(M),
+pub enum LightShadow {
+    Directional([usize; 2]),
     Area {
         position: Vec3,
         basis: Mat3,
-        faces: M,
+        faces: [usize; 2],
     },
 }
 
-impl LightShadow<Vec<ShadowMap<()>>> {
-    pub fn new(positions: &[Vec3], light: &Light, config: &ShadowConfig) -> io::Result<Self> {
+impl LightShadow {
+    fn new(
+        positions: &[Vec3],
+        light: &Light,
+        config: &ShadowConfig,
+        maps: &mut Vec<ShadowMap>,
+    ) -> io::Result<Self> {
         match light {
-            Light::Directional(light) => Ok(Self::Directional(vec![ShadowMap::new(
-                light_matrix(positions, light.direction())?,
-                ShadowProjection::Orthographic,
-                config,
-            )?])),
-            Light::Area(light) => Self::area(positions, light, config),
+            Light::Directional(light) => {
+                let start = maps.len();
+                push_map(
+                    maps,
+                    light_matrix(positions, light.direction())?,
+                    ShadowProjection::Orthographic,
+                    config,
+                )?;
+                Ok(Self::Directional([start, maps.len()]))
+            }
+            Light::Area(light) => Self::area(positions, light, config, maps),
         }
     }
 
-    fn area(positions: &[Vec3], light: &AreaLight, config: &ShadowConfig) -> io::Result<Self> {
+    fn area(
+        positions: &[Vec3],
+        light: &AreaLight,
+        config: &ShadowConfig,
+        maps: &mut Vec<ShadowMap>,
+    ) -> io::Result<Self> {
         let position = light.position();
         let normal = light.normal();
         let up = if normal.y.abs() > 0.99 {
@@ -62,69 +77,35 @@ impl LightShadow<Vec<ShadowMap<()>>> {
         let near = far * 1e-4;
         let projection = rh::proj::opengl::perspective(std::f32::consts::FRAC_PI_2, 1.0, near, far);
         let count = if light.double_sided() { 6 } else { 5 };
-        let faces = (0..count)
-            .map(|face| {
-                let axes = basis * cube_basis(face);
-                let view = rh::view::look_to_mat4(position, axes.z_axis, axes.y_axis);
-                ShadowMap::new(
-                    projection * view,
-                    ShadowProjection::Perspective { far },
-                    config,
-                )
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+        let start = maps.len();
+        for face in 0..count {
+            let axes = basis * cube_basis(face);
+            let view = rh::view::look_to_mat4(position, axes.z_axis, axes.y_axis);
+            push_map(
+                maps,
+                projection * view,
+                ShadowProjection::Perspective { far },
+                config,
+            )?;
+        }
         Ok(Self::Area {
             position,
             basis,
-            faces,
+            faces: [start, maps.len()],
         })
     }
-}
 
-impl<M> LightShadow<M> {
-    pub fn maps(&self) -> &M {
+    pub fn visibility(&self, maps: &[ShadowMap], depths: &[f32], world_position: Vec3) -> f32 {
+        let (Self::Directional([start, end])
+        | Self::Area {
+            faces: [start, end],
+            ..
+        }) = *self;
+        let maps = &maps[start..end];
         match self {
-            Self::Directional(maps) | Self::Area { faces: maps, .. } => maps,
-        }
-    }
-
-    pub(crate) fn with_maps<N>(&self, maps: N) -> LightShadow<N> {
-        match self {
-            Self::Directional(_) => LightShadow::Directional(maps),
-            Self::Area {
-                position, basis, ..
-            } => LightShadow::Area {
-                position: *position,
-                basis: *basis,
-                faces: maps,
-            },
-        }
-    }
-
-    pub fn visibility<P: AsRef<[f32]>>(&self, world_position: Vec3) -> f32
-    where
-        M: AsRef<[ShadowMap<P>]>,
-    {
-        self.visibility_with(world_position, AsRef::as_ref)
-    }
-
-    pub(crate) fn visibility_with<'a, P: 'a>(
-        &'a self,
-        world_position: Vec3,
-        depth: impl Fn(&'a P) -> &'a [f32],
-    ) -> f32
-    where
-        M: AsRef<[ShadowMap<P>]>,
-    {
-        let maps = self.maps().as_ref();
-        let get_map = |face| {
-            maps.get(face)
-                .map(|map: &ShadowMap<P>| (map, depth(&map.depth.values)))
-        };
-        match self {
-            Self::Directional(_) => get_map(0).map_or(1.0, |(map, values)| {
-                map.visibility_with(world_position, values)
-            }),
+            Self::Directional(_) => maps
+                .first()
+                .map_or(1.0, |map| map.visibility(depths, world_position)),
             Self::Area {
                 position, basis, ..
             } => {
@@ -133,7 +114,7 @@ impl<M> LightShadow<M> {
                     return 1.0;
                 }
                 let face = cube_face(direction);
-                let Some((map, values)) = get_map(face) else {
+                let Some(map) = maps.get(face) else {
                     return 1.0;
                 };
                 let Some(projected) = map.project(world_position) else {
@@ -142,7 +123,7 @@ impl<M> LightShadow<M> {
                 pcf(projected.truncate(), |texel| {
                     let outside = texel.cmplt(IVec2::ZERO) | texel.cmpge(map.size().as_ivec2());
                     if !outside.any() {
-                        return map.compare(texel, projected.z, values);
+                        return map.compare(texel, projected.z, depths);
                     }
                     let uv = (texel.as_vec2() + 0.5) / map.size();
                     let ray = cube_basis(face) * Vec3::new(2.0 * uv.x - 1.0, 1.0 - 2.0 * uv.y, 1.0);
@@ -151,12 +132,12 @@ impl<M> LightShadow<M> {
                         (0..3)
                             .map(|axis| {
                                 let neighbor = 2 * axis + usize::from(ray[axis] < 0.0);
-                                cube_compare(get_map, world_position, ray, neighbor)
+                                cube_compare(maps, depths, world_position, ray, neighbor)
                             })
                             .sum::<f32>()
                             / 3.0
                     } else {
-                        cube_compare(get_map, world_position, ray, cube_face(ray))
+                        cube_compare(maps, depths, world_position, ray, cube_face(ray))
                     }
                 })
             }
@@ -165,81 +146,75 @@ impl<M> LightShadow<M> {
 }
 
 #[derive(Clone, Copy)]
-pub struct ShadowMap<P = Vec<f32>> {
+pub struct ShadowMap {
     pub view_projection: Mat4,
-    pub depth: DepthBuffer<P>,
+    pub width: u32,
+    pub height: u32,
+    /// First depth of this map in the shared depth atlas.
+    pub offset: usize,
     pub projection: ShadowProjection,
     bias: f32,
 }
 
-impl ShadowMap<()> {
-    fn new(
-        view_projection: Mat4,
-        projection: ShadowProjection,
-        config: &ShadowConfig,
-    ) -> io::Result<Self> {
-        if config.resolution == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Depth buffer dimensions must be nonzero",
-            ));
-        }
-        if !(0.0..=1.0).contains(&config.bias) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Shadow bias must be finite and in 0..1",
-            ));
-        }
-        if !view_projection.is_finite() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Non-finite shadow matrix",
-            ));
-        }
-        Ok(Self {
-            view_projection,
-            depth: DepthBuffer {
-                width: config.resolution,
-                height: config.resolution,
-                values: (),
-            },
-            projection,
-            bias: config.bias,
-        })
+fn push_map(
+    maps: &mut Vec<ShadowMap>,
+    view_projection: Mat4,
+    projection: ShadowProjection,
+    config: &ShadowConfig,
+) -> io::Result<()> {
+    if config.resolution == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Depth buffer dimensions must be nonzero",
+        ));
     }
+    if !(0.0..=1.0).contains(&config.bias) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Shadow bias must be finite and in 0..1",
+        ));
+    }
+    if !view_projection.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Non-finite shadow matrix",
+        ));
+    }
+    let offset = maps.last().map_or(0, ShadowMap::end);
+    let size = config.resolution as usize * config.resolution as usize;
+    if offset.checked_add(size).is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Shadow depth atlas size overflow",
+        ));
+    }
+    maps.push(ShadowMap {
+        view_projection,
+        width: config.resolution,
+        height: config.resolution,
+        offset,
+        projection,
+        bias: config.bias,
+    });
+    Ok(())
 }
 
-impl<P> ShadowMap<P> {
-    pub(crate) fn with_depth<Q>(&self, values: Q) -> ShadowMap<Q> {
-        ShadowMap {
-            view_projection: self.view_projection,
-            depth: DepthBuffer {
-                width: self.depth.width,
-                height: self.depth.height,
-                values,
-            },
-            projection: self.projection,
-            bias: self.bias,
-        }
+impl ShadowMap {
+    /// One past this map's last depth in the atlas.
+    pub(crate) fn end(&self) -> usize {
+        self.offset + self.width as usize * self.height as usize
     }
 
-    pub fn visibility(&self, world_position: Vec3) -> f32
-    where
-        P: AsRef<[f32]>,
-    {
-        self.visibility_with(world_position, self.depth.values.as_ref())
-    }
-
-    fn visibility_with(&self, world_position: Vec3, values: &[f32]) -> f32 {
+    fn visibility(&self, depths: &[f32], world_position: Vec3) -> f32 {
         self.project(world_position).map_or(1.0, |projected| {
             pcf(projected.truncate(), |texel| {
-                self.compare(texel, projected.z, values)
+                self.compare(texel, projected.z, depths)
             })
         })
     }
 
     fn size(&self) -> Vec2 {
-        Vec2::new(self.depth.width as f32, self.depth.height as f32)
+        Vec2::new(self.width as f32, self.height as f32)
     }
 
     fn reference_depth(&self, clip: Vec4) -> f32 {
@@ -267,10 +242,10 @@ impl<P> ShadowMap<P> {
         Some(pixel.extend(self.reference_depth(clip)))
     }
 
-    fn compare(&self, texel: IVec2, depth: f32, values: &[f32]) -> f32 {
-        let x = texel.x.clamp(0, self.depth.width as i32 - 1) as usize;
-        let y = texel.y.clamp(0, self.depth.height as i32 - 1) as usize;
-        f32::from(depth <= values[y * self.depth.width as usize + x] + self.bias)
+    fn compare(&self, texel: IVec2, depth: f32, depths: &[f32]) -> f32 {
+        let x = texel.x.clamp(0, self.width as i32 - 1) as usize;
+        let y = texel.y.clamp(0, self.height as i32 - 1) as usize;
+        f32::from(depth <= depths[self.offset + y * self.width as usize + x] + self.bias)
     }
 }
 
@@ -313,13 +288,14 @@ fn cube_face(direction: Vec3) -> usize {
     2 * axis + usize::from(direction[axis] < 0.0)
 }
 
-fn cube_compare<'a, P: 'a>(
-    get_map: impl Fn(usize) -> Option<(&'a ShadowMap<P>, &'a [f32])>,
+fn cube_compare(
+    maps: &[ShadowMap],
+    depths: &[f32],
     world_position: Vec3,
     ray: Vec3,
     face: usize,
 ) -> f32 {
-    let Some((map, values)) = get_map(face) else {
+    let Some(map) = maps.get(face) else {
         return 1.0;
     };
     let ray = cube_basis(face).transpose() * ray;
@@ -328,7 +304,7 @@ fn cube_compare<'a, P: 'a>(
         .as_ivec2();
     // Each face stores linear depth along its own view axis.
     let depth = map.reference_depth(map.view_projection * world_position.extend(1.0));
-    map.compare(texel, depth, values)
+    map.compare(texel, depth, depths)
 }
 
 fn light_matrix(positions: &[Vec3], direction: Vec3) -> io::Result<Mat4> {
@@ -375,28 +351,22 @@ fn light_matrix(positions: &[Vec3], direction: Vec3) -> io::Result<Mat4> {
     Ok(projection * view)
 }
 
-#[allow(clippy::type_complexity)]
-pub fn prepare_lights<P>(
+/// Lay out each light's shadow maps; their depths follow one another in one atlas.
+pub fn prepare_lights(
     lights: Vec<Light>,
     positions: &[Vec3],
     config: &ShadowConfig,
-    mut render_depth: impl FnMut(&ShadowMap<()>) -> io::Result<P>,
-) -> io::Result<Vec<RenderLight<LightShadow<Vec<ShadowMap<P>>>>>> {
-    lights
+) -> io::Result<(Vec<RenderLight>, Vec<ShadowMap>)> {
+    let mut maps = Vec::new();
+    let lights = lights
         .into_iter()
         .map(|light| {
-            let shadow = if config.enabled {
-                let layout = LightShadow::new(positions, &light, config)?;
-                let maps = layout
-                    .maps()
-                    .iter()
-                    .map(|map| Ok(map.with_depth(render_depth(map)?)))
-                    .collect::<io::Result<Vec<_>>>()?;
-                Some(layout.with_maps(maps))
-            } else {
-                None
-            };
+            let shadow = config
+                .enabled
+                .then(|| LightShadow::new(positions, &light, config, &mut maps))
+                .transpose()?;
             Ok(RenderLight { light, shadow })
         })
-        .collect()
+        .collect::<io::Result<_>>()?;
+    Ok((lights, maps))
 }

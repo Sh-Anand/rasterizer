@@ -54,16 +54,17 @@ filter results beyond the comparison tolerance. CUDA builds enable glam
 defaults to CPU; `--cuda` runs every stage, including shadow rendering, on CUDA.
 CPU and CUDA stages cannot be mixed.
 
-The CUDA pipeline retains uploaded geometry, materials, textures, shadows, and
-buffer capacity across calls. Its stages share one `CudaDevice` (context, stream
-and kernel module). Call `Pipeline::invalidate_resources()` after editing resources
-in place or replacing a scene; pointer/length checks cannot detect all changes.
-Camera movement alone needs no invalidation.
+`prepare_cuda_lights` uploads geometry, materials, texels, lights and shadow maps;
+renders reuse them and the buffer capacity. The CUDA stages share one `CudaDevice`
+(context, stream and kernel module). Prepare again after editing resources in place
+or replacing a scene; pointer/length checks cannot detect all changes, so call
+`Pipeline::invalidate_resources()` to make renders fail until then. Camera movement
+alone needs no preparation.
 
 Construct `Pipeline::new(CudaVertex::with_device(...),
 CudaRasterization::with_device(...), CudaFragment::with_device(...))` with the same
-device. Call `prepare_cuda_lights(scene, materials, lights, shadow_config,
-unshadowed_lights)` once and again after invalidation, then call
+device. Call `prepare_cuda_lights(scene, materials, texels, lights, shadow_config,
+unshadowed_lights)` once and again after scene changes, then call
 `render_cuda(scene, view_projection, materials, width, height, camera_position)`
 for each frame. Light discovery and shadow fitting use prepared host geometry.
 Transformed vertices, visibility, fragment attributes and shadow depths stay on

@@ -8,8 +8,9 @@ use glam::{Mat4, Vec3, Vec4};
 use crate::{
     framebuffer::{DepthBuffer, Framebuffer, RenderOutput},
     geometry::{ClipPrimitive, ClipScene, PreparedScene},
-    lighting::Lighting,
+    lighting::RenderLight,
     material::Material,
+    shadow::ShadowMap,
     texture::UvSample,
 };
 
@@ -79,6 +80,18 @@ pub trait RasterizationStage {
     ) -> io::Result<RasterizedScene>;
 }
 
+/// Fragment-shading resources other than the material table.
+#[derive(Clone, Copy)]
+pub struct Shading<'a> {
+    /// Every material texture's mip levels.
+    pub texels: &'a [Vec4],
+    pub lights: &'a [RenderLight],
+    pub maps: &'a [ShadowMap],
+    /// Every shadow map's depths.
+    pub depths: &'a [f32],
+    pub camera_position: Vec3,
+}
+
 pub trait FragmentStage {
     /// Call after editing scene resources or replacing the scene, before shading again.
     /// Camera and fragment changes alone need no invalidation.
@@ -89,7 +102,7 @@ pub trait FragmentStage {
         &mut self,
         fragments: &[Fragment],
         materials: &[Material],
-        lighting: &Lighting<'_>,
+        shading: &Shading<'_>,
     ) -> io::Result<Vec<Vec3>>;
 }
 
@@ -102,9 +115,9 @@ impl<F: FragmentStage + ?Sized> FragmentStage for &mut F {
         &mut self,
         fragments: &[Fragment],
         materials: &[Material],
-        lighting: &Lighting<'_>,
+        shading: &Shading<'_>,
     ) -> io::Result<Vec<Vec3>> {
-        (**self).shade(fragments, materials, lighting)
+        (**self).shade(fragments, materials, shading)
     }
 }
 
@@ -164,19 +177,27 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         Ok(transformed)
     }
 
-    pub fn render_depth(
+    /// Render every shadow map into one depth atlas, in map order.
+    pub fn render_shadows(
         &mut self,
         scene: &PreparedScene,
-        view_projection: Mat4,
         materials: &[Material],
-        depth: &mut DepthBuffer,
-        projection: ShadowProjection,
-    ) -> io::Result<()> {
-        let transformed = self.vertex.transform(scene, view_projection)?;
-        let primitives = checked_primitives(&transformed, materials)?;
-        self.rasterization
-            .rasterize(&primitives, materials, depth, Some(projection))?;
-        Ok(())
+        maps: &[ShadowMap],
+    ) -> io::Result<Vec<f32>> {
+        let mut depths = Vec::new();
+        for map in maps {
+            let transformed = self.vertex.transform(scene, map.view_projection)?;
+            let primitives = checked_primitives(&transformed, materials)?;
+            let mut depth = DepthBuffer::new(map.width, map.height)?;
+            self.rasterization.rasterize(
+                &primitives,
+                materials,
+                &mut depth,
+                Some(map.projection),
+            )?;
+            depths.extend(depth.values);
+        }
+        Ok(depths)
     }
 
     pub fn render(
@@ -186,10 +207,10 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         materials: &[Material],
         width: u32,
         height: u32,
-        lighting: Lighting<'_>,
+        shading: Shading<'_>,
     ) -> io::Result<RenderOutput> {
         let transformed = self.transform(scene, view_projection)?;
-        self.render_transformed(&transformed, materials, width, height, lighting)
+        self.render_transformed(&transformed, materials, width, height, shading)
     }
 
     /// Render geometry returned by the vertex stage.
@@ -199,12 +220,12 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         materials: &[Material],
         width: u32,
         height: u32,
-        lighting: Lighting<'_>,
+        shading: Shading<'_>,
     ) -> io::Result<RenderOutput> {
         self.stats.rasterization_time = Duration::ZERO;
         self.stats.fragment_time = Duration::ZERO;
         self.stats.fragments_shaded = 0;
-        if !lighting.camera_position.is_finite() {
+        if !shading.camera_position.is_finite() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Non-finite camera position",
@@ -223,7 +244,7 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
             let started = Instant::now();
             let colors = self
                 .fragment
-                .shade(&rasterized.fragments, materials, &lighting)?;
+                .shade(&rasterized.fragments, materials, &shading)?;
             self.stats.fragment_time = started.elapsed();
             if colors.len() != rasterized.fragments.len() {
                 return Err(io::Error::new(

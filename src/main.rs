@@ -13,9 +13,9 @@ use rasterizer::{
     config::Config,
     cpu,
     geometry::{GltfAsset, prepare_scene},
-    lighting::{DirectionalLight, Light, Lighting, RenderLight, collect_lights},
+    lighting::{DirectionalLight, Light, RenderLight, collect_lights},
     material::load_materials,
-    pipeline::Pipeline,
+    pipeline::{Pipeline, Shading},
     shadow::prepare_lights,
 };
 
@@ -187,11 +187,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&output_dir)
         .map_err(|error| format!("Failed to create '{}': {error}", output_dir.display()))?;
     let started = Instant::now();
-    let materials = load_materials(&asset, config.sampling)?;
+    let (materials, texels) = load_materials(&asset, config.sampling)?;
     let material_time = started.elapsed();
     eprintln!("Preparing direct-light shadows...");
     let started = Instant::now();
-    let source_lights = collect_lights(&prepared, &materials, &config.light)?;
+    let source_lights = collect_lights(&prepared, &materials, &texels, &config.light)?;
     let unshadowed = if camera_light {
         let direction = Vec3::from(config.camera.position) - Vec3::from(config.camera.target);
         vec![Light::Directional(DirectionalLight::new(
@@ -202,25 +202,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Vec::new()
     };
-    let mut lights = Vec::new();
+    let (mut lights, mut maps, mut depths) = (Vec::new(), Vec::new(), Vec::new());
     if !use_cuda {
-        lights = prepare_lights(
+        (lights, maps) = prepare_lights(
             source_lights.clone(),
             &prepared.world_positions()?,
             &config.shadow,
-            |map| {
-                let mut depth =
-                    rasterizer::framebuffer::DepthBuffer::new(map.depth.width, map.depth.height)?;
-                pipeline.render_depth(
-                    &prepared,
-                    map.view_projection,
-                    &materials,
-                    &mut depth,
-                    map.projection,
-                )?;
-                Ok(depth.values)
-            },
         )?;
+        depths = pipeline.render_shadows(&prepared, &materials, &maps)?;
         lights.extend(unshadowed.iter().map(|&light| RenderLight {
             light,
             shadow: None,
@@ -231,6 +220,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         pipeline.prepare_cuda_lights(
             &prepared,
             &materials,
+            &texels,
             source_lights,
             &config.shadow,
             &unshadowed,
@@ -244,8 +234,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &materials,
             render_width,
             render_height,
-            Lighting {
+            Shading {
+                texels: &texels,
                 lights: &lights,
+                maps: &maps,
+                depths: &depths,
                 camera_position: config.camera.position.into(),
             },
         )?

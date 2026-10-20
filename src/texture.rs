@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, io};
 
 use glam::{Vec2, Vec3, Vec4};
 use gltf::{
@@ -41,8 +41,9 @@ pub(crate) enum ColorSpace {
 }
 
 #[derive(Clone, Copy)]
-pub struct Texture<P = Arc<[Vec4]>> {
-    pub(crate) pixels: P,
+pub struct Texture {
+    /// First level-zero texel in the shared texel array.
+    offset: usize,
     width: u32,
     height: u32,
     levels: usize,
@@ -55,6 +56,8 @@ pub(crate) struct TextureLoader<'a> {
     images: &'a [Data],
     sampling: Sampling,
     textures: HashMap<(usize, ColorSpace), Texture>,
+    /// Every loaded mip level, in load order.
+    pub texels: Vec<Vec4>,
 }
 
 impl<'a> TextureLoader<'a> {
@@ -63,6 +66,7 @@ impl<'a> TextureLoader<'a> {
             images,
             sampling,
             textures: HashMap::new(),
+            texels: Vec::new(),
         }
     }
 
@@ -84,22 +88,25 @@ impl<'a> TextureLoader<'a> {
                         levels.push(levels.last().unwrap().downsample());
                     }
                 }
-                entry.insert(Texture {
+                let texture = entry.insert(Texture {
+                    offset: self.texels.len(),
                     width: levels[0].width,
                     height: levels[0].height,
                     levels: levels.len(),
-                    pixels: levels.into_iter().flat_map(|level| level.pixels).collect(),
                     wrap_s: WrappingMode::Repeat,
                     wrap_t: WrappingMode::Repeat,
                     sampling: self.sampling,
-                })
+                });
+                self.texels
+                    .extend(levels.into_iter().flat_map(|level| level.pixels));
+                texture
             }
         };
         let sampler = texture.sampler();
         Ok(Texture {
             wrap_s: sampler.wrap_s(),
             wrap_t: sampler.wrap_t(),
-            ..cached.clone()
+            ..*cached
         })
     }
 }
@@ -188,8 +195,8 @@ impl MipLevel {
     }
 }
 
-impl<P: AsRef<[Vec4]>> Texture<P> {
-    pub fn sample(&self, sample: UvSample) -> Vec4 {
+impl Texture {
+    pub fn sample(&self, texels: &[Vec4], sample: UvSample) -> Vec4 {
         let lod = if self.sampling == Sampling::Trilinear {
             let size = Vec2::new(self.width as f32, self.height as f32);
             let rho_squared = (sample.dx * size)
@@ -199,25 +206,25 @@ impl<P: AsRef<[Vec4]>> Texture<P> {
         } else {
             0.0
         };
-        self.sample_lod(sample.uv, lod)
+        self.sample_lod(texels, sample.uv, lod)
     }
 
-    fn sample_lod(&self, uv: Vec2, lod: f32) -> Vec4 {
+    fn sample_lod(&self, texels: &[Vec4], uv: Vec2, lod: f32) -> Vec4 {
         if self.sampling != Sampling::Trilinear {
-            return self.sample_level(uv, 0);
+            return self.sample_level(texels, uv, 0);
         }
         let lod = lod.max(0.0).min((self.levels - 1) as f32);
         let lower = lod.floor() as usize;
         let upper = (lower + 1).min(self.levels - 1);
-        let color = self.sample_level(uv, lower);
+        let color = self.sample_level(texels, uv, lower);
         if lod.fract() == 0.0 {
             return color;
         }
-        color.lerp(self.sample_level(uv, upper), lod.fract())
+        color.lerp(self.sample_level(texels, uv, upper), lod.fract())
     }
 
-    fn sample_level(&self, uv: Vec2, level: usize) -> Vec4 {
-        let (mut width, mut height, mut offset) = (self.width, self.height, 0);
+    fn sample_level(&self, texels: &[Vec4], uv: Vec2, level: usize) -> Vec4 {
+        let (mut width, mut height, mut offset) = (self.width, self.height, self.offset);
         for _ in 0..level {
             offset += width as usize * height as usize;
             width = (width / 2).max(1);
@@ -228,7 +235,7 @@ impl<P: AsRef<[Vec4]>> Texture<P> {
         let texel = |x, y| {
             let x = wrap_index(x, width, self.wrap_s);
             let y = wrap_index(y, height, self.wrap_t);
-            self.pixels.as_ref()[offset + y * width as usize + x]
+            texels[offset + y * width as usize + x]
         };
         if self.sampling == Sampling::None {
             return texel(x.floor() as i64, y.floor() as i64);
@@ -288,19 +295,4 @@ pub fn encode_srgb(color: Vec3) -> [u8; 3] {
         };
         (encoded * 255.0).round() as u8
     })
-}
-
-#[cfg(feature = "cuda")]
-impl<P> Texture<P> {
-    pub(crate) fn with_pixels<Q>(&self, pixels: Q) -> Texture<Q> {
-        Texture {
-            pixels,
-            width: self.width,
-            height: self.height,
-            levels: self.levels,
-            wrap_s: self.wrap_s,
-            wrap_t: self.wrap_t,
-            sampling: self.sampling,
-        }
-    }
 }

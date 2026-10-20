@@ -7,30 +7,35 @@ use crate::{
     texture::{ColorSpace, Sampling, Texture, TextureLoader, UvSample},
 };
 
-pub fn load_materials(asset: &GltfAsset, sampling: Sampling) -> io::Result<Vec<Material>> {
+/// Returns the materials and the texel array their textures index.
+pub fn load_materials(
+    asset: &GltfAsset,
+    sampling: Sampling,
+) -> io::Result<(Vec<Material>, Vec<Vec4>)> {
     let mut textures = TextureLoader::new(&asset.images, sampling);
-    asset
+    let materials = asset
         .document
         .materials()
         .map(|material| Material::new(material, &mut textures))
-        .collect()
+        .collect::<io::Result<_>>()?;
+    Ok((materials, textures.texels))
 }
 
 #[derive(Clone, Copy)]
-pub struct Material<T = Texture> {
+pub struct Material {
     pub base_color_factor: Vec3,
-    pub base_color_texture: Option<T>,
+    pub base_color_texture: Option<Texture>,
     pub normal_scale: f32,
-    pub normal_texture: Option<T>,
+    pub normal_texture: Option<Texture>,
     pub metallic_factor: f32,
     pub roughness_factor: f32,
-    pub metallic_roughness_texture: Option<T>,
+    pub metallic_roughness_texture: Option<Texture>,
     pub emissive_factor: Vec3,
-    pub emissive_texture: Option<T>,
+    pub emissive_texture: Option<Texture>,
     pub double_sided: bool,
 }
 
-impl<T> Default for Material<T> {
+impl Default for Material {
     fn default() -> Self {
         Self {
             base_color_factor: Vec3::ONE,
@@ -79,14 +84,18 @@ impl Material {
             double_sided: material.double_sided(),
         })
     }
-}
 
-impl<P: AsRef<[Vec4]>> Material<Texture<P>> {
-    pub fn base_color(&self, uv: UvSample) -> Vec3 {
-        self.base_color_factor * sample_texture(&self.base_color_texture, uv).truncate()
+    pub fn base_color(&self, texels: &[Vec4], uv: UvSample) -> Vec3 {
+        self.base_color_factor * sample_texture(&self.base_color_texture, texels, uv).truncate()
     }
 
-    pub fn shading_normal(&self, uv: UvSample, normal: Vec3, tangent: Vec4) -> Vec3 {
+    pub fn shading_normal(
+        &self,
+        texels: &[Vec4],
+        uv: UvSample,
+        normal: Vec3,
+        tangent: Vec4,
+    ) -> Vec3 {
         let Some(texture) = &self.normal_texture else {
             return normal;
         };
@@ -99,7 +108,7 @@ impl<P: AsRef<[Vec4]>> Material<Texture<P>> {
             return normal;
         };
         let b = normal.cross(t) * tangent.w.signum();
-        let mut sampled = texture.sample(uv).truncate() * 2.0 - Vec3::ONE;
+        let mut sampled = texture.sample(texels, uv).truncate() * 2.0 - Vec3::ONE;
         sampled.x *= self.normal_scale;
         sampled.y *= self.normal_scale;
         (t * sampled.x + b * sampled.y + normal * sampled.z)
@@ -107,23 +116,23 @@ impl<P: AsRef<[Vec4]>> Material<Texture<P>> {
             .unwrap_or(normal)
     }
 
-    pub fn metallic_roughness(&self, uv: UvSample) -> (f32, f32) {
-        let sample = sample_texture(&self.metallic_roughness_texture, uv);
+    pub fn metallic_roughness(&self, texels: &[Vec4], uv: UvSample) -> (f32, f32) {
+        let sample = sample_texture(&self.metallic_roughness_texture, texels, uv);
         (
             self.metallic_factor * sample.z,
             self.roughness_factor * sample.y,
         )
     }
 
-    pub fn emission(&self, uv: UvSample) -> Vec3 {
-        self.emissive_factor * sample_texture(&self.emissive_texture, uv).truncate()
+    pub fn emission(&self, texels: &[Vec4], uv: UvSample) -> Vec3 {
+        self.emissive_factor * sample_texture(&self.emissive_texture, texels, uv).truncate()
     }
 }
 
-fn sample_texture<P: AsRef<[Vec4]>>(texture: &Option<Texture<P>>, uv: UvSample) -> Vec4 {
+fn sample_texture(texture: &Option<Texture>, texels: &[Vec4], uv: UvSample) -> Vec4 {
     texture
         .as_ref()
-        .map_or(Vec4::ONE, |texture| texture.sample(uv))
+        .map_or(Vec4::ONE, |texture| texture.sample(texels, uv))
 }
 
 fn load_texture(
@@ -146,22 +155,4 @@ fn check_texture_transform(present: bool) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-#[cfg(feature = "cuda")]
-impl<T> Material<T> {
-    pub(crate) fn map_textures<'a, U>(&'a self, mut map: impl FnMut(&'a T) -> U) -> Material<U> {
-        Material {
-            base_color_factor: self.base_color_factor,
-            base_color_texture: self.base_color_texture.as_ref().map(&mut map),
-            normal_scale: self.normal_scale,
-            normal_texture: self.normal_texture.as_ref().map(&mut map),
-            metallic_factor: self.metallic_factor,
-            roughness_factor: self.roughness_factor,
-            metallic_roughness_texture: self.metallic_roughness_texture.as_ref().map(&mut map),
-            emissive_factor: self.emissive_factor,
-            emissive_texture: self.emissive_texture.as_ref().map(&mut map),
-            double_sided: self.double_sided,
-        }
-    }
 }

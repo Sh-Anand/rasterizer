@@ -1,32 +1,47 @@
 use std::f32::consts::PI;
 
-use glam::{Vec3, Vec4};
+use glam::Vec3;
 
 use crate::{
-    lighting::LightSample, material::Material, pipeline::FragmentAttributes, texture::Texture,
+    material::Material,
+    pipeline::{FragmentAttributes, Shading},
 };
 
-pub(crate) fn shade<P: AsRef<[Vec4]>>(
-    camera_position: Vec3,
-    material: &Material<Texture<P>>,
+pub(crate) fn shade(
+    shading: &Shading<'_>,
+    material: &Material,
     attributes: &FragmentAttributes,
     front_facing: bool,
-    lights: impl Iterator<Item = LightSample>,
 ) -> Vec3 {
-    let base_color = material.base_color(attributes.uv);
-    let normal =
-        material.shading_normal(attributes.normal_uv, attributes.normal, attributes.tangent);
+    let texels = shading.texels;
+    let position = attributes.world_position;
+    let base_color = material.base_color(texels, attributes.uv);
+    let normal = material.shading_normal(
+        texels,
+        attributes.normal_uv,
+        attributes.normal,
+        attributes.tangent,
+    );
     let normal = if front_facing { normal } else { -normal };
-    let view = (camera_position - attributes.world_position).normalize_or_zero();
-    let (metallic, roughness) = material.metallic_roughness(attributes.metallic_roughness_uv);
+    let view = (shading.camera_position - position).normalize_or_zero();
+    let (metallic, roughness) =
+        material.metallic_roughness(texels, attributes.metallic_roughness_uv);
     let brdf = Brdf::new(base_color, metallic, roughness);
     let mut reflected = Vec3::ZERO;
-    for sample in lights {
-        reflected += brdf.evaluate(normal, view, sample.direction)
-            * sample.irradiance
-            * normal.dot(sample.direction).max(0.0);
+    for light in shading.lights {
+        let Some(sample) = light.light.sample(position) else {
+            continue;
+        };
+        let visibility = light.shadow.map_or(1.0, |shadow| {
+            shadow.visibility(shading.maps, shading.depths, position)
+        });
+        if visibility > 0.0 {
+            reflected += brdf.evaluate(normal, view, sample.direction)
+                * (sample.irradiance * visibility)
+                * normal.dot(sample.direction).max(0.0);
+        }
     }
-    reflected + material.emission(attributes.emissive_uv)
+    reflected + material.emission(texels, attributes.emissive_uv)
 }
 
 const DIELECTRIC_F0: f32 = 0.04;

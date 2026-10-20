@@ -13,10 +13,8 @@ use crate::{
     fragment::shade,
     framebuffer::{Framebuffer, RenderOutput},
     geometry::ClipScene,
-    lighting::{Lighting, visible_lights},
     material::Material,
-    pipeline::{Fragment, FragmentStage},
-    shadow::LightShadow,
+    pipeline::{Fragment, FragmentStage, Shading},
 };
 use rasterization::{DepthSlice, project, rasterize};
 
@@ -27,7 +25,7 @@ impl FragmentStage for CpuFragment {
         &mut self,
         fragments: &[Fragment],
         materials: &[Material],
-        lighting: &Lighting<'_>,
+        shading: &Shading<'_>,
     ) -> io::Result<Vec<Vec3>> {
         let default_material = Material::default();
         Ok(fragments
@@ -37,15 +35,10 @@ impl FragmentStage for CpuFragment {
                     .material_index
                     .map_or(&default_material, |index| &materials[index]);
                 shade(
-                    lighting.camera_position,
+                    shading,
                     material,
                     &fragment.attributes,
                     fragment.front_facing,
-                    visible_lights(
-                        lighting.lights,
-                        fragment.attributes.world_position,
-                        LightShadow::visibility,
-                    ),
                 )
             })
             .collect())
@@ -58,9 +51,9 @@ pub fn render_reference(
     materials: &[Material],
     width: u32,
     height: u32,
-    lighting: Lighting<'_>,
+    shading: Shading<'_>,
 ) -> io::Result<RenderOutput> {
-    if !lighting.camera_position.is_finite() {
+    if !shading.camera_position.is_finite() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Non-finite camera position",
@@ -92,17 +85,8 @@ pub fn render_reference(
             },
             None,
             |index, attributes, front_facing| {
-                output.framebuffer.color[index] = shade(
-                    lighting.camera_position,
-                    material,
-                    attributes,
-                    front_facing,
-                    visible_lights(
-                        lighting.lights,
-                        attributes.world_position,
-                        LightShadow::visibility,
-                    ),
-                );
+                output.framebuffer.color[index] =
+                    shade(&shading, material, attributes, front_facing);
             },
         );
     }

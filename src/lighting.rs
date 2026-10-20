@@ -1,6 +1,6 @@
 use std::{f32::consts::PI, io};
 
-use glam::Vec3;
+use glam::{Vec3, Vec4};
 
 use crate::{
     config::LightConfig, geometry::PreparedScene, material::Material, shadow::LightShadow,
@@ -8,30 +8,9 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-pub struct RenderLight<S = LightShadow> {
+pub struct RenderLight {
     pub light: Light,
-    pub shadow: Option<S>,
-}
-
-pub struct Lighting<'a> {
-    pub lights: &'a [RenderLight],
-    pub camera_position: Vec3,
-}
-
-pub(crate) fn visible_lights<S>(
-    lights: &[RenderLight<S>],
-    position: Vec3,
-    visibility: impl Fn(&S, Vec3) -> f32,
-) -> impl Iterator<Item = LightSample> {
-    lights.iter().filter_map(move |light| {
-        let mut sample = light.light.sample(position)?;
-        let visibility = light
-            .shadow
-            .as_ref()
-            .map_or(1.0, |shadow| visibility(shadow, position));
-        sample.irradiance *= visibility;
-        (visibility > 0.0).then_some(sample)
-    })
+    pub shadow: Option<LightShadow>,
 }
 
 #[derive(Clone, Copy)]
@@ -167,6 +146,7 @@ impl AreaLight {
 pub fn collect_lights(
     scene: &PreparedScene,
     materials: &[Material],
+    texels: &[Vec4],
     config: &LightConfig,
 ) -> io::Result<Vec<Light>> {
     let mut lights = vec![Light::Directional(DirectionalLight::new(
@@ -186,7 +166,7 @@ pub fn collect_lights(
             let vertices = triangle.map(|i| primitive.vertices[i as usize]);
             let emissive_uv =
                 (vertices[0].emissive_uv + vertices[1].emissive_uv + vertices[2].emissive_uv) / 3.0;
-            let radiance = material.emission(UvSample::point(emissive_uv));
+            let radiance = material.emission(texels, UvSample::point(emissive_uv));
             if radiance == Vec3::ZERO {
                 continue;
             }

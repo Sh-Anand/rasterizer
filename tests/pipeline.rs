@@ -6,11 +6,11 @@ use rasterizer::{
     cpu::{self, CpuFragment, CpuRasterization, CpuVertex},
     framebuffer::{DepthBuffer, RenderOutput},
     geometry::{ClipPrimitive, ClipScene, ClipVertex, GltfAsset, PreparedScene, PrimitiveSource},
-    lighting::{DirectionalLight, Light, Lighting, RenderLight},
+    lighting::{DirectionalLight, Light, RenderLight},
     material::{Material, load_materials},
     pipeline::{
         Fragment, FragmentAttributes, FragmentStage, Pipeline, RasterizationStage, RasterizedScene,
-        ShadowProjection, VertexStage,
+        Shading, ShadowProjection, VertexStage,
     },
     texture::{Sampling, UvSample},
 };
@@ -89,9 +89,12 @@ fn material(color: Vec3) -> Material {
     }
 }
 
-fn lighting() -> Lighting<'static> {
-    Lighting {
+fn shading() -> Shading<'static> {
+    Shading {
+        texels: &[],
         lights: &[],
+        maps: &[],
+        depths: &[],
         camera_position: Vec3::Z,
     }
 }
@@ -126,7 +129,7 @@ fn assert_same(actual: &RenderOutput, expected: &RenderOutput) {
 fn reference(scene: &ClipScene, materials: &[Material], size: u32) -> RenderOutput {
     let mut scene = scene.clone();
     scene.primitives.sort_by_key(|p| p.source.material_index);
-    cpu::render_reference(&scene, materials, size, size, lighting()).unwrap()
+    cpu::render_reference(&scene, materials, size, size, shading()).unwrap()
 }
 
 #[derive(Default)]
@@ -140,14 +143,14 @@ impl FragmentStage for &mut RecordingFragment {
         &mut self,
         fragments: &[Fragment],
         materials: &[Material],
-        lighting: &Lighting<'_>,
+        shading: &Shading<'_>,
     ) -> io::Result<Vec<Vec3>> {
         assert!(!fragments.is_empty());
         assert_unique_samples(fragments);
         self.material_indices
             .extend(fragments.iter().map(|fragment| fragment.material_index));
         self.sample_counts.push(fragments.len());
-        CpuFragment.shade(fragments, materials, lighting)
+        CpuFragment.shade(fragments, materials, shading)
     }
 }
 
@@ -163,7 +166,7 @@ fn scene_preserves_material_order_and_shades_only_final_winners() {
     let mut fragment = RecordingFragment::default();
     let mut pipeline = Pipeline::new(CpuVertex, CpuRasterization, &mut fragment);
     let result = pipeline
-        .render_transformed(&scene, &materials, 8, 8, lighting())
+        .render_transformed(&scene, &materials, 8, 8, shading())
         .unwrap();
     assert!(
         fragment
@@ -367,9 +370,9 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
         light: Light::Directional(DirectionalLight::new([0.0, 0.0, 1.0], [1.0; 3], 1.0).unwrap()),
         shadow: None,
     }];
-    let lighting = || Lighting {
+    let shading = || Shading {
         lights: &lights,
-        ..lighting()
+        ..shading()
     };
     let opaque = Material {
         base_color_factor: Vec3::new(0.5, 0.75, 1.0),
@@ -383,7 +386,7 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
         vertex.normal_uv = Vec2::ONE;
     }
     let scene = scene(vec![triangle(Some(0), 0.5), near]);
-    let expected = cpu::render_reference(&scene, &[opaque], 16, 16, lighting()).unwrap();
+    let expected = cpu::render_reference(&scene, &[opaque], 16, 16, shading()).unwrap();
     assert!(
         expected
             .framebuffer
@@ -402,10 +405,14 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
         bias: 0.0,
     };
     let prepared_lighting = prepare_identity(&scene);
-    let shadow = |materials: &[Material]| {
-        let lights =
-            rasterizer::lighting::collect_lights(&prepared_lighting, materials, &light_config)
-                .unwrap();
+    let shadow = |materials: &[Material], texels: &[Vec4]| {
+        let lights = rasterizer::lighting::collect_lights(
+            &prepared_lighting,
+            materials,
+            texels,
+            &light_config,
+        )
+        .unwrap();
         assert_eq!(lights.len(), 3);
         let mut vertex = FixedVertex {
             scene: scene.clone(),
@@ -416,30 +423,20 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
             primitives: Vec::new(),
         };
         let mut pipeline = Pipeline::new(&mut vertex, CpuRasterization, BrokenFragment(true));
-        let prepared = rasterizer::shadow::prepare_lights(
+        let (_, maps) = rasterizer::shadow::prepare_lights(
             lights,
             &prepared_lighting.world_positions().unwrap(),
             &shadow_config,
-            |map| {
-                let mut depth = DepthBuffer::new(map.depth.width, map.depth.height)?;
-                pipeline.render_depth(
-                    &prepared_scene,
-                    map.view_projection,
-                    materials,
-                    &mut depth,
-                    map.projection,
-                )?;
-                Ok(depth.values)
-            },
         )
         .unwrap();
-        prepared
-            .iter()
-            .flat_map(|light| light.shadow.as_ref().unwrap().maps())
-            .flat_map(|map| map.depth.values.iter().map(|z| z.to_bits()))
+        pipeline
+            .render_shadows(&prepared_scene, materials, &maps)
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
             .collect::<Vec<_>>()
     };
-    let expected_shadow = shadow(&[material(Vec3::new(0.25, 0.5, 0.75))]);
+    let expected_shadow = shadow(&[material(Vec3::new(0.25, 0.5, 0.75))], &[]);
     for mode in ["OPAQUE", "MASK", "BLEND"] {
         for alpha in [0.0, 0.25, 1.0] {
             let json = format!(
@@ -464,10 +461,10 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
                 }],
             };
             for sampling in [Sampling::None, Sampling::Bilinear, Sampling::Trilinear] {
-                let materials = load_materials(&asset, sampling).unwrap();
+                let (materials, texels) = load_materials(&asset, sampling).unwrap();
                 for uv in [Vec2::new(0.25, 0.5), Vec2::new(0.75, 0.5)] {
                     assert_eq!(
-                        materials[0].base_color(UvSample::point(uv)),
+                        materials[0].base_color(&texels, UvSample::point(uv)),
                         Vec3::new(0.5, 0.75, 1.0)
                     );
                 }
@@ -480,10 +477,19 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
                         .all(|f| f.attributes.normal_uv.uv == Vec2::ONE)
                 );
                 let actual = Pipeline::new(CpuVertex, CpuRasterization, CpuFragment)
-                    .render_transformed(&scene, &materials, 16, 16, lighting())
+                    .render_transformed(
+                        &scene,
+                        &materials,
+                        16,
+                        16,
+                        Shading {
+                            texels: &texels,
+                            ..shading()
+                        },
+                    )
                     .unwrap();
                 assert_same(&actual, &expected);
-                assert_eq!(shadow(&materials), expected_shadow);
+                assert_eq!(shadow(&materials, &texels), expected_shadow);
             }
         }
     }
@@ -509,7 +515,7 @@ fn cpu_stages_preserve_clipping_mirrored_winding_and_double_sided_faces() {
     ];
     let mut pipeline = Pipeline::new(CpuVertex, CpuRasterization, CpuFragment);
     let result = pipeline
-        .render_transformed(&scene, &materials, 16, 16, lighting())
+        .render_transformed(&scene, &materials, 16, 16, shading())
         .unwrap();
     assert_same(&result, &reference(&scene, &materials, 16));
     assert!(result.framebuffer.color.contains(&Vec3::Z));
@@ -554,7 +560,7 @@ fn vertex_backend_can_be_replaced_independently() {
             &[material(Vec3::X)],
             8,
             8,
-            lighting(),
+            shading(),
         )
         .unwrap();
     assert!(vertex.called);
@@ -615,7 +621,7 @@ fn rasterization_backend_can_be_replaced_independently() {
             &[material(Vec3::Y)],
             2,
             2,
-            lighting(),
+            shading(),
         )
         .unwrap();
     assert_eq!(
@@ -632,7 +638,7 @@ impl FragmentStage for SolidFragment {
         &mut self,
         fragments: &[Fragment],
         _: &[Material],
-        _: &Lighting<'_>,
+        _: &Shading<'_>,
     ) -> io::Result<Vec<Vec3>> {
         assert!(fragments.len() > 1);
         Ok(vec![Vec3::Z; fragments.len()])
@@ -648,7 +654,7 @@ fn fragment_backend_can_be_replaced_independently() {
             &[material(Vec3::X)],
             8,
             8,
-            lighting(),
+            shading(),
         )
         .unwrap();
     assert!(result.framebuffer.color.contains(&Vec3::Z));
@@ -658,7 +664,7 @@ fn fragment_backend_can_be_replaced_independently() {
 struct BrokenFragment(bool);
 
 impl FragmentStage for BrokenFragment {
-    fn shade(&mut self, _: &[Fragment], _: &[Material], _: &Lighting<'_>) -> io::Result<Vec<Vec3>> {
+    fn shade(&mut self, _: &[Fragment], _: &[Material], _: &Shading<'_>) -> io::Result<Vec<Vec3>> {
         if self.0 {
             Err(io::Error::other("backend failure"))
         } else {
@@ -676,7 +682,7 @@ fn backend_errors_and_invalid_outputs_are_reported() {
     ] {
         let mut pipeline = Pipeline::new(CpuVertex, CpuRasterization, BrokenFragment(fail));
         let error = pipeline
-            .render_transformed(&scene, &[material(Vec3::X)], 8, 8, lighting())
+            .render_transformed(&scene, &[material(Vec3::X)], 8, 8, shading())
             .err()
             .unwrap();
         assert_eq!(error.kind(), kind);
@@ -687,7 +693,7 @@ fn backend_errors_and_invalid_outputs_are_reported() {
         CpuFragment,
     );
     let error = pipeline
-        .render_transformed(&scene, &[material(Vec3::X)], 8, 8, lighting())
+        .render_transformed(&scene, &[material(Vec3::X)], 8, 8, shading())
         .err()
         .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -698,18 +704,18 @@ fn empty_scenes_and_invalid_render_inputs_are_handled_before_shading() {
     let mut pipeline = Pipeline::new(CpuVertex, CpuRasterization, BrokenFragment(true));
     let empty = scene(Vec::new());
     let result = pipeline
-        .render_transformed(&empty, &[], 2, 2, lighting())
+        .render_transformed(&empty, &[], 2, 2, shading())
         .unwrap();
     assert_eq!(result.framebuffer.color, [Vec3::ZERO; 4]);
     assert_eq!(result.covered_fragments, 0);
     assert!(
         pipeline
-            .render_transformed(&empty, &[], 0, 2, lighting())
+            .render_transformed(&empty, &[], 0, 2, shading())
             .is_err()
     );
     assert!(
         pipeline
-            .render_transformed(&scene(vec![triangle(Some(0), 0.0)]), &[], 2, 2, lighting())
+            .render_transformed(&scene(vec![triangle(Some(0), 0.0)]), &[], 2, 2, shading())
             .is_err()
     );
     assert!(
@@ -719,9 +725,9 @@ fn empty_scenes_and_invalid_render_inputs_are_handled_before_shading() {
                 &[],
                 2,
                 2,
-                Lighting {
+                Shading {
                     camera_position: Vec3::NAN,
-                    ..lighting()
+                    ..shading()
                 }
             )
             .is_err()
@@ -757,18 +763,11 @@ fn resident_cuda_preserves_visibility_clipping_and_resource_lifetimes() {
         bias: 0.0,
     };
     for pass in 0..3 {
-        gpu.prepare_cuda_lights(&scene, &materials, vec![], &shadow, &[])
+        gpu.prepare_cuda_lights(&scene, &materials, &[], vec![], &shadow, &[])
             .unwrap();
         for (width, height) in [(65, 67), (17, 11), (65, 67)] {
             let expected = cpu
-                .render(
-                    &scene,
-                    Mat4::IDENTITY,
-                    &materials,
-                    width,
-                    height,
-                    lighting(),
-                )
+                .render(&scene, Mat4::IDENTITY, &materials, width, height, shading())
                 .unwrap();
             let actual = gpu
                 .render_cuda(&scene, Mat4::IDENTITY, &materials, width, height, Vec3::Z)
