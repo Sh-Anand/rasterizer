@@ -15,11 +15,11 @@ use rasterizer::{
     geometry::{GltfAsset, prepare_scene},
     lighting::{DirectionalLight, Light, Lighting, RenderLight, collect_lights},
     material::load_materials,
-    pipeline::{FragmentStage, Pipeline, VertexStage},
+    pipeline::Pipeline,
     shadow::prepare_lights,
 };
 
-const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light] [--cuda] [--cuda-vertex] [--cuda-rasterization]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\n--cuda: use CUDA for fragment shading (requires the cuda feature).\n--cuda-vertex: use CUDA for vertex shading, including shadow passes.\n--cuda-rasterization: keep vertex, rasterization, fragment and shadow work on CUDA.\nRender: cargo run --release -- living-room";
+const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light] [--cuda]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\n--cuda: keep vertex, rasterization, fragment and shadow work on CUDA (requires the cuda feature).\nRender: cargo run --release -- living-room";
 
 fn scene_paths() -> io::Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -108,20 +108,12 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut camera_light = false;
     let mut use_cuda = false;
-    let mut use_cuda_vertex = false;
-    let mut use_cuda_rasterization = false;
     let mut positional = Vec::new();
     for arg in env::args_os().skip(1) {
         if arg == "--camera-light" {
             camera_light = true;
         } else if arg == "--cuda" {
             use_cuda = true;
-        } else if arg == "--cuda-rasterization" {
-            use_cuda_rasterization = true;
-            use_cuda = true;
-            use_cuda_vertex = true;
-        } else if arg == "--cuda-vertex" {
-            use_cuda_vertex = true;
         } else if arg == "--help" || arg == "-h" {
             println!("{USAGE}");
             return Ok(());
@@ -133,7 +125,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut args = positional.into_iter();
     let Some(path) = args.next() else {
-        if camera_light || use_cuda || use_cuda_vertex {
+        if camera_light || use_cuda {
             return Err(format!("Expected a scene.\n\n{USAGE}").into());
         }
         list_scenes().map_err(|error| format!("Failed to list scenes: {error}"))?;
@@ -144,7 +136,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("Expected one scene name or asset path.\n\n{USAGE}").into());
     }
     #[cfg(not(feature = "cuda"))]
-    if use_cuda || use_cuda_vertex {
+    if use_cuda {
         return Err("CUDA support requires building with cargo oxide and --features cuda".into());
     }
     let path = resolve_scene(Path::new(&path))?;
@@ -166,48 +158,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("Failed to prepare '{}': {error}", path.display()))?;
     let preparation_time = started.elapsed();
     let started = Instant::now();
-    let mut cpu_vertex = cpu::CpuVertex;
-    let mut cpu_fragment = cpu::CpuFragment;
     #[cfg(feature = "cuda")]
-    let cuda_device = (use_cuda || use_cuda_vertex)
-        .then(|| rasterizer::cuda::CudaDevice::new(0))
+    let mut resident = use_cuda
+        .then(|| {
+            let device = rasterizer::cuda::CudaDevice::new(0)?;
+            Ok::<_, io::Error>(Pipeline::new(
+                rasterizer::cuda::CudaVertex::with_device(device.clone()),
+                rasterizer::cuda::CudaRasterization::with_device(device.clone()),
+                rasterizer::cuda::CudaFragment::with_device(device),
+            ))
+        })
         .transpose()?;
-    #[cfg(feature = "cuda")]
-    let mut cuda_vertex = cuda_device
-        .as_ref()
-        .filter(|_| use_cuda_vertex)
-        .map(|device| rasterizer::cuda::CudaVertex::with_device(device.clone()));
-    #[cfg(feature = "cuda")]
-    let mut cuda_fragment = cuda_device
-        .as_ref()
-        .filter(|_| use_cuda)
-        .map(|device| rasterizer::cuda::CudaFragment::with_device(device.clone()));
-    #[cfg(feature = "cuda")]
-    let mut resident = use_cuda_rasterization.then(|| {
-        Pipeline::new(
-            cuda_vertex.take().unwrap(),
-            rasterizer::cuda::CudaRasterization::with_device(cuda_device.as_ref().unwrap().clone()),
-            cuda_fragment.take().unwrap(),
-        )
-    });
-    let vertex: &mut dyn VertexStage = &mut cpu_vertex;
-    let fragment: &mut dyn FragmentStage = &mut cpu_fragment;
-    #[cfg(feature = "cuda")]
-    let vertex: &mut dyn VertexStage = match &mut cuda_vertex {
-        Some(cuda) => cuda,
-        None => vertex,
-    };
-    #[cfg(feature = "cuda")]
-    let fragment: &mut dyn FragmentStage = match &mut cuda_fragment {
-        Some(cuda) => cuda,
-        None => fragment,
-    };
-    let mut pipeline = Pipeline::new(vertex, cpu::CpuRasterization, fragment);
+    let mut pipeline = Pipeline::new(cpu::CpuVertex, cpu::CpuRasterization, cpu::CpuFragment);
     let backend_setup_time = started.elapsed();
     let started = Instant::now();
     let camera_matrix = config.camera_matrix()?;
     let frame_setup_time = started.elapsed();
-    let transformed = if use_cuda_rasterization {
+    let transformed = if use_cuda {
         None
     } else {
         Some(
@@ -236,7 +203,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Vec::new()
     };
     let mut lights = Vec::new();
-    if !use_cuda_rasterization {
+    if !use_cuda {
         lights = prepare_lights(
             source_lights.clone(),
             &prepared.world_positions()?,
@@ -317,22 +284,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
     println!("Loaded {}", path.display());
     println!("CPU workers: {threads}");
-    println!(
-        "Vertex backend: {}",
-        if use_cuda_vertex { "CUDA" } else { "CPU" }
-    );
-    println!(
-        "Fragment backend: {}",
-        if use_cuda { "CUDA" } else { "CPU" }
-    );
-    println!(
-        "Rasterization backend: {}",
-        if use_cuda_rasterization {
-            "CUDA"
-        } else {
-            "CPU"
-        }
-    );
+    println!("Backend: {}", if use_cuda { "CUDA" } else { "CPU" });
     println!("Resolution: {}x{}", config.width, config.height);
     println!(
         "Supersampling: {}x per axis ({} samples/pixel); render resolution: {render_width}x{render_height}",
@@ -371,16 +323,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Triangles loaded (selected scene, before clipping): {triangles}");
     println!("Vertices shaded: {}", stats.vertices_shaded);
     println!("Surviving fragments shaded: {}", stats.fragments_shaded);
-    println!(
-        "After clipping: {} vertices, {} triangles",
-        rendered.screen_vertices, rendered.screen_triangles
-    );
+    match rendered.screen_vertices {
+        Some(vertices) => println!(
+            "After clipping: {vertices} vertices, {} triangles",
+            rendered.screen_triangles
+        ),
+        None => println!("After clipping: {} triangles", rendered.screen_triangles),
+    }
     println!(
         "Covered fragments (before depth testing): {}",
         rendered.covered_fragments
     );
     println!("Timings (static scene with camera changes):");
-    if use_cuda_rasterization {
+    if use_cuda {
         println!(
             "  CUDA stage times use events; remaining wall time includes uploads, readback and host setup."
         );
@@ -408,7 +363,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     (frame_setup_time + render_time).saturating_sub(
                         stats.rasterization_time
                             + stats.fragment_time
-                            + if use_cuda_rasterization {
+                            + if use_cuda {
                                 stats.vertex_time
                             } else {
                                 Duration::ZERO
@@ -430,22 +385,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "    Total {category}: {:.3} ms",
             total.as_secs_f32() * 1000.0
         );
-    }
-    #[cfg(feature = "cuda")]
-    if let Some(cuda) = &cuda_fragment {
-        let timings = cuda.timings();
-        println!("  CUDA fragment breakdown:");
-        for (name, duration) in [
-            ("Resource packing", timings.packing),
-            ("Allocation + upload", timings.upload),
-            (
-                "Dispatch (CUDA events, includes cold launch)",
-                timings.dispatch,
-            ),
-            ("Readback", timings.readback),
-        ] {
-            println!("    {name}: {:.3} ms", duration.as_secs_f32() * 1000.0);
-        }
     }
     println!(
         "  PNG encoding + write (excluded from totals): {:.3} ms",

@@ -143,7 +143,6 @@ impl<V, R, F> Pipeline<V, R, F> {
 
 impl<V: VertexStage, R, F: FragmentStage> Pipeline<V, R, F> {
     /// Invalidate cached geometry and shading resources.
-    /// Resident CUDA requires prepare_cuda_lights again before rendering.
     pub fn invalidate_resources(&mut self) {
         self.vertex.invalidate_resources();
         self.fragment.invalidate_resources();
@@ -249,7 +248,7 @@ impl<V: VertexStage, R: RasterizationStage, F: FragmentStage> Pipeline<V, R, F> 
         Ok(RenderOutput {
             framebuffer,
             covered_fragments: rasterized.covered_fragments,
-            screen_vertices: rasterized.screen_vertices,
+            screen_vertices: Some(rasterized.screen_vertices),
             screen_triangles: rasterized.screen_triangles,
         })
     }

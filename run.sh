@@ -25,6 +25,6 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/nvvm/lib64${LD_LIBRARY_PATH:
         --cargo-target-dir target/gpu -- --release
 )
 if (( $# )); then
-    set -- "$@" --cuda-rasterization
+    set -- "$@" --cuda
 fi
 exec "$root/target/gpu/release/rasterizer" "$@"

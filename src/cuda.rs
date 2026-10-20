@@ -1,33 +1,21 @@
-use std::{
-    collections::HashMap,
-    io,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
 use cuda_core::{
     CudaContext, CudaEvent, CudaStream, DeviceBuffer,
     simt::{LaunchConfig, memory},
 };
-use cuda_device::{
-    atomic::{DeviceAtomicU32, DeviceAtomicU64},
-    cuda_module,
-};
+use cuda_device::{atomic::DeviceAtomicU64, cuda_module};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
 use crate::{
     config::ShadowConfig,
     framebuffer::{DepthBuffer, Framebuffer, RenderOutput},
     geometry::{
-        ClipPrimitive, ClipScene, ClipVertex, PreparedScene, PreparedVertex, VertexTransform,
-        check_view_projection,
+        ClipVertex, PreparedScene, PreparedVertex, VertexTransform, check_view_projection,
     },
-    lighting::{Light, Lighting, RenderLight, visible_lights},
+    lighting::{Light, RenderLight, visible_lights},
     material::Material,
-    pipeline::{
-        Fragment, FragmentAttributes, FragmentStage, Pipeline, PipelineStats, ShadowProjection,
-        VertexStage,
-    },
+    pipeline::{FragmentAttributes, Pipeline, PipelineStats, ShadowProjection},
     rasterization::{
         Polygon, ScreenVertex, Triangle, UvGradients, clip_triangle, interpolate_attributes,
         outcode, project_vertex,
@@ -182,16 +170,6 @@ impl<T> Buffer<T> {
     }
 }
 
-#[derive(Default, Debug)]
-pub struct CudaTimings {
-    pub packing: Duration,
-    /// Allocation and host-to-device copies.
-    pub upload: Duration,
-    /// CUDA event interval around dispatch, including any cold launch delay.
-    pub dispatch: Duration,
-    pub readback: Duration,
-}
-
 pub struct CudaDevice {
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
@@ -213,8 +191,6 @@ impl CudaDevice {
 
 pub struct CudaFragment {
     device: Arc<CudaDevice>,
-    timings: CudaTimings,
-    resource_key: Option<(usize, usize, usize, usize)>,
     resident_key: Option<(usize, usize, usize, usize)>,
     fragments: Buffer<f32>,
     fragment_meta: Buffer<u32>,
@@ -227,15 +203,9 @@ pub struct CudaFragment {
 }
 
 impl CudaFragment {
-    pub fn new(device: usize) -> io::Result<Self> {
-        Ok(Self::with_device(CudaDevice::new(device)?))
-    }
-
     pub fn with_device(device: Arc<CudaDevice>) -> Self {
         let context = device.stream.context();
         Self {
-            timings: CudaTimings::default(),
-            resource_key: None,
             resident_key: None,
             fragments: Buffer::new(context),
             fragment_meta: Buffer::new(context),
@@ -249,13 +219,8 @@ impl CudaFragment {
         }
     }
 
-    pub fn timings(&self) -> &CudaTimings {
-        &self.timings
-    }
-
     fn upload_materials(&mut self, materials: &[Material]) -> io::Result<()> {
         u32::try_from(materials.len()).map_err(io::Error::other)?;
-        let started = Instant::now();
         let mut pixels = Vec::new();
         let mut pixel_count = 0;
         let mut textures = HashMap::new();
@@ -273,62 +238,10 @@ impl CudaFragment {
                 })
             })
             .collect();
-        self.timings.packing += started.elapsed();
-        let started = Instant::now();
         unsafe {
             self.materials.upload(&[&materials])?;
             self.pixels.upload(&pixels)?;
         }
-        self.timings.upload += started.elapsed();
-        Ok(())
-    }
-
-    fn upload_resources(
-        &mut self,
-        materials: &[Material],
-        lights: &[RenderLight],
-    ) -> io::Result<()> {
-        let key = (
-            materials.as_ptr() as usize,
-            materials.len(),
-            lights.as_ptr() as usize,
-            lights.len(),
-        );
-        if self.resource_key == Some(key) {
-            return Ok(());
-        }
-        self.invalidate_resources();
-        self.upload_materials(materials)?;
-        let started = Instant::now();
-        let mut depths = Vec::new();
-        let mut depth_count = 0;
-        let mut maps = Vec::new();
-        let lights: Vec<_> = lights
-            .iter()
-            .map(|light| RenderLight {
-                light: light.light,
-                shadow: light.shadow.as_ref().map(|shadow| {
-                    let start = maps.len();
-                    for map in shadow.maps() {
-                        let offset = depth_count;
-                        depth_count += map.depth.values.len();
-                        depths.push(map.depth.values.as_slice());
-                        maps.push(map.with_depth([offset, depth_count]));
-                    }
-                    shadow.with_maps([start, maps.len()])
-                }),
-            })
-            .collect();
-        self.timings.packing += started.elapsed();
-        let started = Instant::now();
-        // Packed descriptors contain offsets; pixel and depth slices contain values only.
-        unsafe {
-            self.lights.upload(&[&lights])?;
-            self.maps.upload(&[&maps])?;
-            self.depths.upload(&depths)?;
-        }
-        self.timings.upload += started.elapsed();
-        self.resource_key = Some(key);
         Ok(())
     }
 
@@ -349,7 +262,6 @@ impl CudaFragment {
                     block_dim: (block, 1, 1),
                     shared_mem_bytes: 0,
                 },
-                count,
                 &self.fragments.device,
                 &self.fragment_meta.device,
                 winners,
@@ -377,71 +289,6 @@ impl CudaFragment {
     }
 }
 
-impl FragmentStage for CudaFragment {
-    fn invalidate_resources(&mut self) {
-        self.resource_key = None;
-        self.resident_key = None;
-    }
-
-    fn shade(
-        &mut self,
-        fragments: &[Fragment],
-        materials: &[Material],
-        lighting: &Lighting<'_>,
-    ) -> io::Result<Vec<Vec3>> {
-        self.timings = CudaTimings::default();
-        if fragments.is_empty() {
-            return Ok(Vec::new());
-        }
-        let count = u32::try_from(fragments.len()).map_err(io::Error::other)?;
-        if fragments
-            .iter()
-            .any(|f| f.material_index.is_some_and(|i| i >= materials.len()))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Fragment material index is outside the material list",
-            ));
-        }
-        self.device
-            .stream
-            .context()
-            .bind_to_thread()
-            .map_err(io::Error::other)?;
-        self.upload_resources(materials, lighting.lights)?;
-        let started = Instant::now();
-        let stride = padded_count(fragments.len());
-        let mut values = vec![0.0; stride * FragmentAttributes::COMPONENTS];
-        let mut meta = vec![0; 2 * stride];
-        for (i, fragment) in fragments.iter().enumerate() {
-            fragment
-                .attributes
-                .store_soa(i, |offset, v| values[offset] = v);
-            meta[soa_offset::<2>(i, 0)] = fragment.material_index.map_or(u32::MAX, |i| i as u32);
-            meta[soa_offset::<2>(i, 1)] = u32::from(fragment.front_facing);
-        }
-        self.timings.packing += started.elapsed();
-        let started = Instant::now();
-        unsafe {
-            self.fragments.upload(&[&values])?;
-            self.fragment_meta.upload(&[&meta])?;
-        }
-        self.colors.resize(stride)?;
-        self.timings.upload += started.elapsed();
-        let events = self.shade_device(
-            count,
-            &Buffer::<DeviceAtomicU64>::new(self.device.stream.context()).device,
-            lighting.camera_position,
-        )?;
-        events.1.synchronize().map_err(io::Error::other)?;
-        self.timings.dispatch = elapsed(&events)?;
-        let started = Instant::now();
-        let colors = self.read_colors(fragments.len())?;
-        self.timings.readback = started.elapsed();
-        Ok(colors)
-    }
-}
-
 #[derive(Clone, Copy)]
 struct CudaTriangle {
     vertices: [u32; 3],
@@ -456,7 +303,6 @@ struct CudaPrimitive {
 
 pub struct CudaVertex {
     device: Arc<CudaDevice>,
-    timings: CudaTimings,
     resource_key: Option<(usize, usize)>,
     vertices: Buffer<f32>,
     primitive_indices: Buffer<u32>,
@@ -465,18 +311,12 @@ pub struct CudaVertex {
     triangles: Buffer<CudaTriangle>,
     primitives: Buffer<CudaPrimitive>,
     error: Buffer<DeviceAtomicU64>,
-    readback: Vec<f32>,
 }
 
 impl CudaVertex {
-    pub fn new(device: usize) -> io::Result<Self> {
-        Ok(Self::with_device(CudaDevice::new(device)?))
-    }
-
     pub fn with_device(device: Arc<CudaDevice>) -> Self {
         let context = device.stream.context();
         Self {
-            timings: CudaTimings::default(),
             resource_key: None,
             vertices: Buffer::new(context),
             primitive_indices: Buffer::new(context),
@@ -485,7 +325,6 @@ impl CudaVertex {
             triangles: Buffer::new(context),
             primitives: Buffer::new(context),
             error: Buffer::new(context),
-            readback: Vec::new(),
             device,
         }
     }
@@ -495,7 +334,6 @@ impl CudaVertex {
         scene: &PreparedScene,
         view_projection: Mat4,
     ) -> io::Result<(CudaEvent, CudaEvent)> {
-        self.timings = CudaTimings::default();
         check_view_projection(view_projection)?;
         let count = scene
             .primitives
@@ -511,8 +349,7 @@ impl CudaVertex {
             .map_err(io::Error::other)?;
         let key = (scene.primitives.as_ptr() as usize, scene.primitives.len());
         if self.resource_key != Some(key) {
-            self.invalidate_resources();
-            let started = Instant::now();
+            self.resource_key = None;
             let triangle_count = scene
                 .primitives
                 .iter()
@@ -558,8 +395,6 @@ impl CudaVertex {
             }
             // Camera ranks index this stable material order; shadows retain source order.
             triangles.sort_by_key(|t| primitives[t.primitive as usize].material_index);
-            self.timings.packing += started.elapsed();
-            let started = Instant::now();
             // Geometry and descriptors contain values and indices, never host pointers.
             unsafe {
                 self.vertices.upload(&[&vertices])?;
@@ -567,24 +402,19 @@ impl CudaVertex {
                 self.triangles.upload(&[&triangles])?;
                 self.primitives.upload(&[&primitives])?;
             }
-            self.timings.upload += started.elapsed();
             self.resource_key = Some(key);
         }
-        let started = Instant::now();
         let transforms: Vec<_> = scene
             .primitives
             .iter()
             .map(|primitive| VertexTransform::new(primitive, view_projection))
             .collect();
-        self.timings.packing += started.elapsed();
-        let started = Instant::now();
         // Transform descriptors contain only matrices and a scalar sign.
         unsafe { self.transforms.upload(&[&transforms])? };
         let output = self
             .output
             .resize(padded_count(count as usize) * ClipVertex::COMPONENTS)?;
         self.error.resize(1)?;
-        self.timings.upload += started.elapsed();
         let start = self.device.event()?;
         self.error.fill(255, &self.device.stream)?;
         if count != 0 {
@@ -604,54 +434,6 @@ impl CudaVertex {
             }
         }
         Ok((start, self.device.event()?))
-    }
-
-    pub fn timings(&self) -> &CudaTimings {
-        &self.timings
-    }
-}
-
-impl VertexStage for CudaVertex {
-    fn invalidate_resources(&mut self) {
-        self.resource_key = None;
-    }
-
-    fn transform(&mut self, scene: &PreparedScene, view_projection: Mat4) -> io::Result<ClipScene> {
-        let events = self.transform_device(scene, view_projection)?;
-        events.1.synchronize().map_err(io::Error::other)?;
-        let count = self.output.device.len();
-        let output = &self.output.device;
-        let started = Instant::now();
-        self.readback.resize(count, 0.0);
-        if count != 0 {
-            output
-                .copy_to_host(&self.device.stream, &mut self.readback)
-                .map_err(io::Error::other)?;
-        }
-        let mut vertices = (0..self.primitive_indices.device.len())
-            .map(|i| ClipVertex::load_soa(&self.readback, i));
-        let primitives = scene
-            .primitives
-            .iter()
-            .map(|primitive| {
-                Ok(ClipPrimitive {
-                    source: primitive.source,
-                    mirrored: primitive.mirrored,
-                    vertices: vertices
-                        .by_ref()
-                        .take(primitive.vertices.len())
-                        .map(|vertex| vertex.checked(primitive))
-                        .collect::<io::Result<_>>()?,
-                    triangles: primitive.triangles.clone(),
-                })
-            })
-            .collect::<io::Result<_>>()?;
-        self.timings.readback = started.elapsed();
-        self.timings.dispatch = elapsed(&events)?;
-        Ok(ClipScene {
-            scene_index: scene.scene_index,
-            primitives,
-        })
     }
 }
 
@@ -700,34 +482,20 @@ mod kernels {
         }
     }
 
-    fn mark_vertex(used: &[DeviceAtomicU32], source: Option<u32>) -> u32 {
-        if used.is_empty() {
-            return 0;
-        }
-        match source {
-            Some(i) => {
-                let bit = 1 << (i % 32);
-                u32::from(used[i as usize / 32].fetch_or(bit, AtomicOrdering::Relaxed) & bit == 0)
-            }
-            None => 1,
-        }
-    }
-
     fn project_faces(
         vertices: &[f32],
         triangle: &CudaTriangle,
         width: u32,
         height: u32,
-        used: &[DeviceAtomicU32],
         mut emit: impl FnMut(&[ScreenVertex; 3], u32),
-    ) -> Result<[u32; 2], crate::rasterization::RasterError> {
+    ) -> Result<u32, crate::rasterization::RasterError> {
         let codes = triangle.vertices.map(|i| {
             outcode(Vec4::from_array(std::array::from_fn(|c| {
                 vertices[soa_offset::<22>(i as usize, c)]
             })))
         });
         if codes[0] & codes[1] & codes[2] != 0 {
-            return Ok([0, 0]);
+            return Ok(0);
         }
         // Most triangles avoid the clipping scratch entirely.
         if codes[0] | codes[1] | codes[2] == 0 {
@@ -738,14 +506,8 @@ mod kernels {
                     height as f32,
                 )
             });
-            let points = [a?, b?, c?];
-            let count = triangle
-                .vertices
-                .iter()
-                .map(|&i| mark_vertex(used, Some(i)))
-                .sum();
-            emit(&points, 0);
-            return Ok([count, 1]);
+            emit(&[a?, b?, c?], 0);
+            return Ok(1);
         }
         let mut polygon = Polygon::default();
         clip_triangle(
@@ -755,7 +517,7 @@ mod kernels {
             &mut polygon,
         )?;
         if polygon.len < 3 {
-            return Ok([0, 0]);
+            return Ok(0);
         }
         let first = project_vertex(polygon.vertices[0].0, width as f32, height as f32)?;
         let mut previous = project_vertex(polygon.vertices[1].0, width as f32, height as f32)?;
@@ -764,11 +526,7 @@ mod kernels {
             emit(&[first, previous, current], fan as u32);
             previous = current;
         }
-        let count = polygon.vertices[..polygon.len]
-            .iter()
-            .map(|&(_, source)| mark_vertex(used, source))
-            .sum();
-        Ok([count, (polygon.len - 2) as u32])
+        Ok((polygon.len - 2) as u32)
     }
 
     fn raster_samples(
@@ -818,13 +576,12 @@ mod kernels {
         height: u32,
         shadow: Option<ShadowProjection>,
         winners: &[DeviceAtomicU64],
-        used: &[DeviceAtomicU32],
         stats: &[DeviceAtomicU64],
         error: &[DeviceAtomicU64],
         mut large: DisjointSlice<[u32; 2]>,
     ) {
         let index = thread::index_1d().get();
-        let mut counts = [0u32; 3];
+        let mut counts = [0u32; 2];
         if let Some(triangle) = triangles.get(index)
             && error[0].load(AtomicOrdering::Relaxed) == u64::MAX
         {
@@ -838,7 +595,7 @@ mod kernels {
                 index as u32
             } * 7;
             let mut parts = 0;
-            match project_faces(vertices, triangle, width, height, used, |points, fan| {
+            match project_faces(vertices, triangle, width, height, |points, fan| {
                 if let Some(setup) = Triangle::new(points, primitive.mirrored, double_sided, shadow)
                 {
                     let (xs, ys) = setup.bounds(width, 0..height);
@@ -851,10 +608,7 @@ mod kernels {
                     }
                 }
             }) {
-                Ok([vertices, triangles]) => {
-                    counts[1] = vertices;
-                    counts[2] = triangles;
-                }
+                Ok(triangles) => counts[1] = triangles,
                 Err(reason) => {
                     error[0].fetch_min(
                         ((triangle.source_index as u64) << 32) | (10 + reason as u64),
@@ -863,14 +617,14 @@ mod kernels {
                 }
             }
             if parts != 0 {
-                let slot = stats[4].fetch_add(1, AtomicOrdering::Relaxed) as usize;
+                let slot = stats[3].fetch_add(1, AtomicOrdering::Relaxed) as usize;
                 // Each input triangle reserves at most one unique slot.
                 unsafe {
                     *large.get_unchecked_mut(slot) = [index as u32, parts as u32];
                 }
             }
         }
-        for i in 0..3 {
+        for i in 0..2 {
             count_warp(&stats[i], counts[i]);
         }
     }
@@ -896,13 +650,13 @@ mod kernels {
         loop {
             if lane == 0 {
                 unsafe {
-                    JOB[0] = stats[5].fetch_add(1, AtomicOrdering::Relaxed);
+                    JOB[0] = stats[4].fetch_add(1, AtomicOrdering::Relaxed);
                     LENGTH[0] = 0;
                 }
             }
             thread::sync_threads();
             let job = unsafe { JOB[0] as usize };
-            if job >= stats[4].load(AtomicOrdering::Relaxed) as usize * MAX_PARTS {
+            if job >= stats[3].load(AtomicOrdering::Relaxed) as usize * MAX_PARTS {
                 return;
             }
             let [index, parts] = large[job / MAX_PARTS];
@@ -922,7 +676,6 @@ mod kernels {
                     &triangle,
                     width,
                     height,
-                    &[],
                     |points, fan| unsafe {
                         SETUPS[fan as usize] =
                             Triangle::new(points, primitive.mirrored, double_sided, shadow);
@@ -989,7 +742,7 @@ mod kernels {
                 let triangle = triangles[(rank / 7) as usize];
                 let primitive = primitives[triangle.primitive as usize];
                 if let Err(reason) =
-                    project_faces(vertices, &triangle, width, height, &[], |points, fan| {
+                    project_faces(vertices, &triangle, width, height, |points, fan| {
                         if fan != rank % 7 {
                             return;
                         }
@@ -1029,7 +782,7 @@ mod kernels {
                 winners[index].store(u64::MAX, AtomicOrdering::Relaxed);
             }
         }
-        count_warp(&stats[3], shaded);
+        count_warp(&stats[2], shaded);
     }
 
     #[kernel]
@@ -1041,21 +794,17 @@ mod kernels {
         mut output: DisjointSlice<f32>,
     ) {
         let offset = thread::index_1d().get();
-        let stride = output.len() / ClipVertex::COMPONENTS;
-        if offset < stride {
-            let mut vertex = ClipVertex::default();
-            if let Some(&primitive) = primitive_indices.get(offset) {
-                let transform = &transforms[primitive as usize];
-                vertex = transform.apply(&PreparedVertex::load_soa(vertices, offset));
-                let invalid = vertex.invalid(transform.flat_shaded);
-                if invalid != 0 {
-                    error[0].fetch_min(
-                        ((offset as u64) << 32) | u64::from(invalid),
-                        AtomicOrdering::Relaxed,
-                    );
-                }
+        if let Some(&primitive) = primitive_indices.get(offset) {
+            let transform = &transforms[primitive as usize];
+            let vertex = transform.apply(&PreparedVertex::load_soa(vertices, offset));
+            let invalid = vertex.invalid(transform.flat_shaded);
+            if invalid != 0 {
+                error[0].fetch_min(
+                    ((offset as u64) << 32) | u64::from(invalid),
+                    AtomicOrdering::Relaxed,
+                );
             }
-            // Include padding lanes so mixed-backend readback is fully initialized.
+            // Each lane owns its index in every component plane.
             vertex.store_soa(offset, |index, v| unsafe {
                 *output.get_unchecked_mut(index) = v;
             });
@@ -1064,7 +813,6 @@ mod kernels {
 
     #[kernel]
     pub fn shade(
-        count: u32,
         fragments: &[f32],
         fragment_meta: &[u32],
         winners: &[DeviceAtomicU64],
@@ -1080,8 +828,9 @@ mod kernels {
         let stride = colors.len();
         if offset < stride {
             let mut color = Vec3::ZERO;
-            if offset < count as usize
-                && (winners.is_empty() || winners[offset].load(AtomicOrdering::Relaxed) != u64::MAX)
+            if winners
+                .get(offset)
+                .is_some_and(|winner| winner.load(AtomicOrdering::Relaxed) != u64::MAX)
             {
                 let attributes = FragmentAttributes::load_soa(fragments, offset);
                 let material_index = fragment_meta[soa_offset::<2>(offset, 0)];
@@ -1143,7 +892,6 @@ fn elapsed(events: &(CudaEvent, CudaEvent)) -> io::Result<Duration> {
 pub struct CudaRasterization {
     device: Arc<CudaDevice>,
     winners: Buffer<DeviceAtomicU64>,
-    used: Buffer<DeviceAtomicU32>,
     counters: Buffer<DeviceAtomicU64>,
     depth: Buffer<f32>,
     large: Buffer<[u32; 2]>,
@@ -1154,7 +902,6 @@ impl CudaRasterization {
         let context = device.stream.context();
         Self {
             winners: Buffer::new(context),
-            used: Buffer::new(context),
             counters: Buffer::new(context),
             depth: Buffer::new(context),
             large: Buffer::new(context),
@@ -1172,10 +919,8 @@ impl CudaRasterization {
     ) -> io::Result<(CudaEvent, CudaEvent)> {
         let count = sample_count(width, height)?;
         self.winners.resize(count as usize)?;
-        self.used
-            .resize(vertex.primitive_indices.device.len().div_ceil(32))?;
-        // Coverage, projected vertices/triangles, winners, queue length/cursor.
-        self.counters.resize(6)?;
+        // Coverage, projected triangles, winners, queue length/cursor.
+        self.counters.resize(5)?;
         self.large.resize(vertex.triangles.device.len())?;
         if shadow.is_none() {
             fragment
@@ -1189,7 +934,6 @@ impl CudaRasterization {
         let stream = &self.device.stream;
         let start = self.device.event()?;
         self.winners.fill(255, stream)?;
-        self.used.fill(0, stream)?;
         self.counters.fill(0, stream)?;
         if !vertex.triangles.device.is_empty() {
             unsafe {
@@ -1206,7 +950,6 @@ impl CudaRasterization {
                         height,
                         shadow,
                         &self.winners.device,
-                        &self.used.device,
                         &self.counters.device,
                         &vertex.error.device,
                         &mut self.large.device,
@@ -1263,6 +1006,12 @@ impl CudaRasterization {
 }
 
 impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
+    /// Invalidate cached geometry and shading resources; prepare_cuda_lights must run again.
+    pub fn invalidate_resources(&mut self) {
+        self.vertex.resource_key = None;
+        self.fragment.resident_key = None;
+    }
+
     fn check_cuda(&self, scene: &PreparedScene, materials: &[Material]) -> io::Result<()> {
         if !Arc::ptr_eq(&self.vertex.device, &self.rasterization.device)
             || !Arc::ptr_eq(&self.vertex.device, &self.fragment.device)
@@ -1300,8 +1049,7 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
         unshadowed_lights: &[Light],
     ) -> io::Result<()> {
         self.check_cuda(scene, materials)?;
-        self.fragment.invalidate_resources();
-        self.fragment.timings = CudaTimings::default();
+        self.fragment.resident_key = None;
         self.fragment.upload_materials(materials)?;
         let mut depth_count = 0usize;
         let positions = if config.enabled && !lights.is_empty() {
@@ -1417,7 +1165,7 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
         self.stats.rasterization_time = elapsed(&raster_events)?;
         self.stats.fragment_time = elapsed(&fragment_events)?;
         self.stats.vertices_shaded = self.vertex.primitive_indices.device.len();
-        self.stats.fragments_shaded = counters[3] as usize;
+        self.stats.fragments_shaded = counters[2] as usize;
         Ok(RenderOutput {
             framebuffer: Framebuffer {
                 color,
@@ -1428,8 +1176,8 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
                 },
             },
             covered_fragments: counters[0],
-            screen_vertices: counters[1] as usize,
-            screen_triangles: counters[2] as usize,
+            screen_vertices: None,
+            screen_triangles: counters[1] as usize,
         })
     }
 }

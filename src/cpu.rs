@@ -69,7 +69,7 @@ pub fn render_reference(
     let mut output = RenderOutput {
         framebuffer: Framebuffer::new(width, height)?,
         covered_fragments: 0,
-        screen_vertices: 0,
+        screen_vertices: Some(0),
         screen_triangles: 0,
     };
     let default_material = Material::default();
@@ -79,7 +79,7 @@ pub fn render_reference(
             .material_index
             .map_or(&default_material, |i| &materials[i]);
         let screen = project(primitive, width, height)?;
-        output.screen_vertices += screen.vertices.len();
+        *output.screen_vertices.get_or_insert(0) += screen.vertices.len();
         output.screen_triangles += screen.triangles.len();
         output.covered_fragments += rasterize(
             &screen,

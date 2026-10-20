@@ -7,7 +7,8 @@ use crate::{config::OutputConfig, texture::encode_srgb};
 pub struct RenderOutput {
     pub framebuffer: Framebuffer,
     pub covered_fragments: u64,
-    pub screen_vertices: usize,
+    /// CUDA does not count post-clipping vertices.
+    pub screen_vertices: Option<usize>,
     pub screen_triangles: usize,
 }
 
