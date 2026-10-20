@@ -41,7 +41,7 @@ pub enum Light {
 }
 
 impl Light {
-    pub fn sample(self, position: Vec3) -> Option<LightSample> {
+    pub fn sample(&self, position: Vec3) -> Option<LightSample> {
         match self {
             Self::Directional(light) => Some(LightSample {
                 direction: light.direction,

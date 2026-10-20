@@ -192,7 +192,7 @@ pub(super) fn project(
     let mut polygon = Polygon::default();
     for triangle in &primitive.triangles {
         clip_triangle(
-            &primitive.vertices,
+            |i| primitive.vertices[i as usize],
             *triangle,
             triangle.map(|i| codes[i as usize]),
             &mut polygon,

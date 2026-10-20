@@ -231,7 +231,7 @@ impl Polygon {
 }
 
 pub(crate) fn clip_triangle(
-    vertices: &[ClipVertex],
+    vertex: impl Fn(u32) -> ClipVertex,
     triangle: [u32; 3],
     codes: [u8; 3],
     polygon: &mut Polygon,
@@ -241,7 +241,7 @@ pub(crate) fn clip_triangle(
         return Ok(());
     }
     for i in triangle {
-        polygon.push((vertices[i as usize], Some(i)))?;
+        polygon.push((vertex(i), Some(i)))?;
     }
     if codes[0] | codes[1] | codes[2] != 0 {
         let mut scratch = Polygon::default();

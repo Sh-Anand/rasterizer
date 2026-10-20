@@ -119,10 +119,12 @@ impl<M> LightShadow<M> {
         let maps = self.maps().as_ref();
         let get_map = |face| {
             maps.get(face)
-                .map(|map: &ShadowMap<P>| map.with_depth(depth(&map.depth.values)))
+                .map(|map: &ShadowMap<P>| (map, depth(&map.depth.values)))
         };
         match self {
-            Self::Directional(_) => get_map(0).map_or(1.0, |map| map.visibility(world_position)),
+            Self::Directional(_) => get_map(0).map_or(1.0, |(map, values)| {
+                map.visibility_with(world_position, values)
+            }),
             Self::Area {
                 position, basis, ..
             } => {
@@ -131,7 +133,7 @@ impl<M> LightShadow<M> {
                     return 1.0;
                 }
                 let face = cube_face(direction);
-                let Some(map) = get_map(face) else {
+                let Some((map, values)) = get_map(face) else {
                     return 1.0;
                 };
                 let Some(projected) = map.project(world_position) else {
@@ -140,7 +142,7 @@ impl<M> LightShadow<M> {
                 pcf(projected.truncate(), |texel| {
                     let outside = texel.cmplt(IVec2::ZERO) | texel.cmpge(map.size().as_ivec2());
                     if !outside.any() {
-                        return map.compare(texel, projected.z);
+                        return map.compare(texel, projected.z, values);
                     }
                     let uv = (texel.as_vec2() + 0.5) / map.size();
                     let ray = cube_basis(face) * Vec3::new(2.0 * uv.x - 1.0, 1.0 - 2.0 * uv.y, 1.0);
@@ -220,13 +222,18 @@ impl<P> ShadowMap<P> {
             bias: self.bias,
         }
     }
-}
 
-impl<P: AsRef<[f32]>> ShadowMap<P> {
-    pub fn visibility(&self, world_position: Vec3) -> f32 {
+    pub fn visibility(&self, world_position: Vec3) -> f32
+    where
+        P: AsRef<[f32]>,
+    {
+        self.visibility_with(world_position, self.depth.values.as_ref())
+    }
+
+    fn visibility_with(&self, world_position: Vec3, values: &[f32]) -> f32 {
         self.project(world_position).map_or(1.0, |projected| {
             pcf(projected.truncate(), |texel| {
-                self.compare(texel, projected.z)
+                self.compare(texel, projected.z, values)
             })
         })
     }
@@ -260,12 +267,10 @@ impl<P: AsRef<[f32]>> ShadowMap<P> {
         Some(pixel.extend(self.reference_depth(clip)))
     }
 
-    fn compare(&self, texel: IVec2, depth: f32) -> f32 {
+    fn compare(&self, texel: IVec2, depth: f32, values: &[f32]) -> f32 {
         let x = texel.x.clamp(0, self.depth.width as i32 - 1) as usize;
         let y = texel.y.clamp(0, self.depth.height as i32 - 1) as usize;
-        f32::from(
-            depth <= self.depth.values.as_ref()[y * self.depth.width as usize + x] + self.bias,
-        )
+        f32::from(depth <= values[y * self.depth.width as usize + x] + self.bias)
     }
 }
 
@@ -308,13 +313,13 @@ fn cube_face(direction: Vec3) -> usize {
     2 * axis + usize::from(direction[axis] < 0.0)
 }
 
-fn cube_compare<P: AsRef<[f32]>>(
-    get_map: impl Fn(usize) -> Option<ShadowMap<P>>,
+fn cube_compare<'a, P: 'a>(
+    get_map: impl Fn(usize) -> Option<(&'a ShadowMap<P>, &'a [f32])>,
     world_position: Vec3,
     ray: Vec3,
     face: usize,
 ) -> f32 {
-    let Some(map) = get_map(face) else {
+    let Some((map, values)) = get_map(face) else {
         return 1.0;
     };
     let ray = cube_basis(face).transpose() * ray;
@@ -323,7 +328,7 @@ fn cube_compare<P: AsRef<[f32]>>(
         .as_ivec2();
     // Each face stores linear depth along its own view axis.
     let depth = map.reference_depth(map.view_projection * world_position.extend(1.0));
-    map.compare(texel, depth)
+    map.compare(texel, depth, values)
 }
 
 fn light_matrix(positions: &[Vec3], direction: Vec3) -> io::Result<Mat4> {
