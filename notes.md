@@ -82,7 +82,7 @@ Treat every material as fully opaque. Ignore alpha mode, alpha cutoff, base-colo
 
 ## Runtime material shading
 
-Use one global material-texture filter: `none` (nearest), `bilinear` (level zero), or `trilinear` (mipmapped). Override glTF filter choices but preserve wrap modes. Filter color textures in linear RGB; data maps stay linear. Alpha is ignored. Rasterized passes use analytic perspective-correct UV gradients instead of GPU quad derivatives; non-rasterized point queries use level zero.
+Use one global material-texture filter: `none` (nearest texel of the nearest mip level), `bilinear` (level zero), or `trilinear` (mipmapped). `none` reads one texel per texture, as an on-sample neural decoder evaluates one texel; it is the initial NTC mode and its baseline, aliasing instead of the noise stochastic filtering would add. Override glTF filter choices but preserve wrap modes. Filter color textures in linear RGB; data maps stay linear. Alpha is ignored. Rasterized passes use analytic perspective-correct UV gradients instead of GPU quad derivatives; non-rasterized point queries use level zero.
 
 Sample all of a material's textures together at one UV before lighting, as an on-sample neural texture decoder produces a whole texture set at once. A material's textures must share one texture-coordinate set; mixed sets are rejected. Fragments carry one UV and gradient pair instead of four, and the normal map is read even when an unusable tangent frame discards it.
 

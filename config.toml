@@ -2,7 +2,8 @@ width = 800
 height = 600
 # Per-axis supersampling: 1 = off, 2 = 4 samples/pixel, 4 = 16 samples/pixel.
 supersampling = 1
-# Material texture filtering: "none" (nearest), "bilinear", or "trilinear".
+# Material texture filtering: "none" (nearest texel of the nearest mip level), "bilinear"
+# (level zero), or "trilinear".
 sampling = "trilinear"
 
 [output]

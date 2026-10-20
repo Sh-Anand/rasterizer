@@ -10,6 +10,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Sampling {
+    /// Nearest texel of the nearest mip level.
     None,
     Bilinear,
     #[default]
@@ -85,7 +86,7 @@ impl<'a> TextureLoader<'a> {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let mut levels = vec![MipLevel::decode(&self.images[key.0], color_space)?];
-                if self.sampling == Sampling::Trilinear {
+                if self.sampling != Sampling::Bilinear {
                     while levels
                         .last()
                         .is_some_and(|level| level.width > 1 || level.height > 1)
@@ -204,10 +205,10 @@ impl Texture {
     // CUDA shading must inline texture reads to address the texel array as global memory.
     #[inline(always)]
     pub fn sample(&self, texels: &[Texel], sample: UvSample) -> Vec4 {
-        let lod = if self.sampling == Sampling::Trilinear {
-            self.lod(sample)
-        } else {
+        let lod = if self.sampling == Sampling::Bilinear {
             0.0
+        } else {
+            self.lod(sample)
         };
         self.sample_lod(texels, sample.uv, lod)
     }
@@ -237,7 +238,8 @@ impl Texture {
     #[inline(always)]
     fn sample_lod(&self, texels: &[Texel], uv: Vec2, lod: f32) -> Vec4 {
         if self.sampling != Sampling::Trilinear {
-            return self.sample_level(texels, uv, 0);
+            // Rounds to the nearest level; bilinear textures have only level zero.
+            return self.sample_level(texels, uv, (self.clamp_lod(lod) + 0.5) as usize);
         }
         let lod = self.clamp_lod(lod);
         let lower = lod.floor() as usize;

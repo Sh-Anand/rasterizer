@@ -65,7 +65,7 @@ impl Trace for () {
 }
 
 // Source-level estimates of the work below, not compiled instruction counts.
-const NEAREST: Ops = ops(1, 0, 12, 0, 13);
+const NEAREST: Ops = ops(1, 0, 29, 1, 30);
 const BILINEAR: Ops = ops(4, 0, 52, 0, 40);
 const TRILINEAR: Ops = ops(4, 0, 69, 1, 57);
 const SECOND_LEVEL: Ops = ops(4, 0, 64, 0, 52);
