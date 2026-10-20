@@ -3,9 +3,79 @@ use std::f32::consts::PI;
 use glam::Vec3;
 
 use crate::{
+    lighting::Light,
     material::Material,
     pipeline::{FragmentAttributes, Shading},
+    shadow::LightShadow,
+    texture::{Sampling, Texture, UvSample},
 };
+
+/// Straight-line shader regions in program order; trace records store their numbers.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Site {
+    Input,
+    BaseColor,
+    BaseColorLevel,
+    Normal,
+    NormalLevel,
+    NormalMap,
+    MetallicRoughness,
+    MetallicRoughnessLevel,
+    Surface,
+    Light,
+    Shadow,
+    Brdf,
+    Emissive,
+    EmissiveLevel,
+    Output,
+}
+
+/// One lane's memory operations and arithmetic in a region.
+#[derive(Clone, Copy)]
+pub(crate) struct Ops {
+    pub loads: u16,
+    pub stores: u16,
+    pub fp: u16,
+    pub sfu: u16,
+    pub int: u16,
+}
+
+pub(crate) const fn ops(loads: u16, stores: u16, fp: u16, sfu: u16, int: u16) -> Ops {
+    Ops {
+        loads,
+        stores,
+        fp,
+        sfu,
+        int,
+    }
+}
+
+/// Receives each region a lane executes; `()` records nothing.
+pub(crate) trait Trace {
+    /// False skips computing what regions read, which CUDA cannot always eliminate.
+    const ENABLED: bool = true;
+
+    fn op(&mut self, site: Site, light: u32, ops: Ops);
+}
+
+impl Trace for () {
+    const ENABLED: bool = false;
+
+    fn op(&mut self, _: Site, _: u32, _: Ops) {}
+}
+
+// Source-level estimates of the work below, not compiled instruction counts.
+const NEAREST: Ops = ops(1, 0, 12, 0, 13);
+const BILINEAR: Ops = ops(4, 0, 52, 0, 40);
+const TRILINEAR: Ops = ops(4, 0, 69, 1, 57);
+const SECOND_LEVEL: Ops = ops(4, 0, 64, 0, 52);
+const NORMAL_MAP: Ops = ops(0, 0, 67, 4, 0);
+const SURFACE: Ops = ops(0, 0, 47, 2, 0);
+const DIRECTIONAL_LIGHT: Ops = ops(1, 0, 6, 0, 0);
+const AREA_LIGHT: Ops = ops(1, 0, 30, 3, 0);
+const DIRECTIONAL_SHADOW: Ops = ops(5, 0, 76, 2, 35);
+const AREA_SHADOW: Ops = ops(5, 0, 102, 2, 50);
+const BRDF: Ops = ops(0, 0, 112, 7, 0);
 
 // CUDA shading must inline this to address texels and shadow depths as global memory.
 #[inline(always)]
@@ -14,23 +84,42 @@ pub(crate) fn shade(
     material: &Material,
     attributes: &FragmentAttributes,
     front_facing: bool,
+    trace: &mut impl Trace,
 ) -> Vec3 {
     let texels = shading.texels;
     let position = attributes.world_position;
-    let base_color = material.base_color(texels, attributes.uv);
-    let normal = material.shading_normal(
-        texels,
-        attributes.normal_uv,
-        attributes.normal,
-        attributes.tangent,
-    );
+    let uv = attributes.uv;
+    trace_texture(trace, Site::BaseColor, &material.base_color_texture, uv);
+    let base_color = material.base_color(texels, uv);
+    let uv = attributes.normal_uv;
+    trace_texture(trace, Site::Normal, &material.normal_texture, uv);
+    if material.normal_texture.is_some() {
+        trace.op(Site::NormalMap, 0, NORMAL_MAP);
+    }
+    let normal = material.shading_normal(texels, uv, attributes.normal, attributes.tangent);
     let normal = if front_facing { normal } else { -normal };
     let view = (shading.camera_position - position).normalize_or_zero();
-    let (metallic, roughness) =
-        material.metallic_roughness(texels, attributes.metallic_roughness_uv);
+    let uv = attributes.metallic_roughness_uv;
+    trace_texture(
+        trace,
+        Site::MetallicRoughness,
+        &material.metallic_roughness_texture,
+        uv,
+    );
+    let (metallic, roughness) = material.metallic_roughness(texels, uv);
+    trace.op(Site::Surface, 0, SURFACE);
     let brdf = Brdf::new(base_color, metallic, roughness);
     let mut reflected = Vec3::ZERO;
+    // A wrapping count avoids enumerate's overflow check, which CUDA builds keep.
+    let mut next_index = 0u32;
     for light in shading.lights {
+        let index = next_index;
+        next_index = next_index.wrapping_add(1);
+        let light_ops = match light.light {
+            Light::Directional(_) => DIRECTIONAL_LIGHT,
+            Light::Area(_) => AREA_LIGHT,
+        };
+        trace.op(Site::Light, index, light_ops);
         let Some(sample) = light.light.sample(position) else {
             continue;
         };
@@ -40,16 +129,52 @@ pub(crate) fn shade(
             continue;
         }
         let visibility = match &light.shadow {
-            Some(shadow) => shadow.visibility(shading.maps, shading.depths, position),
+            Some(shadow) => {
+                let shadow_ops = match shadow {
+                    LightShadow::Directional(_) => DIRECTIONAL_SHADOW,
+                    LightShadow::Area { .. } => AREA_SHADOW,
+                };
+                trace.op(Site::Shadow, index, shadow_ops);
+                shadow.visibility(shading.maps, shading.depths, position)
+            }
             None => 1.0,
         };
         if visibility > 0.0 {
+            trace.op(Site::Brdf, index, BRDF);
             reflected += brdf.evaluate(normal, view, sample.direction)
                 * (sample.irradiance * visibility)
                 * cosine.max(0.0);
         }
     }
-    reflected + material.emission(texels, attributes.emissive_uv)
+    let uv = attributes.emissive_uv;
+    trace_texture(trace, Site::Emissive, &material.emissive_texture, uv);
+    reflected + material.emission(texels, uv)
+}
+
+/// Record a texture sample, then the second mip level a trilinear sample may read.
+#[inline(always)]
+fn trace_texture<T: Trace>(trace: &mut T, site: Site, texture: &Option<Texture>, uv: UvSample) {
+    if !T::ENABLED {
+        return;
+    }
+    if let Some(texture) = texture {
+        let (sampling, second_level) = texture.reads(uv);
+        let first = match sampling {
+            Sampling::None => NEAREST,
+            Sampling::Bilinear => BILINEAR,
+            Sampling::Trilinear => TRILINEAR,
+        };
+        trace.op(site, 0, first);
+        if second_level {
+            let level = match site {
+                Site::BaseColor => Site::BaseColorLevel,
+                Site::Normal => Site::NormalLevel,
+                Site::MetallicRoughness => Site::MetallicRoughnessLevel,
+                _ => Site::EmissiveLevel,
+            };
+            trace.op(level, 0, SECOND_LEVEL);
+        }
+    }
 }
 
 const DIELECTRIC_F0: f32 = 0.04;

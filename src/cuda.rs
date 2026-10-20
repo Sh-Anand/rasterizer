@@ -791,6 +791,7 @@ mod kernels {
                 &materials[fragment_meta[soa_offset::<2>(sample, 0)] as usize],
                 &FragmentAttributes::load_soa(fragments, sample),
                 fragment_meta[soa_offset::<2>(sample, 1)] != 0,
+                &mut (),
             );
         }
         // Transpose each row's colors so its lanes store contiguous floats in CPU RGB order.

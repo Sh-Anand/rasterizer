@@ -5,6 +5,7 @@
 ./run.sh living-room                     # all GPU (default)
 ./run.sh gpu living-room                 # all GPU explicitly
 ./run.sh cpu living-room                 # all CPU
+./run.sh cpu living-room --trace         # also write output/living-room.trace
 cargo test --release
 ```
 
@@ -14,6 +15,10 @@ The runner builds in release mode, with separate `target/cpu` and `target/gpu`
 directories. GPU mode requires the one-time CUDA setup below; it selects CUDA
 13.4 and the pinned nightly automatically. Postprocessing stays on the CPU.
 Plain `cargo run --release -- living-room` still uses CPU rendering.
+
+`--trace` swaps the CPU fragment stage for one that also records the shared
+shader's operations per 32-lane warp (an 8x4 pixel block). The binary format is
+documented on `trace::TraceFragment`; record site numbers follow `fragment::Site`.
 
 ## CUDA backends
 

@@ -205,15 +205,33 @@ impl Texture {
     #[inline(always)]
     pub fn sample(&self, texels: &[Texel], sample: UvSample) -> Vec4 {
         let lod = if self.sampling == Sampling::Trilinear {
-            let size = Vec2::new(self.width as f32, self.height as f32);
-            let rho_squared = (sample.dx * size)
-                .length_squared()
-                .max((sample.dy * size).length_squared());
-            (0.5 * rho_squared.log2()).max(0.0)
+            self.lod(sample)
         } else {
             0.0
         };
         self.sample_lod(texels, sample.uv, lod)
+    }
+
+    /// Sampling mode, and whether a trilinear sample also reads the next mip level.
+    #[inline(always)]
+    pub(crate) fn reads(&self, sample: UvSample) -> (Sampling, bool) {
+        let trilinear = self.sampling == Sampling::Trilinear;
+        let second_level = trilinear && self.clamp_lod(self.lod(sample)).fract() != 0.0;
+        (self.sampling, second_level)
+    }
+
+    #[inline(always)]
+    fn lod(&self, sample: UvSample) -> f32 {
+        let size = Vec2::new(self.width as f32, self.height as f32);
+        let rho_squared = (sample.dx * size)
+            .length_squared()
+            .max((sample.dy * size).length_squared());
+        (0.5 * rho_squared.log2()).max(0.0)
+    }
+
+    #[inline(always)]
+    fn clamp_lod(&self, lod: f32) -> f32 {
+        lod.max(0.0).min((self.levels - 1) as f32)
     }
 
     #[inline(always)]
@@ -221,7 +239,7 @@ impl Texture {
         if self.sampling != Sampling::Trilinear {
             return self.sample_level(texels, uv, 0);
         }
-        let lod = lod.max(0.0).min((self.levels - 1) as f32);
+        let lod = self.clamp_lod(lod);
         let lower = lod.floor() as usize;
         let upper = (lower + 1).min(self.levels - 1);
         let color = self.sample_level(texels, uv, lower);

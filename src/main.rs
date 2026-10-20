@@ -15,11 +15,12 @@ use rasterizer::{
     geometry::{GltfAsset, prepare_scene},
     lighting::{DirectionalLight, Light, RenderLight, collect_lights},
     material::load_materials,
-    pipeline::{Pipeline, Shading},
+    pipeline::{FragmentStage, Pipeline, Shading},
     shadow::prepare_lights,
+    trace::TraceFragment,
 };
 
-const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light] [--cuda]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\n--cuda: keep vertex, rasterization, fragment and shadow work on CUDA (requires the cuda feature).\nRender: cargo run --release -- living-room";
+const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light] [--cuda] [--trace]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\n--cuda: keep vertex, rasterization, fragment and shadow work on CUDA (requires the cuda feature).\n--trace: also write the CPU fragment shader's operations to output/<scene>.trace.\nRender: cargo run --release -- living-room";
 
 fn scene_paths() -> io::Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -108,12 +109,15 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut camera_light = false;
     let mut use_cuda = false;
+    let mut trace = false;
     let mut positional = Vec::new();
     for arg in env::args_os().skip(1) {
         if arg == "--camera-light" {
             camera_light = true;
         } else if arg == "--cuda" {
             use_cuda = true;
+        } else if arg == "--trace" {
+            trace = true;
         } else if arg == "--help" || arg == "-h" {
             println!("{USAGE}");
             return Ok(());
@@ -125,7 +129,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut args = positional.into_iter();
     let Some(path) = args.next() else {
-        if camera_light || use_cuda {
+        if camera_light || use_cuda || trace {
             return Err(format!("Expected a scene.\n\n{USAGE}").into());
         }
         list_scenes().map_err(|error| format!("Failed to list scenes: {error}"))?;
@@ -134,6 +138,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.next().is_some() {
         return Err(format!("Expected one scene name or asset path.\n\n{USAGE}").into());
+    }
+    if trace && use_cuda {
+        return Err("--trace runs the CPU pipeline and cannot be combined with --cuda".into());
     }
     #[cfg(not(feature = "cuda"))]
     if use_cuda {
@@ -169,7 +176,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ))
         })
         .transpose()?;
-    let mut pipeline = Pipeline::new(cpu::CpuVertex, cpu::CpuRasterization, cpu::CpuFragment);
+    let trace_path = root
+        .join("output")
+        .join(scene_name(&path))
+        .with_extension("trace");
+    let mut cpu_fragment = cpu::CpuFragment;
+    let mut trace_fragment = TraceFragment::new(render_width, &trace_path);
+    let fragment: &mut dyn FragmentStage = if trace {
+        &mut trace_fragment
+    } else {
+        &mut cpu_fragment
+    };
+    let mut pipeline = Pipeline::new(cpu::CpuVertex, cpu::CpuRasterization, fragment);
     let backend_setup_time = started.elapsed();
     let started = Instant::now();
     let camera_matrix = config.camera_matrix()?;
@@ -384,6 +402,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         output_time.as_secs_f32() * 1000.0
     );
     println!("Wrote {}", output_path.display());
+    if trace {
+        println!("Wrote {}", trace_path.display());
+    }
     println!("Lighting: direct diffuse + specular");
     if camera_light {
         println!("Camera light: white, unshadowed");

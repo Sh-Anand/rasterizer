@@ -9,6 +9,7 @@ pub mod material;
 pub mod pipeline;
 pub mod shadow;
 pub mod texture;
+pub mod trace;
 
 mod fragment;
 mod rasterization;

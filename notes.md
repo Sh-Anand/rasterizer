@@ -38,6 +38,16 @@ Visibility atomically minimizes an ordered FP32 depth and stable triangle/fan ra
 
 Shadow passes use the same visibility kernel, skip attribute emission, and unpack winning depths directly into the resident shadow atlas. Camera output reads back RGB and depth only, plus small validation/statistics counters. CUDA stage instances must share one device; invalidation requires preparing resident lights/shadows again before rendering.
 
+## Trace backend
+
+Emit a binary operation trace of fragment shading for workload analysis; no image is required. The trace follows the shared GPU shader, evaluating values only to resolve branches. Lanes use the CUDA packing: 32-lane warps covering 8x4 pixel blocks. Emit one record per operation and active mask: diverging lanes produce separate records, while lanes running the same code on different data share one.
+
+Texture texels, shadow depths, descriptors and fragment inputs are all plain loads; each descriptor read counts as one load. Straight-line arithmetic is grouped into FP32, special-function and integer counts. Counts are source-level estimates of shader work, not compiled instructions; compiler artifacts such as local-memory copies are excluded.
+
+The trace runs the CPU vertex and rasterization stages and hooks regions inside the shared shader, so only branches between regions split masks: texture presence, the second trilinear level, facing lights, shadowed lights and visible lights. Branches inside a region (texture wrap modes, normal-map early exits, extra shadow taps at cube-face edges and corners, BRDF early returns) are folded into that region's counts. CUDA shading passes a no-op recorder; its generated code and timing are unchanged.
+
+Deferred: per-lane addresses with coalescing and cache analysis, which buffer each load reads, and per-lane texture or weight identity for decoder batching.
+
 ## Clipping
 
 Use FP32 for all rendering calculations, including clipping, coverage, interpolation, texture filtering, lighting, and image export.

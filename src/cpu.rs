@@ -39,6 +39,7 @@ impl FragmentStage for CpuFragment {
                     material,
                     &fragment.attributes,
                     fragment.front_facing,
+                    &mut (),
                 )
             })
             .collect())
@@ -86,7 +87,7 @@ pub fn render_reference(
             None,
             |index, attributes, front_facing| {
                 output.framebuffer.color[index] =
-                    shade(&shading, material, attributes, front_facing);
+                    shade(&shading, material, attributes, front_facing, &mut ());
             },
         );
     }
