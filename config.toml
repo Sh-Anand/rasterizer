@@ -26,6 +26,55 @@ fov_y_degrees = 60.0
 near = 0.1
 far = 1000.0
 
+# The next four cameras are converted from each scene's glTF camera.
+[scene_cameras.classroom]
+position = [-1.6905, 1.2716, 5.8865]
+target = [-1.5392, 1.2999, 4.8985]
+up = [-0.0043, 0.9996, 0.028]
+fov_y_degrees = 35.98
+near = 0.01
+far = 1000.0
+
+[scene_cameras.staircase]
+position = [0.0324, 1.5267, 4.882]
+target = [0.0248, 1.5718, 3.883]
+up = [0.0003, 0.999, 0.0451]
+fov_y_degrees = 58.54
+near = 0.01
+far = 100.0
+
+[scene_cameras.bathroom]
+position = [0.0072, 0.9124, -0.2276]
+target = [-0.7446, 0.9279, -0.8867]
+up = [0.0116, 0.9999, 0.0102]
+fov_y_degrees = 55.0
+near = 0.01
+far = 100.0
+
+[scene_cameras.house]
+position = [-37.4663, -0.6143, 32.1223]
+target = [-36.7998, -0.4622, 31.3925]
+up = [-0.1025, 0.9884, 0.1123]
+fov_y_degrees = 20.11
+near = 0.01
+far = 100.0
+
+[scene_cameras.sponza]
+position = [-10.0, 2.0, -0.3]
+target = [10.0, 4.0, -0.3]
+up = [0.0, 1.0, 0.0]
+fov_y_degrees = 60.0
+near = 0.1
+far = 100.0
+
+[scene_cameras.beautiful-game]
+position = [0.55, 0.45, 0.55]
+target = [0.0, 0.03, 0.0]
+up = [0.0, 1.0, 0.0]
+fov_y_degrees = 40.0
+near = 0.01
+far = 10.0
+
 [light]
 # World-space direction toward the light.
 direction = [1.0, 3.0, 2.0]

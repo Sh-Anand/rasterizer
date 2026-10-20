@@ -320,8 +320,9 @@ fn prepare_node(
                 let supplied = normals.as_ref().and_then(|_| reader.read_tangents());
                 Some(if let Some(supplied) = supplied {
                     let tangents: Vec<Vec4> = supplied.map(Vec4::from_array).collect();
-                    supplied_tangents(&tangents, positions.len(), &triangles)
-                        .map_err(|error| invalid(&error.to_string()))?
+                    supplied_tangents(&tangents, positions.len(), &triangles).unwrap_or_else(|| {
+                        generate_tangents(&positions, normals.as_deref(), &normal_uvs, &triangles)
+                    })
                 } else {
                     if normals.is_some() && primitive.get(&gltf::Semantic::Tangents).is_some() {
                         return Err(invalid("Cannot read vertex tangents"));
@@ -391,27 +392,24 @@ fn prepare_node(
     Ok(())
 }
 
+/// None when tangents are invalid or a triangle mixes handedness.
 fn supplied_tangents(
     tangents: &[Vec4],
     vertex_count: usize,
     triangles: &[[u32; 3]],
-) -> io::Result<Vec<[Vec4; 3]>> {
-    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+) -> Option<Vec<[Vec4; 3]>> {
     if tangents.len() != vertex_count
         || tangents
             .iter()
             .any(|t| !t.is_finite() || t.w.abs() != 1.0 || t.truncate().try_normalize().is_none())
     {
-        return Err(invalid("Invalid vertex tangents"));
+        return None;
     }
     triangles
         .iter()
         .map(|triangle| {
             let [a, b, c] = triangle.map(|i| tangents[i as usize]);
-            if a.w != b.w || a.w != c.w {
-                return Err(invalid("Triangle tangent handedness must be uniform"));
-            }
-            Ok([a, b, c])
+            (a.w == b.w && a.w == c.w).then_some([a, b, c])
         })
         .collect()
 }
