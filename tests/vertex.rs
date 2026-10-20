@@ -168,18 +168,12 @@ fn supplied_frames_transform_in_world_space_and_preserve_uvs() {
     // An oblique normal distinguishes the inverse-transpose from the model matrix.
     vertex.normal = Vec3::new(1.0, 1.0, 0.0);
     vertex.uv = Vec2::new(0.1, 0.2);
-    vertex.normal_uv = Vec2::new(0.3, 0.4);
-    vertex.metallic_roughness_uv = Vec2::new(0.5, 0.6);
-    vertex.emissive_uv = Vec2::new(0.9, 1.0);
     let input = *vertex;
     let transformed = CpuVertex.transform(&prepared, Mat4::IDENTITY).unwrap();
     let output = &transformed.primitives[0].vertices[0];
     assert_eq!(output.normal, Vec3::new(-0.5, 1.0 / 3.0, 0.0).normalize());
     assert_eq!(output.tangent, Vec4::new(-1.0, 0.0, 0.0, -1.0));
     assert_eq!(output.uv, input.uv);
-    assert_eq!(output.normal_uv, input.normal_uv);
-    assert_eq!(output.metallic_roughness_uv, input.metallic_roughness_uv);
-    assert_eq!(output.emissive_uv, input.emissive_uv);
 }
 
 #[test]

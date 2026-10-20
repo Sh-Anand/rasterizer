@@ -21,6 +21,16 @@ pub fn load_materials(
     Ok((materials, textures.texels))
 }
 
+/// Factor-scaled material values at one UV.
+pub struct MaterialSample {
+    pub base_color: Vec3,
+    /// Scaled tangent-space normal; meaningful only with a normal texture.
+    pub normal: Vec3,
+    pub metallic: f32,
+    pub roughness: f32,
+    pub emission: Vec3,
+}
+
 #[derive(Clone, Copy)]
 pub struct Material {
     pub base_color_factor: Vec3,
@@ -85,21 +95,27 @@ impl Material {
         })
     }
 
-    pub fn base_color(&self, texels: &[Texel], uv: UvSample) -> Vec3 {
-        self.base_color_factor * sample_texture(&self.base_color_texture, texels, uv).truncate()
+    /// Reads every texture at one UV, as a texture-set decoder produces all channels at once.
+    #[inline(always)]
+    pub fn sample(&self, texels: &[Texel], uv: UvSample) -> MaterialSample {
+        let base_color = sample_texture(&self.base_color_texture, texels, uv);
+        let mut normal =
+            sample_texture(&self.normal_texture, texels, uv).truncate() * 2.0 - Vec3::ONE;
+        normal.x *= self.normal_scale;
+        normal.y *= self.normal_scale;
+        let metallic_roughness = sample_texture(&self.metallic_roughness_texture, texels, uv);
+        MaterialSample {
+            base_color: self.base_color_factor * base_color.truncate(),
+            normal,
+            metallic: self.metallic_factor * metallic_roughness.z,
+            roughness: self.roughness_factor * metallic_roughness.y,
+            emission: self.emission(texels, uv),
+        }
     }
 
-    pub fn shading_normal(
-        &self,
-        texels: &[Texel],
-        uv: UvSample,
-        normal: Vec3,
-        tangent: Vec4,
-    ) -> Vec3 {
-        let Some(texture) = &self.normal_texture else {
-            return normal;
-        };
-        if self.normal_scale == 0.0 || tangent.w == 0.0 {
+    /// Applies a sampled tangent-space normal.
+    pub fn shading_normal(&self, sampled: Vec3, normal: Vec3, tangent: Vec4) -> Vec3 {
+        if self.normal_texture.is_none() || self.normal_scale == 0.0 || tangent.w == 0.0 {
             return normal;
         }
         let Some(t) =
@@ -108,22 +124,12 @@ impl Material {
             return normal;
         };
         let b = normal.cross(t) * tangent.w.signum();
-        let mut sampled = texture.sample(texels, uv).truncate() * 2.0 - Vec3::ONE;
-        sampled.x *= self.normal_scale;
-        sampled.y *= self.normal_scale;
         (t * sampled.x + b * sampled.y + normal * sampled.z)
             .try_normalize()
             .unwrap_or(normal)
     }
 
-    pub fn metallic_roughness(&self, texels: &[Texel], uv: UvSample) -> (f32, f32) {
-        let sample = sample_texture(&self.metallic_roughness_texture, texels, uv);
-        (
-            self.metallic_factor * sample.z,
-            self.roughness_factor * sample.y,
-        )
-    }
-
+    #[inline(always)]
     pub fn emission(&self, texels: &[Texel], uv: UvSample) -> Vec3 {
         self.emissive_factor * sample_texture(&self.emissive_texture, texels, uv).truncate()
     }

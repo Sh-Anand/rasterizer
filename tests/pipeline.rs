@@ -33,9 +33,6 @@ fn triangle(material_index: Option<usize>, z: f32) -> ClipPrimitive {
             position: position.extend(1.0),
             world_position: position,
             uv: Vec2::ZERO,
-            normal_uv: Vec2::ZERO,
-            metallic_roughness_uv: Vec2::ZERO,
-            emissive_uv: Vec2::ZERO,
             normal: Vec3::Z,
             tangent: Vec4::ZERO,
         })
@@ -70,9 +67,6 @@ fn prepare_identity(scene: &ClipScene) -> PreparedScene {
                     .map(|v| rasterizer::geometry::PreparedVertex {
                         position: v.world_position,
                         uv: v.uv,
-                        normal_uv: v.normal_uv,
-                        metallic_roughness_uv: v.metallic_roughness_uv,
-                        emissive_uv: v.emissive_uv,
                         normal: v.normal,
                         tangent: v.tangent,
                     })
@@ -233,7 +227,6 @@ fn nearer_fragments_replace_all_attributes_and_facing_within_and_across_primitiv
     near.triangles[0].swap(1, 2);
     for vertex in &mut near.vertices {
         vertex.uv = Vec2::new(0.25, 0.75);
-        vertex.normal_uv = Vec2::ONE;
         vertex.normal = Vec3::X;
         vertex.tangent = Vec4::new(0.0, 1.0, 0.0, -1.0);
     }
@@ -265,7 +258,6 @@ fn nearer_fragments_replace_all_attributes_and_facing_within_and_across_primitiv
                     .uv
                     .abs_diff_eq(Vec2::new(0.25, 0.75), 1e-6)
             );
-            assert_eq!(fragment.attributes.normal_uv.uv, Vec2::ONE);
             assert_eq!(fragment.attributes.normal, Vec3::X);
             assert_eq!(fragment.attributes.tangent, Vec4::new(0.0, 1.0, 0.0, -1.0));
             assert!((fragment.attributes.world_position.z + 0.5).abs() < 1e-6);
@@ -280,7 +272,7 @@ fn partial_occlusion_retains_the_uncovered_samples_of_an_earlier_triangle() {
     for vertex in &mut near.vertices {
         vertex.position.x *= 0.5;
         vertex.position.y *= 0.5;
-        vertex.normal_uv = Vec2::ONE;
+        vertex.uv = Vec2::ONE;
     }
     let material = Material::default();
     let (far_only, _) = collect_fragments(std::slice::from_ref(&far), &material);
@@ -300,7 +292,7 @@ fn partial_occlusion_retains_the_uncovered_samples_of_an_earlier_triangle() {
         } else {
             Vec2::ZERO
         };
-        assert_eq!(fragment.attributes.normal_uv.uv, expected_tag);
+        assert_eq!(fragment.attributes.uv.uv, expected_tag);
     }
 }
 
@@ -313,7 +305,7 @@ fn equal_depth_keeps_the_first_winner_and_collector_state_does_not_cross_calls()
         let first = triangle(Some(0), 0.5);
         let mut equal = first.clone();
         for vertex in &mut equal.vertices {
-            vertex.normal_uv = Vec2::ONE;
+            vertex.uv = Vec2::ONE;
         }
         let rasterized = rasterizer
             .rasterize(
@@ -330,7 +322,7 @@ fn equal_depth_keeps_the_first_winner_and_collector_state_does_not_cross_calls()
             rasterized
                 .fragments
                 .iter()
-                .all(|fragment| fragment.attributes.normal_uv.uv == Vec2::ZERO)
+                .all(|fragment| fragment.attributes.uv.uv == Vec2::ZERO)
         );
         let previous_depth = depth.values.clone();
         let rejected = rasterizer
@@ -383,7 +375,6 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
     let mut near = triangle(Some(0), -0.5);
     for vertex in &mut near.vertices {
         vertex.uv = Vec2::new(0.75, 0.5);
-        vertex.normal_uv = Vec2::ONE;
     }
     let scene = scene(vec![triangle(Some(0), 0.5), near]);
     let expected = cpu::render_reference(&scene, &[opaque], 16, 16, shading()).unwrap();
@@ -464,17 +455,18 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
                 let (materials, texels) = load_materials(&asset, sampling).unwrap();
                 for uv in [Vec2::new(0.25, 0.5), Vec2::new(0.75, 0.5)] {
                     assert_eq!(
-                        materials[0].base_color(&texels, UvSample::point(uv)),
+                        materials[0].sample(&texels, UvSample::point(uv)).base_color,
                         Vec3::new(0.5, 0.75, 1.0)
                     );
                 }
                 let (rasterized, _) = collect_fragments(&scene.primitives, &materials[0]);
                 assert!(!rasterized.fragments.is_empty());
                 assert!(
-                    rasterized
-                        .fragments
-                        .iter()
-                        .all(|f| f.attributes.normal_uv.uv == Vec2::ONE)
+                    rasterized.fragments.iter().all(|f| f
+                        .attributes
+                        .uv
+                        .uv
+                        .abs_diff_eq(Vec2::new(0.75, 0.5), 1e-6))
                 );
                 let actual = Pipeline::new(CpuVertex, CpuRasterization, CpuFragment)
                     .render_transformed(
@@ -597,9 +589,6 @@ impl RasterizationStage for FixedRasterization {
                     normal: Vec3::Z,
                     tangent: Vec4::ZERO,
                     uv,
-                    normal_uv: uv,
-                    metallic_roughness_uv: uv,
-                    emissive_uv: uv,
                 },
             }],
             covered_fragments: 1,

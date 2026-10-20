@@ -16,13 +16,13 @@ use crate::{
 
 // Work the CUDA shading kernel does outside the shared shader: fragment attributes,
 // material index, facing, visibility winner and material descriptor; RGB stores.
-const INPUT: Ops = ops(38, 0, 0, 0, 10);
+const INPUT: Ops = ops(20, 0, 0, 0, 10);
 const OUTPUT: Ops = ops(0, 3, 0, 0, 5);
 
 /// Fragment stage that writes the shader operations of each 32-lane warp, which covers an
 /// 8x4 pixel block as in the CUDA backend. The colors it returns match the CPU stage.
 ///
-/// The little-endian file holds `b"RTRC"`, version 1 and the render width as u32, then
+/// The little-endian file holds `b"RTRC"`, version 2 and the render width as u32, then
 /// one record per operation and active mask: warp u32, lane mask u32, `Site` number u8,
 /// light index u32, then loads, stores, fp, sfu and int counts per lane as u16.
 pub struct TraceFragment {
@@ -114,7 +114,7 @@ impl FragmentStage for TraceFragment {
             .collect();
         let mut file = BufWriter::new(File::create(&self.path)?);
         file.write_all(b"RTRC")?;
-        file.write_all(&1u32.to_le_bytes())?;
+        file.write_all(&2u32.to_le_bytes())?;
         file.write_all(&self.width.to_le_bytes())?;
         let mut colors = vec![Vec3::ZERO; fragments.len()];
         for (records, warp_colors) in warps {

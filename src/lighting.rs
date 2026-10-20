@@ -168,9 +168,8 @@ pub fn collect_lights(
         }
         for triangle in &primitive.triangles {
             let vertices = triangle.map(|i| primitive.vertices[i as usize]);
-            let emissive_uv =
-                (vertices[0].emissive_uv + vertices[1].emissive_uv + vertices[2].emissive_uv) / 3.0;
-            let radiance = material.emission(texels, UvSample::point(emissive_uv));
+            let uv = (vertices[0].uv + vertices[1].uv + vertices[2].uv) / 3.0;
+            let radiance = material.emission(texels, UvSample::point(uv));
             if radiance == Vec3::ZERO {
                 continue;
             }

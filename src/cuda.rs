@@ -74,21 +74,15 @@ impl UvSample {
     }
 }
 
-soa!(PreparedVertex, 18,
-    position: Vec3 = 0, uv: Vec2 = 3, normal_uv: Vec2 = 5,
-    metallic_roughness_uv: Vec2 = 7, emissive_uv: Vec2 = 9,
-    normal: Vec3 = 11, tangent: Vec4 = 14,
+soa!(PreparedVertex, 12,
+    position: Vec3 = 0, uv: Vec2 = 3, normal: Vec3 = 5, tangent: Vec4 = 8,
 );
-soa!(ClipVertex, 22,
-    position: Vec4 = 0, world_position: Vec3 = 4,
-    uv: Vec2 = 7, normal_uv: Vec2 = 9,
-    metallic_roughness_uv: Vec2 = 11, emissive_uv: Vec2 = 13,
-    normal: Vec3 = 15, tangent: Vec4 = 18,
+soa!(ClipVertex, 16,
+    position: Vec4 = 0, world_position: Vec3 = 4, uv: Vec2 = 7,
+    normal: Vec3 = 9, tangent: Vec4 = 12,
 );
-soa!(FragmentAttributes, 34,
-    world_position: Vec3 = 0, uv: UvSample = 3, normal_uv: UvSample = 9,
-    metallic_roughness_uv: UvSample = 15, emissive_uv: UvSample = 21,
-    normal: Vec3 = 27, tangent: Vec4 = 30,
+soa!(FragmentAttributes, 16,
+    world_position: Vec3 = 0, uv: UvSample = 3, normal: Vec3 = 9, tangent: Vec4 = 12,
 );
 
 struct Buffer<T> {
@@ -448,7 +442,7 @@ mod kernels {
     ) -> Result<u32, crate::rasterization::RasterError> {
         let codes = triangle.vertices.map(|i| {
             outcode(Vec4::from_array(std::array::from_fn(|c| {
-                vertices[soa_offset::<22>(i as usize, c)]
+                vertices[soa_offset::<{ ClipVertex::COMPONENTS }>(i as usize, c)]
             })))
         });
         if codes[0] & codes[1] & codes[2] != 0 {

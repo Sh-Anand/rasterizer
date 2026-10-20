@@ -18,15 +18,15 @@ pub(crate) enum Site {
     BaseColorLevel,
     Normal,
     NormalLevel,
-    NormalMap,
     MetallicRoughness,
     MetallicRoughnessLevel,
+    Emissive,
+    EmissiveLevel,
+    NormalMap,
     Surface,
     Light,
     Shadow,
     Brdf,
-    Emissive,
-    EmissiveLevel,
     Output,
 }
 
@@ -86,29 +86,26 @@ pub(crate) fn shade(
     front_facing: bool,
     trace: &mut impl Trace,
 ) -> Vec3 {
-    let texels = shading.texels;
     let position = attributes.world_position;
     let uv = attributes.uv;
     trace_texture(trace, Site::BaseColor, &material.base_color_texture, uv);
-    let base_color = material.base_color(texels, uv);
-    let uv = attributes.normal_uv;
     trace_texture(trace, Site::Normal, &material.normal_texture, uv);
-    if material.normal_texture.is_some() {
-        trace.op(Site::NormalMap, 0, NORMAL_MAP);
-    }
-    let normal = material.shading_normal(texels, uv, attributes.normal, attributes.tangent);
-    let normal = if front_facing { normal } else { -normal };
-    let view = (shading.camera_position - position).normalize_or_zero();
-    let uv = attributes.metallic_roughness_uv;
     trace_texture(
         trace,
         Site::MetallicRoughness,
         &material.metallic_roughness_texture,
         uv,
     );
-    let (metallic, roughness) = material.metallic_roughness(texels, uv);
+    trace_texture(trace, Site::Emissive, &material.emissive_texture, uv);
+    let surface = material.sample(shading.texels, uv);
+    if material.normal_texture.is_some() {
+        trace.op(Site::NormalMap, 0, NORMAL_MAP);
+    }
+    let normal = material.shading_normal(surface.normal, attributes.normal, attributes.tangent);
+    let normal = if front_facing { normal } else { -normal };
+    let view = (shading.camera_position - position).normalize_or_zero();
     trace.op(Site::Surface, 0, SURFACE);
-    let brdf = Brdf::new(base_color, metallic, roughness);
+    let brdf = Brdf::new(surface.base_color, surface.metallic, surface.roughness);
     let mut reflected = Vec3::ZERO;
     // A wrapping count avoids enumerate's overflow check, which CUDA builds keep.
     let mut next_index = 0u32;
@@ -146,9 +143,7 @@ pub(crate) fn shade(
                 * cosine.max(0.0);
         }
     }
-    let uv = attributes.emissive_uv;
-    trace_texture(trace, Site::Emissive, &material.emissive_texture, uv);
-    reflected + material.emission(texels, uv)
+    reflected + surface.emission
 }
 
 /// Record a texture sample, then the second mip level a trilinear sample may read.

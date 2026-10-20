@@ -80,7 +80,7 @@ The resident rasterizer handles small triangles per thread and distributes large
 triangles through a bounded work queue. Atomic depth/owner selection preserves
 stable material/triangle order for equal depths. A per-pixel pass interpolates
 only final winners. Clipping, coverage, depth and interpolation reuse the CPU
-math. Storage includes dense fragment slots (about 69.1 MB at 800×600) and an
+math. Storage includes dense fragment slots (about 34.6 MB at 800×600) and an
 8-byte queue entry per input triangle; no global clipped-geometry pool is needed.
 
 The CLI reports wall times for CPU stages and CUDA event intervals for CUDA

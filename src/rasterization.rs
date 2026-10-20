@@ -37,16 +37,12 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f32)
     let mut position = outside.position * (1.0 - t) + inside.position * t;
     position[axis] = -sign * position.w;
     let world_position = outside.world_position * (1.0 - t) + inside.world_position * t;
-    let uv = |a: Vec2, b: Vec2| a * (1.0 - t) + b * t;
     let tangent = outside.tangent * (1.0 - t) + inside.tangent * t;
     let normal = outside.normal * (1.0 - t) + inside.normal * t;
     ClipVertex {
         position,
         world_position,
-        uv: uv(outside.uv, inside.uv),
-        normal_uv: uv(outside.normal_uv, inside.normal_uv),
-        metallic_roughness_uv: uv(outside.metallic_roughness_uv, inside.metallic_roughness_uv),
-        emissive_uv: uv(outside.emissive_uv, inside.emissive_uv),
+        uv: outside.uv * (1.0 - t) + inside.uv * t,
         normal,
         tangent,
     }
@@ -58,9 +54,6 @@ pub(crate) struct ScreenVertex {
     pub world_position: Vec3,
     pub inv_w: f32,
     pub uv: Vec2,
-    pub normal_uv: Vec2,
-    pub metallic_roughness_uv: Vec2,
-    pub emissive_uv: Vec2,
     /// World-space normal.
     pub normal: Vec3,
     pub tangent: Vec4,
@@ -68,7 +61,7 @@ pub(crate) struct ScreenVertex {
 
 pub(crate) struct UvGradients {
     inv_w: Vec2,
-    sets: [[Vec2; 2]; 4],
+    uv: [Vec2; 2],
 }
 
 impl UvGradients {
@@ -80,23 +73,17 @@ impl UvGradients {
         let b = Vec2::new(ac.y, -ac.x) / area;
         let c = Vec2::new(-ab.y, ab.x) / area;
         let weights: [Vec2; 3] = std::array::from_fn(|i| [-b - c, b, c][i] * vertices[i].inv_w);
-        let uvs: [[Vec2; 4]; 3] = std::array::from_fn(|i| {
-            let v = &vertices[i];
-            [v.uv, v.normal_uv, v.metallic_roughness_uv, v.emissive_uv]
-        });
         Self {
             inv_w: weights.iter().sum(),
-            sets: std::array::from_fn(|set| {
-                [
-                    (0..3).map(|i| uvs[i][set] * weights[i].x).sum(),
-                    (0..3).map(|i| uvs[i][set] * weights[i].y).sum(),
-                ]
-            }),
+            uv: [
+                (0..3).map(|i| vertices[i].uv * weights[i].x).sum(),
+                (0..3).map(|i| vertices[i].uv * weights[i].y).sum(),
+            ],
         }
     }
 
-    fn sample(&self, set: usize, uv: Vec2, inv_w: f32) -> UvSample {
-        let [dx, dy] = self.sets[set];
+    fn sample(&self, uv: Vec2, inv_w: f32) -> UvSample {
+        let [dx, dy] = self.uv;
         UvSample {
             uv,
             // Quotient rule for (UV/w) / (1/w).
@@ -130,9 +117,6 @@ pub(crate) fn project_vertex(
         world_position: vertex.world_position,
         inv_w,
         uv: vertex.uv,
-        normal_uv: vertex.normal_uv,
-        metallic_roughness_uv: vertex.metallic_roughness_uv,
-        emissive_uv: vertex.emissive_uv,
         normal: vertex.normal,
         tangent: vertex.tangent,
     })
@@ -150,14 +134,12 @@ pub(crate) fn interpolate_attributes(
         .map(|(vertex, weight)| vertex.world_position * weight)
         .sum();
     let sum = weights.iter().sum::<f32>();
-    let uv = |values: [Vec2; 3]| {
-        values
-            .into_iter()
-            .zip(weights)
-            .map(|(value, weight)| value * weight)
-            .sum::<Vec2>()
-            / sum
-    };
+    let uv = vertices
+        .iter()
+        .zip(weights)
+        .map(|(vertex, weight)| vertex.uv * weight)
+        .sum::<Vec2>()
+        / sum;
     let tangent: Vec4 = vertices
         .iter()
         .zip(weights)
@@ -170,14 +152,7 @@ pub(crate) fn interpolate_attributes(
         .sum();
     FragmentAttributes {
         world_position: world_position / sum,
-        uv: gradients.sample(0, uv(std::array::from_fn(|i| vertices[i].uv)), sum),
-        normal_uv: gradients.sample(1, uv(std::array::from_fn(|i| vertices[i].normal_uv)), sum),
-        metallic_roughness_uv: gradients.sample(
-            2,
-            uv(std::array::from_fn(|i| vertices[i].metallic_roughness_uv)),
-            sum,
-        ),
-        emissive_uv: gradients.sample(3, uv(std::array::from_fn(|i| vertices[i].emissive_uv)), sum),
+        uv: gradients.sample(uv, sum),
         normal: (normal / sum).normalize_or_zero(),
         tangent: tangent / sum,
     }

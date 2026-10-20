@@ -44,9 +44,6 @@ pub struct PreparedVertex {
     /// Object-space position.
     pub position: Vec3,
     pub uv: Vec2,
-    pub normal_uv: Vec2,
-    pub metallic_roughness_uv: Vec2,
-    pub emissive_uv: Vec2,
     /// Object-space normal; normalize after transformation.
     pub normal: Vec3,
     /// Object-space tangent; W is handedness, or zero for an unusable frame.
@@ -74,9 +71,6 @@ pub struct ClipVertex {
     pub position: Vec4,
     pub world_position: Vec3,
     pub uv: Vec2,
-    pub normal_uv: Vec2,
-    pub metallic_roughness_uv: Vec2,
-    pub emissive_uv: Vec2,
     /// World-space normal.
     pub normal: Vec3,
     /// World-space tangent; W is handedness, or zero for an unusable frame.
@@ -123,9 +117,6 @@ impl VertexTransform {
             position: self.mvp * vertex.position.extend(1.0),
             world_position: self.model.transform_point3(vertex.position),
             uv: vertex.uv,
-            normal_uv: vertex.normal_uv,
-            metallic_roughness_uv: vertex.metallic_roughness_uv,
-            emissive_uv: vertex.emissive_uv,
             normal: (self.normal * vertex.normal).normalize_or_zero(),
             tangent,
         }
@@ -247,32 +238,35 @@ fn prepare_node(
             if positions.iter().any(|position| !position.is_finite()) {
                 return Err(invalid("Non-finite vertex position"));
             }
-            let read_uvs = |tex_coord: Option<u32>| -> io::Result<Vec<Vec2>> {
-                let required = tex_coord.is_some();
-                let tex_coord = tex_coord.unwrap_or(0);
-                let uvs: Vec<Vec2> = match reader.read_tex_coords(tex_coord) {
-                    Some(uvs) => uvs.into_f32().map(Vec2::from).collect(),
-                    None if required => {
-                        return Err(invalid(&format!(
-                            "Missing TEXCOORD_{tex_coord} for material texture"
-                        )));
-                    }
-                    None => vec![Vec2::ZERO; positions.len()],
-                };
-                if uvs.len() != positions.len() || uvs.iter().any(|uv| !uv.is_finite()) {
-                    return Err(invalid("Invalid texture coordinates"));
-                }
-                Ok(uvs)
-            };
             let material = primitive.material();
             let pbr = material.pbr_metallic_roughness();
-            let uvs = read_uvs(pbr.base_color_texture().map(|info| info.tex_coord()))?;
-            let normal_uvs = read_uvs(material.normal_texture().map(|info| info.tex_coord()))?;
-            let metallic_roughness_uvs = read_uvs(
+            let mut tex_coords = [
+                pbr.base_color_texture().map(|info| info.tex_coord()),
+                material.normal_texture().map(|info| info.tex_coord()),
                 pbr.metallic_roughness_texture()
                     .map(|info| info.tex_coord()),
-            )?;
-            let emissive_uvs = read_uvs(material.emissive_texture().map(|info| info.tex_coord()))?;
+                material.emissive_texture().map(|info| info.tex_coord()),
+            ]
+            .into_iter()
+            .flatten();
+            let tex_coord = tex_coords.next();
+            if tex_coords.any(|set| Some(set) != tex_coord) {
+                return Err(invalid(
+                    "Material textures must share one texture coordinate set",
+                ));
+            }
+            let uvs: Vec<Vec2> = match (reader.read_tex_coords(tex_coord.unwrap_or(0)), tex_coord) {
+                (Some(uvs), _) => uvs.into_f32().map(Vec2::from).collect(),
+                (None, Some(set)) => {
+                    return Err(invalid(&format!(
+                        "Missing TEXCOORD_{set} for material texture"
+                    )));
+                }
+                (None, None) => vec![Vec2::ZERO; positions.len()],
+            };
+            if uvs.len() != positions.len() || uvs.iter().any(|uv| !uv.is_finite()) {
+                return Err(invalid("Invalid texture coordinates"));
+            }
             let indices: Vec<u32> = if primitive.indices().is_some() {
                 reader
                     .read_indices()
@@ -321,13 +315,13 @@ fn prepare_node(
                 Some(if let Some(supplied) = supplied {
                     let tangents: Vec<Vec4> = supplied.map(Vec4::from_array).collect();
                     supplied_tangents(&tangents, positions.len(), &triangles).unwrap_or_else(|| {
-                        generate_tangents(&positions, normals.as_deref(), &normal_uvs, &triangles)
+                        generate_tangents(&positions, normals.as_deref(), &uvs, &triangles)
                     })
                 } else {
                     if normals.is_some() && primitive.get(&gltf::Semantic::Tangents).is_some() {
                         return Err(invalid("Cannot read vertex tangents"));
                     }
-                    generate_tangents(&positions, normals.as_deref(), &normal_uvs, &triangles)
+                    generate_tangents(&positions, normals.as_deref(), &uvs, &triangles)
                 })
             } else {
                 None
@@ -338,9 +332,6 @@ fn prepare_node(
                 .map(|(i, position)| PreparedVertex {
                     position: *position,
                     uv: uvs[i],
-                    normal_uv: normal_uvs[i],
-                    metallic_roughness_uv: metallic_roughness_uvs[i],
-                    emissive_uv: emissive_uvs[i],
                     normal: Vec3::ZERO,
                     tangent: Vec4::ZERO,
                 })

@@ -36,9 +36,6 @@ impl<V: VertexStage + ?Sized> VertexStage for &mut V {
 pub struct FragmentAttributes {
     pub world_position: Vec3,
     pub uv: UvSample,
-    pub normal_uv: UvSample,
-    pub metallic_roughness_uv: UvSample,
-    pub emissive_uv: UvSample,
     pub normal: Vec3,
     pub tangent: Vec4,
 }

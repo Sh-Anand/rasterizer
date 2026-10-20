@@ -84,6 +84,8 @@ Treat every material as fully opaque. Ignore alpha mode, alpha cutoff, base-colo
 
 Use one global material-texture filter: `none` (nearest), `bilinear` (level zero), or `trilinear` (mipmapped). Override glTF filter choices but preserve wrap modes. Filter color textures in linear RGB; data maps stay linear. Alpha is ignored. Rasterized passes use analytic perspective-correct UV gradients instead of GPU quad derivatives; non-rasterized point queries use level zero.
 
+Sample all of a material's textures together at one UV before lighting, as an on-sample neural texture decoder produces a whole texture set at once. A material's textures must share one texture-coordinate set; mixed sets are rejected. Fragments carry one UV and gradient pair instead of four, and the normal map is read even when an unusable tangent frame discards it.
+
 Use isotropic box-filtered mipmaps, without anisotropic filtering or normal-variance roughness compensation. Oblique textures can blur. Shadow maps use comparison filtering independently of this setting.
 
 Compute direct diffuse and specular together at runtime, sharing each light's direction and shadow lookup. Use GGX distribution, height-correlated Smith visibility, and Schlick Fresnel, with dielectric F0 = 0.04 and metallic F0 = base color. Multiply direct diffuse reflectance by `1 - F_dielectric(V dot H)`; do not apply the metallic-tinted specular Fresnel to this term. This follows the [glTF metallic-roughness mixing model](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#metal-brdf-and-dielectric-brdf), itself an approximation rather than an exactly energy-conserving layered BRDF.
