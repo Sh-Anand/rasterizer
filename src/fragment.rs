@@ -7,6 +7,8 @@ use crate::{
     pipeline::{FragmentAttributes, Shading},
 };
 
+// CUDA shading must inline this to address texels and shadow depths as global memory.
+#[inline(always)]
 pub(crate) fn shade(
     shading: &Shading<'_>,
     material: &Material,
@@ -32,13 +34,19 @@ pub(crate) fn shade(
         let Some(sample) = light.light.sample(position) else {
             continue;
         };
-        let visibility = light.shadow.map_or(1.0, |shadow| {
-            shadow.visibility(shading.maps, shading.depths, position)
-        });
+        let cosine = normal.dot(sample.direction);
+        // The BRDF is zero here, so the light contributes nothing and needs no shadow test.
+        if cosine <= 0.0 {
+            continue;
+        }
+        let visibility = match &light.shadow {
+            Some(shadow) => shadow.visibility(shading.maps, shading.depths, position),
+            None => 1.0,
+        };
         if visibility > 0.0 {
             reflected += brdf.evaluate(normal, view, sample.direction)
                 * (sample.irradiance * visibility)
-                * normal.dot(sample.direction).max(0.0);
+                * cosine.max(0.0);
         }
     }
     reflected + material.emission(texels, attributes.emissive_uv)

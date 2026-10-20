@@ -40,6 +40,11 @@ pub(crate) enum ColorSpace {
     Linear,
 }
 
+/// A linear RGBA texel, aligned so the GPU reads it with one 16-byte load.
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+pub struct Texel(pub Vec4);
+
 #[derive(Clone, Copy)]
 pub struct Texture {
     /// First level-zero texel in the shared texel array.
@@ -57,7 +62,7 @@ pub(crate) struct TextureLoader<'a> {
     sampling: Sampling,
     textures: HashMap<(usize, ColorSpace), Texture>,
     /// Every loaded mip level, in load order.
-    pub texels: Vec<Vec4>,
+    pub texels: Vec<Texel>,
 }
 
 impl<'a> TextureLoader<'a> {
@@ -98,7 +103,7 @@ impl<'a> TextureLoader<'a> {
                     sampling: self.sampling,
                 });
                 self.texels
-                    .extend(levels.into_iter().flat_map(|level| level.pixels));
+                    .extend(levels.into_iter().flat_map(|level| level.pixels).map(Texel));
                 texture
             }
         };
@@ -196,7 +201,9 @@ impl MipLevel {
 }
 
 impl Texture {
-    pub fn sample(&self, texels: &[Vec4], sample: UvSample) -> Vec4 {
+    // CUDA shading must inline texture reads to address the texel array as global memory.
+    #[inline(always)]
+    pub fn sample(&self, texels: &[Texel], sample: UvSample) -> Vec4 {
         let lod = if self.sampling == Sampling::Trilinear {
             let size = Vec2::new(self.width as f32, self.height as f32);
             let rho_squared = (sample.dx * size)
@@ -209,7 +216,8 @@ impl Texture {
         self.sample_lod(texels, sample.uv, lod)
     }
 
-    fn sample_lod(&self, texels: &[Vec4], uv: Vec2, lod: f32) -> Vec4 {
+    #[inline(always)]
+    fn sample_lod(&self, texels: &[Texel], uv: Vec2, lod: f32) -> Vec4 {
         if self.sampling != Sampling::Trilinear {
             return self.sample_level(texels, uv, 0);
         }
@@ -223,7 +231,8 @@ impl Texture {
         color.lerp(self.sample_level(texels, uv, upper), lod.fract())
     }
 
-    fn sample_level(&self, texels: &[Vec4], uv: Vec2, level: usize) -> Vec4 {
+    #[inline(always)]
+    fn sample_level(&self, texels: &[Texel], uv: Vec2, level: usize) -> Vec4 {
         let (mut width, mut height, mut offset) = (self.width, self.height, self.offset);
         for _ in 0..level {
             offset += width as usize * height as usize;
@@ -235,7 +244,7 @@ impl Texture {
         let texel = |x, y| {
             let x = wrap_index(x, width, self.wrap_s);
             let y = wrap_index(y, height, self.wrap_t);
-            texels[offset + y * width as usize + x]
+            texels[offset + y * width as usize + x].0
         };
         if self.sampling == Sampling::None {
             return texel(x.floor() as i64, y.floor() as i64);

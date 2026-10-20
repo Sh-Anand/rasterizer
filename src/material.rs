@@ -4,14 +4,14 @@ use glam::{Vec3, Vec4};
 
 use crate::{
     geometry::GltfAsset,
-    texture::{ColorSpace, Sampling, Texture, TextureLoader, UvSample},
+    texture::{ColorSpace, Sampling, Texel, Texture, TextureLoader, UvSample},
 };
 
 /// Returns the materials and the texel array their textures index.
 pub fn load_materials(
     asset: &GltfAsset,
     sampling: Sampling,
-) -> io::Result<(Vec<Material>, Vec<Vec4>)> {
+) -> io::Result<(Vec<Material>, Vec<Texel>)> {
     let mut textures = TextureLoader::new(&asset.images, sampling);
     let materials = asset
         .document
@@ -85,13 +85,13 @@ impl Material {
         })
     }
 
-    pub fn base_color(&self, texels: &[Vec4], uv: UvSample) -> Vec3 {
+    pub fn base_color(&self, texels: &[Texel], uv: UvSample) -> Vec3 {
         self.base_color_factor * sample_texture(&self.base_color_texture, texels, uv).truncate()
     }
 
     pub fn shading_normal(
         &self,
-        texels: &[Vec4],
+        texels: &[Texel],
         uv: UvSample,
         normal: Vec3,
         tangent: Vec4,
@@ -116,7 +116,7 @@ impl Material {
             .unwrap_or(normal)
     }
 
-    pub fn metallic_roughness(&self, texels: &[Vec4], uv: UvSample) -> (f32, f32) {
+    pub fn metallic_roughness(&self, texels: &[Texel], uv: UvSample) -> (f32, f32) {
         let sample = sample_texture(&self.metallic_roughness_texture, texels, uv);
         (
             self.metallic_factor * sample.z,
@@ -124,15 +124,17 @@ impl Material {
         )
     }
 
-    pub fn emission(&self, texels: &[Vec4], uv: UvSample) -> Vec3 {
+    pub fn emission(&self, texels: &[Texel], uv: UvSample) -> Vec3 {
         self.emissive_factor * sample_texture(&self.emissive_texture, texels, uv).truncate()
     }
 }
 
-fn sample_texture(texture: &Option<Texture>, texels: &[Vec4], uv: UvSample) -> Vec4 {
-    texture
-        .as_ref()
-        .map_or(Vec4::ONE, |texture| texture.sample(texels, uv))
+#[inline(always)]
+fn sample_texture(texture: &Option<Texture>, texels: &[Texel], uv: UvSample) -> Vec4 {
+    match texture {
+        Some(texture) => texture.sample(texels, uv),
+        None => Vec4::ONE,
+    }
 }
 
 fn load_texture(

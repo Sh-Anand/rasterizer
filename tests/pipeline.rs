@@ -12,7 +12,7 @@ use rasterizer::{
         Fragment, FragmentAttributes, FragmentStage, Pipeline, RasterizationStage, RasterizedScene,
         Shading, ShadowProjection, VertexStage,
     },
-    texture::{Sampling, UvSample},
+    texture::{Sampling, Texel, UvSample},
 };
 
 fn triangle(material_index: Option<usize>, z: f32) -> ClipPrimitive {
@@ -405,7 +405,7 @@ fn alpha_modes_factors_and_texture_alpha_are_ignored() {
         bias: 0.0,
     };
     let prepared_lighting = prepare_identity(&scene);
-    let shadow = |materials: &[Material], texels: &[Vec4]| {
+    let shadow = |materials: &[Material], texels: &[Texel]| {
         let lights = rasterizer::lighting::collect_lights(
             &prepared_lighting,
             materials,

@@ -95,13 +95,15 @@ impl LightShadow {
         })
     }
 
+    // CUDA shading must inline depth reads to address the atlas as global memory.
+    #[inline(always)]
     pub fn visibility(&self, maps: &[ShadowMap], depths: &[f32], world_position: Vec3) -> f32 {
         let (Self::Directional([start, end])
         | Self::Area {
             faces: [start, end],
             ..
-        }) = *self;
-        let maps = &maps[start..end];
+        }) = self;
+        let maps = &maps[*start..*end];
         match self {
             Self::Directional(_) => maps
                 .first()
@@ -264,15 +266,16 @@ fn pcf(pixel: Vec2, sample: impl Fn(IVec2) -> f32) -> f32 {
 
 fn cube_basis(face: usize) -> Mat3 {
     // +X, -X, +Y, -Y, +Z, -Z in the emitter's local frame.
-    let forward = [
+    const FORWARD: [Vec3; 6] = [
         Vec3::X,
         Vec3::NEG_X,
         Vec3::Y,
         Vec3::NEG_Y,
         Vec3::Z,
         Vec3::NEG_Z,
-    ][face];
-    let up = [Vec3::Y, Vec3::Y, Vec3::NEG_Z, Vec3::Z, Vec3::Y, Vec3::Y][face];
+    ];
+    const UP: [Vec3; 6] = [Vec3::Y, Vec3::Y, Vec3::NEG_Z, Vec3::Z, Vec3::Y, Vec3::Y];
+    let (forward, up) = (FORWARD[face], UP[face]);
     Mat3::from_cols(forward.cross(up), up, forward)
 }
 

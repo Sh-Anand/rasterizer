@@ -19,7 +19,7 @@ use crate::{
         outcode, project_vertex,
     },
     shadow::{ShadowMap, prepare_lights},
-    texture::UvSample,
+    texture::{Texel, UvSample},
 };
 
 // Component planes are grouped in warps to keep indexed vertex reads nearby.
@@ -181,7 +181,7 @@ pub struct CudaFragment {
     fragments: Buffer<f32>,
     fragment_meta: Buffer<u32>,
     materials: Buffer<Material>,
-    texels: Buffer<Vec4>,
+    texels: Buffer<Texel>,
     lights: Buffer<RenderLight>,
     maps: Buffer<ShadowMap>,
     depths: Buffer<f32>,
@@ -207,21 +207,23 @@ impl CudaFragment {
 
     fn shade_device(
         &mut self,
-        count: u32,
+        width: u32,
+        height: u32,
         winners: &DeviceBuffer<DeviceAtomicU64>,
         camera_position: Vec3,
     ) -> io::Result<(CudaEvent, CudaEvent)> {
-        let block = 32;
         let start = self.device.event()?;
-        // One lane per output; buffers live through the synchronous readback.
+        // One warp per 8x4 pixel block; buffers live through the synchronous readback.
         unsafe {
             self.device.module.shade(
                 &self.device.stream,
                 LaunchConfig {
-                    grid_dim: (count.div_ceil(block), 1, 1),
-                    block_dim: (block, 1, 1),
+                    grid_dim: (width.div_ceil(8) * height.div_ceil(4), 1, 1),
+                    block_dim: (32, 1, 1),
                     shared_mem_bytes: 0,
                 },
+                width,
+                height,
                 &self.fragments.device,
                 &self.fragment_meta.device,
                 winners,
@@ -256,7 +258,7 @@ struct CudaTriangle {
 }
 #[derive(Clone, Copy)]
 struct CudaPrimitive {
-    /// u32::MAX selects the default material.
+    /// The material count selects the default material appended after the scene's.
     material_index: u32,
     mirrored: bool,
     double_sided: bool,
@@ -320,7 +322,7 @@ impl CudaVertex {
             indices.extend(std::iter::repeat_n(i, primitive.vertices.len()));
             let material_index = primitive.source.material_index;
             primitives.push(CudaPrimitive {
-                material_index: material_index.map_or(u32::MAX, |i| i as u32),
+                material_index: material_index.unwrap_or(materials.len()) as u32,
                 mirrored: primitive.mirrored,
                 double_sided: material_index.is_some_and(|i| materials[i].double_sided),
             });
@@ -751,62 +753,66 @@ mod kernels {
 
     #[kernel]
     pub fn shade(
+        width: u32,
+        height: u32,
         fragments: &[f32],
         fragment_meta: &[u32],
         winners: &[DeviceAtomicU64],
         materials: &[Material],
-        texels: &[Vec4],
+        texels: &[Texel],
         lights: &[RenderLight],
         maps: &[ShadowMap],
         depths: &[f32],
         camera: [f32; 3],
         mut colors: DisjointSlice<[f32; 3]>,
     ) {
-        let offset = thread::index_1d().get();
-        let stride = colors.len();
-        if offset < stride {
-            let mut color = Vec3::ZERO;
-            if winners
-                .get(offset)
-                .is_some_and(|winner| winner.load(AtomicOrdering::Relaxed) != u64::MAX)
-            {
-                let material_index = fragment_meta[soa_offset::<2>(offset, 0)];
-                let default_material = Material::default();
-                let shading = Shading {
-                    texels,
-                    lights,
-                    maps,
-                    depths,
-                    camera_position: Vec3::from_array(camera),
-                };
-                color = crate::fragment::shade(
-                    &shading,
-                    materials
-                        .get(material_index as usize)
-                        .unwrap_or(&default_material),
-                    &FragmentAttributes::load_soa(fragments, offset),
-                    fragment_meta[soa_offset::<2>(offset, 1)] != 0,
-                );
-            }
-            // Transpose in the warp: contiguous stores, CPU RGB order, no repacking.
-            let lane = offset % 32;
-            for plane in 0..3 {
-                let slot = plane * 32 + lane;
-                let source = (slot / 3) as u32;
-                let r = cuda_device::warp::shuffle_f32(color.x, source);
-                let g = cuda_device::warp::shuffle_f32(color.y, source);
-                let b = cuda_device::warp::shuffle_f32(color.z, source);
-                let value = match slot % 3 {
-                    0 => r,
-                    1 => g,
-                    _ => b,
-                };
-                // Padded warps participate fully and each lane writes a distinct scalar.
+        // Each warp shades an 8x4 pixel block, one 8-pixel row per group of 8 lanes.
+        let index = thread::index_1d().get();
+        let (block, lane) = (index / 32, index % 32);
+        let blocks = (width as usize).div_ceil(8);
+        let row_start = block % blocks * 8;
+        let x = row_start + lane % 8;
+        let y = block / blocks * 4 + lane / 8;
+        let sample = y * width as usize + x;
+        let mut color = Vec3::ZERO;
+        if x < width as usize
+            && y < height as usize
+            && winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX
+        {
+            let shading = Shading {
+                texels,
+                lights,
+                maps,
+                depths,
+                camera_position: Vec3::from_array(camera),
+            };
+            color = crate::fragment::shade(
+                &shading,
+                &materials[fragment_meta[soa_offset::<2>(sample, 0)] as usize],
+                &FragmentAttributes::load_soa(fragments, sample),
+                fragment_meta[soa_offset::<2>(sample, 1)] != 0,
+            );
+        }
+        // Transpose each row's colors so its lanes store contiguous floats in CPU RGB order.
+        let valid = (width as usize - row_start).min(8) * 3;
+        for plane in 0..3 {
+            let slot = plane * 8 + lane % 8;
+            let source = (lane / 8 * 8 + slot / 3) as u32;
+            let r = cuda_device::warp::shuffle_f32(color.x, source);
+            let g = cuda_device::warp::shuffle_f32(color.y, source);
+            let b = cuda_device::warp::shuffle_f32(color.z, source);
+            let value = match slot % 3 {
+                0 => r,
+                1 => g,
+                _ => b,
+            };
+            if y < height as usize && slot < valid {
+                // Each lane writes a distinct scalar of an in-bounds row.
                 unsafe {
                     colors
                         .as_mut_ptr()
                         .cast::<f32>()
-                        .add((offset / 32) * 96 + slot)
+                        .add((sample - lane % 8) * 3 + slot)
                         .write(value);
                 }
             }
@@ -962,7 +968,7 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
         &mut self,
         scene: &PreparedScene,
         materials: &[Material],
-        texels: &[Vec4],
+        texels: &[Texel],
         lights: Vec<Light>,
         config: &ShadowConfig,
         unshadowed_lights: &[Light],
@@ -994,9 +1000,15 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
         self.fragment
             .depths
             .resize(maps.last().map_or(0, ShadowMap::end))?;
+        // The default material follows the scene materials, so every index reads device memory.
+        let table: Vec<_> = materials
+            .iter()
+            .copied()
+            .chain([Material::default()])
+            .collect();
         // Materials, lights and maps hold values and array offsets, never host pointers.
         unsafe {
-            self.fragment.materials.upload(materials)?;
+            self.fragment.materials.upload(&table)?;
             self.fragment.texels.upload(texels)?;
             self.fragment.lights.upload(&lights)?;
             self.fragment.maps.upload(&maps)?;
@@ -1059,9 +1071,10 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
             height,
             None,
         )?;
-        self.fragment.colors.resize(padded_count(count as usize))?;
+        self.fragment.colors.resize(count as usize)?;
         let fragment_events = self.fragment.shade_device(
-            count,
+            width,
+            height,
             &self.rasterization.winners.device,
             camera_position,
         )?;

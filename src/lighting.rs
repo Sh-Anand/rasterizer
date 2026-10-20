@@ -1,10 +1,13 @@
 use std::{f32::consts::PI, io};
 
-use glam::{Vec3, Vec4};
+use glam::Vec3;
 
 use crate::{
-    config::LightConfig, geometry::PreparedScene, material::Material, shadow::LightShadow,
-    texture::UvSample,
+    config::LightConfig,
+    geometry::PreparedScene,
+    material::Material,
+    shadow::LightShadow,
+    texture::{Texel, UvSample},
 };
 
 #[derive(Clone, Copy)]
@@ -20,6 +23,7 @@ pub enum Light {
 }
 
 impl Light {
+    #[inline(always)]
     pub fn sample(&self, position: Vec3) -> Option<LightSample> {
         match self {
             Self::Directional(light) => Some(LightSample {
@@ -146,7 +150,7 @@ impl AreaLight {
 pub fn collect_lights(
     scene: &PreparedScene,
     materials: &[Material],
-    texels: &[Vec4],
+    texels: &[Texel],
     config: &LightConfig,
 ) -> io::Result<Vec<Light>> {
     let mut lights = vec![Light::Directional(DirectionalLight::new(

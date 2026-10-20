@@ -11,7 +11,7 @@ use crate::{
     lighting::RenderLight,
     material::Material,
     shadow::ShadowMap,
-    texture::UvSample,
+    texture::{Texel, UvSample},
 };
 
 pub trait VertexStage {
@@ -84,7 +84,7 @@ pub trait RasterizationStage {
 #[derive(Clone, Copy)]
 pub struct Shading<'a> {
     /// Every material texture's mip levels.
-    pub texels: &'a [Vec4],
+    pub texels: &'a [Texel],
     pub lights: &'a [RenderLight],
     pub maps: &'a [ShadowMap],
     /// Every shadow map's depths.
