@@ -8,6 +8,7 @@ use cuda_device::{atomic::DeviceAtomicU64, cuda_module};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
 use crate::{
+    bvh::{self, Node},
     config::ShadowConfig,
     framebuffer::{DepthBuffer, Framebuffer, RenderOutput},
     geometry::{ClipVertex, PreparedScene, PreparedVertex, VertexTransform, check_view_projection},
@@ -180,6 +181,8 @@ pub struct CudaFragment {
     maps: Buffer<ShadowMap>,
     depths: Buffer<f32>,
     colors: Buffer<[f32; 3]>,
+    /// Primary and bounce-hit material per pixel.
+    hits: Buffer<u32>,
 }
 
 impl CudaFragment {
@@ -195,6 +198,7 @@ impl CudaFragment {
             maps: Buffer::new(context),
             depths: Buffer::new(context),
             colors: Buffer::new(context),
+            hits: Buffer::new(context),
             device,
         }
     }
@@ -266,6 +270,9 @@ pub struct CudaVertex {
     output: Buffer<f32>,
     triangles: Buffer<CudaTriangle>,
     primitives: Buffer<CudaPrimitive>,
+    /// Bounce BVH over `triangles`; empty without the bounce.
+    nodes: Buffer<Node>,
+    order: Buffer<u32>,
     error: Buffer<DeviceAtomicU64>,
 }
 
@@ -279,13 +286,20 @@ impl CudaVertex {
             output: Buffer::new(context),
             triangles: Buffer::new(context),
             primitives: Buffer::new(context),
+            nodes: Buffer::new(context),
+            order: Buffer::new(context),
             error: Buffer::new(context),
             device,
         }
     }
 
     /// Material indices must be checked against the material list.
-    fn upload_geometry(&mut self, scene: &PreparedScene, materials: &[Material]) -> io::Result<()> {
+    fn upload_geometry(
+        &mut self,
+        scene: &PreparedScene,
+        materials: &[Material],
+        bounce: bool,
+    ) -> io::Result<()> {
         let count = scene
             .primitives
             .iter()
@@ -307,11 +321,20 @@ impl CudaVertex {
         let mut vertices = vec![0.0; padded_count(count as usize) * PreparedVertex::COMPONENTS];
         let mut indices = Vec::with_capacity(count as usize);
         let mut primitives = Vec::with_capacity(scene.primitives.len());
+        let mut world = Vec::new();
         for (i, primitive) in scene.primitives.iter().enumerate() {
             let i = u32::try_from(i).map_err(io::Error::other)?;
             let base = indices.len() as u32;
             for (index, vertex) in primitive.vertices.iter().enumerate() {
                 vertex.store_soa(base as usize + index, |offset, v| vertices[offset] = v);
+            }
+            if bounce {
+                world.extend(
+                    primitive
+                        .vertices
+                        .iter()
+                        .map(|v| primitive.model.transform_point3(v.position)),
+                );
             }
             indices.extend(std::iter::repeat_n(i, primitive.vertices.len()));
             let material_index = primitive.source.material_index;
@@ -338,12 +361,23 @@ impl CudaVertex {
         }
         // Ranks index this stable material order, with the default material first.
         triangles.sort_by_key(|t| scene.primitives[t.primitive as usize].source.material_index);
+        let corners: Vec<_> = if bounce {
+            triangles
+                .iter()
+                .map(|t| t.vertices.map(|v| world[v as usize]))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (nodes, order) = bvh::build(&corners);
         // Geometry and descriptors contain values and indices, never host pointers.
         unsafe {
             self.vertices.upload(&vertices)?;
             self.primitive_indices.upload(&indices)?;
             self.triangles.upload(&triangles)?;
             self.primitives.upload(&primitives)?;
+            self.nodes.upload(&nodes)?;
+            self.order.upload(&order)?;
         }
         Ok(())
     }
@@ -813,6 +847,130 @@ mod kernels {
             }
         }
     }
+
+    /// Adds one cosine-weighted diffuse bounce. Lanes keep shading's 8x4 pixel blocks, so a
+    /// warp shades its hits in ray launch order, across whatever materials they reach.
+    #[kernel]
+    pub fn bounce(
+        width: u32,
+        height: u32,
+        fragments: &[f32],
+        fragment_meta: &[u32],
+        winners: &[DeviceAtomicU64],
+        vertices: &[f32],
+        triangles: &[CudaTriangle],
+        primitives: &[CudaPrimitive],
+        nodes: &[Node],
+        order: &[u32],
+        materials: &[Material],
+        texels: &[Texel],
+        lights: &[RenderLight],
+        maps: &[ShadowMap],
+        depths: &[f32],
+        mut colors: DisjointSlice<[f32; 3]>,
+        mut hits: DisjointSlice<u32>,
+    ) {
+        let index = thread::index_1d().get();
+        let (block, lane) = (index / 32, index % 32);
+        let blocks = (width as usize).div_ceil(8);
+        let x = block % blocks * 8 + lane % 8;
+        let y = block / blocks * 4 + lane / 8;
+        if x >= width as usize || y >= height as usize {
+            return;
+        }
+        let sample = y * width as usize + x;
+        let (mut primary, mut hit_material) = (u32::MAX, u32::MAX);
+        if winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX {
+            primary = fragment_meta[soa_offset::<2>(sample, 0)];
+            let attributes = FragmentAttributes::load_soa(fragments, sample);
+            let surface = materials[primary as usize].sample(texels, attributes.uv);
+            let normal = if fragment_meta[soa_offset::<2>(sample, 1)] != 0 {
+                attributes.normal
+            } else {
+                -attributes.normal
+            };
+            let position = attributes.world_position;
+            let origin = position + normal * (1e-4 * (1.0 + position.abs().max_element()));
+            let direction = cosine_direction(normal, sample as u32);
+            let corners = |triangle: u32| {
+                triangles[triangle as usize].vertices.map(|v| {
+                    Vec3::from_array(std::array::from_fn(|c| {
+                        vertices[soa_offset::<{ ClipVertex::COMPONENTS }>(v as usize, 4 + c)]
+                    }))
+                })
+            };
+            if let Some(hit) = bvh::closest_hit(nodes, order, origin, direction, corners) {
+                let triangle = triangles[hit.triangle as usize];
+                let primitive = primitives[triangle.primitive as usize];
+                let [a, b, c] = triangle
+                    .vertices
+                    .map(|v| ClipVertex::load_soa(vertices, v as usize));
+                let [wa, wb, wc] = hit.barycentric;
+                let hit_attributes = FragmentAttributes {
+                    world_position: origin + direction * hit.t,
+                    // Hits read level zero; ray cones could select a mip level.
+                    uv: UvSample::point(a.uv * wa + b.uv * wb + c.uv * wc),
+                    normal: (a.normal * wa + b.normal * wb + c.normal * wc).normalize_or_zero(),
+                    tangent: a.tangent * wa + b.tangent * wb + c.tangent * wc,
+                };
+                let geometric = (b.world_position - a.world_position)
+                    .cross(c.world_position - a.world_position);
+                let front_facing = (geometric.dot(direction) < 0.0) != primitive.mirrored;
+                let shading = Shading {
+                    texels,
+                    lights,
+                    maps,
+                    depths,
+                    camera_position: origin,
+                };
+                let radiance = crate::fragment::shade(
+                    &shading,
+                    &materials[primitive.material_index as usize],
+                    &hit_attributes,
+                    front_facing,
+                    &mut (),
+                );
+                // Cosine-weighted sampling cancels the Lambertian cosine and 1/pi.
+                let indirect = surface.base_color * (1.0 - surface.metallic) * radiance;
+                // Each lane owns its pixel's color and hit slots.
+                let color = unsafe { colors.get_unchecked_mut(sample) };
+                color[0] += indirect.x;
+                color[1] += indirect.y;
+                color[2] += indirect.z;
+                hit_material = primitive.material_index;
+            }
+        }
+        unsafe {
+            *hits.get_unchecked_mut(2 * sample) = primary;
+            *hits.get_unchecked_mut(2 * sample + 1) = hit_material;
+        }
+    }
+
+    fn cosine_direction(normal: Vec3, seed: u32) -> Vec3 {
+        // PCG hash.
+        let hash = |x: u32| {
+            let x = x.wrapping_mul(747796405).wrapping_add(2891336453);
+            let word = ((x >> ((x >> 28) + 4)) ^ x).wrapping_mul(277803737);
+            (word >> 22) ^ word
+        };
+        let first = hash(seed);
+        let u = (first >> 8) as f32 / 16777216.0;
+        let v = (hash(first) >> 8) as f32 / 16777216.0;
+        let (sin, cos) = (std::f32::consts::TAU * v).sin_cos();
+        let radius = u.sqrt();
+        // Branchless orthonormal basis (Duff et al. 2017).
+        let sign = 1f32.copysign(normal.z);
+        let a = -1.0 / (sign + normal.z);
+        let b = normal.x * normal.y * a;
+        let tangent = Vec3::new(
+            1.0 + sign * normal.x * normal.x * a,
+            sign * b,
+            -sign * normal.x,
+        );
+        let bitangent = Vec3::new(b, sign + normal.y * normal.y * a, -normal.y);
+        (tangent * (radius * cos) + bitangent * (radius * sin) + normal * (1.0 - u).sqrt())
+            .normalize_or_zero()
+    }
 }
 
 fn elapsed(events: &(CudaEvent, CudaEvent)) -> io::Result<Duration> {
@@ -959,6 +1117,8 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
     }
 
     /// Upload geometry, textures, lights and GPU shadow maps; repeat after scene changes.
+    /// With `bounce`, also build the BVH that adds a diffuse bounce to every render.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_cuda_lights(
         &mut self,
         scene: &PreparedScene,
@@ -967,6 +1127,7 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
         lights: Vec<Light>,
         config: &ShadowConfig,
         unshadowed_lights: &[Light],
+        bounce: bool,
     ) -> io::Result<()> {
         self.check_cuda()?;
         u32::try_from(materials.len()).map_err(io::Error::other)?;
@@ -981,7 +1142,7 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
             ));
         }
         self.fragment.resident_key = None;
-        self.vertex.upload_geometry(scene, materials)?;
+        self.vertex.upload_geometry(scene, materials, bounce)?;
         let positions = if config.enabled && !lights.is_empty() {
             scene.world_positions()?
         } else {
@@ -1073,6 +1234,43 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
             &self.rasterization.winners.device,
             camera_position,
         )?;
+        let bounce_events = if self.vertex.nodes.device.is_empty() {
+            None
+        } else {
+            let (vertex, fragment) = (&self.vertex, &mut self.fragment);
+            fragment.hits.resize(2 * count as usize)?;
+            let start = vertex.device.event()?;
+            // Buffers live through the synchronous readback.
+            unsafe {
+                vertex.device.module.bounce(
+                    &vertex.device.stream,
+                    LaunchConfig {
+                        grid_dim: (width.div_ceil(8) * height.div_ceil(4), 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    width,
+                    height,
+                    &fragment.fragments.device,
+                    &fragment.fragment_meta.device,
+                    &self.rasterization.winners.device,
+                    &vertex.output.device,
+                    &vertex.triangles.device,
+                    &vertex.primitives.device,
+                    &vertex.nodes.device,
+                    &vertex.order.device,
+                    &fragment.materials.device,
+                    &fragment.texels.device,
+                    &fragment.lights.device,
+                    &fragment.maps.device,
+                    &fragment.depths.device,
+                    &mut fragment.colors.device,
+                    &mut fragment.hits.device,
+                )
+            }
+            .map_err(io::Error::other)?;
+            Some((start, vertex.device.event()?))
+        };
         let stream = &self.vertex.device.stream;
         let color = self.fragment.read_colors(count as usize)?;
         let depth = self
@@ -1086,6 +1284,9 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
         self.stats.vertex_time = elapsed(&vertex_events)?;
         self.stats.rasterization_time = elapsed(&raster_events)?;
         self.stats.fragment_time = elapsed(&fragment_events)?;
+        if let Some(events) = &bounce_events {
+            self.stats.bounce_time = elapsed(events)?;
+        }
         self.stats.vertices_shaded = self.vertex.primitive_indices.device.len();
         self.stats.fragments_shaded = counters[2] as usize;
         Ok(RenderOutput {
@@ -1101,6 +1302,19 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
             screen_vertices: None,
             screen_triangles: counters[1] as usize,
         })
+    }
+
+    /// The last render's primary and bounce-hit material index per pixel, interleaved, with
+    /// `u32::MAX` for none; empty without the bounce.
+    pub fn bounce_materials(&self) -> io::Result<Vec<u32>> {
+        if self.vertex.nodes.device.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.fragment
+            .hits
+            .device
+            .to_host_vec(&self.vertex.device.stream)
+            .map_err(io::Error::other)
     }
 }
 

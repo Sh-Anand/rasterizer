@@ -66,10 +66,15 @@ or replacing a scene; pointer/length checks cannot detect all changes, so call
 `Pipeline::invalidate_resources()` to make renders fail until then. Camera movement
 alone needs no preparation.
 
+`bounce = true` in `config.toml` adds one ray-traced diffuse bounce per pixel (CUDA only)
+and writes `output/<scene>.hits`: the render width and height as u32, then each pixel's
+primary and bounce-hit material index as u32 pairs (`u32::MAX` for none; the scene's
+material count selects the default material).
+
 Construct `Pipeline::new(CudaVertex::with_device(...),
 CudaRasterization::with_device(...), CudaFragment::with_device(...))` with the same
 device. Call `prepare_cuda_lights(scene, materials, texels, lights, shadow_config,
-unshadowed_lights)` once and again after scene changes, then call
+unshadowed_lights, bounce)` once and again after scene changes, then call
 `render_cuda(scene, view_projection, materials, width, height, camera_position)`
 for each frame. Light discovery and shadow fitting use prepared host geometry.
 Transformed vertices, visibility, fragment attributes and shadow depths stay on

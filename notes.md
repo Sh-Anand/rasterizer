@@ -74,7 +74,15 @@ Use rasterized shadow maps at each emitting triangle's centroid: five cube faces
 
 Perspective shadow faces store linear light-view depth, normalized by their far distance, with the same one-texel slope bias and configured constant bias. Their range fits the full scene; the near plane is 0.0001 times the far distance, so very nearby occluders can be clipped.
 
-Render direct diffuse and specular lighting, shadows, and surface emission only. Indirect lighting is deferred; its future implementation is undecided. Ignore material occlusion maps, which affect only indirect lighting.
+Render direct diffuse and specular lighting, shadows, and surface emission; the optional ray-traced bounce below is the only indirect lighting. Ignore material occlusion maps.
+
+## Ray-traced bounce
+
+Add one optional cosine-weighted diffuse bounce per pixel, on CUDA only and without a CPU reference; rasterization keeps primary visibility, as in hybrid engines. The bounce exists to produce incoherent hit shading for tensor-core batching studies, so a roughly right image suffices.
+
+A host BVH splits at the median centroid of the widest axis, with leaves of up to four triangles, and indexes the rank-ordered triangle list, so hits read the resident vertex output and primitive table without duplicated geometry. Surface-area-heuristic builds and child ordering are deferred. Hits interpolate vertex attributes with barycentrics, read texture level zero (no ray cones), and run the shared shader with the ray origin as viewer; misses add nothing.
+
+The bounce kernel keeps shading's 8x4 pixel blocks, so warps shade hits in ray launch order, unsorted. A separate kernel leaves primary shading's code and timing unchanged. Each bounce render writes every pixel's primary and hit material for batching analysis.
 
 ## Transparency
 

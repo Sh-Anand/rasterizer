@@ -5,6 +5,8 @@ supersampling = 1
 # Material texture filtering: "none" (nearest texel of the nearest mip level), "bilinear"
 # (level zero), or "trilinear".
 sampling = "trilinear"
+# One ray-traced, cosine-weighted diffuse bounce per pixel (CUDA only).
+bounce = false
 
 [output]
 # Linear brightness multiplier; 2.0 is one stop brighter.

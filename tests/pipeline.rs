@@ -752,7 +752,7 @@ fn resident_cuda_preserves_visibility_clipping_and_resource_lifetimes() {
         bias: 0.0,
     };
     for pass in 0..3 {
-        gpu.prepare_cuda_lights(&scene, &materials, &[], vec![], &shadow, &[])
+        gpu.prepare_cuda_lights(&scene, &materials, &[], vec![], &shadow, &[], false)
             .unwrap();
         for (width, height) in [(65, 67), (17, 11), (65, 67)] {
             let expected = cpu

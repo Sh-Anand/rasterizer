@@ -151,6 +151,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = root.join("config.toml");
     let config = Config::load_scene(&config_path, &scene_name(&path).to_string_lossy())
         .map_err(|error| format!("Failed to load '{}': {error}", config_path.display()))?;
+    if config.bounce && !use_cuda {
+        return Err("bounce = true in config.toml requires --cuda".into());
+    }
     let (render_width, render_height) = config.render_size()?;
     let threads = std::thread::available_parallelism()?.get();
     rayon::ThreadPoolBuilder::new()
@@ -242,6 +245,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             source_lights,
             &config.shadow,
             &unshadowed,
+            config.bounce,
         )?;
     }
     let shadow_time = started.elapsed();
@@ -290,6 +294,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .save(&output_path)
         .map_err(|error| format!("Failed to save '{}': {error}", output_path.display()))?;
     let output_time = started.elapsed();
+    let hits_path = output_path.with_extension("hits");
+    #[cfg(feature = "cuda")]
+    if config.bounce {
+        // Render width and height as u32, then primary and hit material per pixel.
+        let hits = resident.as_ref().unwrap().bounce_materials()?;
+        let mut bytes = Vec::with_capacity(8 + 4 * hits.len());
+        for value in [render_width, render_height].into_iter().chain(hits) {
+            bytes.extend(value.to_le_bytes());
+        }
+        fs::write(&hits_path, bytes)
+            .map_err(|error| format!("Failed to save '{}': {error}", hits_path.display()))?;
+    }
 
     let document = &asset.document;
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
@@ -369,11 +385,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ("Vertex shading", stats.vertex_time),
                 ("Rasterization", stats.rasterization_time),
                 ("Fragment shading", stats.fragment_time),
+                ("Diffuse bounce", stats.bounce_time),
                 (
                     "Render setup + color writeback",
                     (frame_setup_time + render_time).saturating_sub(
                         stats.rasterization_time
                             + stats.fragment_time
+                            + stats.bounce_time
                             + if use_cuda {
                                 stats.vertex_time
                             } else {
@@ -405,7 +423,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if trace {
         println!("Wrote {}", trace_path.display());
     }
-    println!("Lighting: direct diffuse + specular");
+    if config.bounce {
+        println!("Wrote {}", hits_path.display());
+        println!("Lighting: direct diffuse + specular, one diffuse bounce");
+    } else {
+        println!("Lighting: direct diffuse + specular");
+    }
     if camera_light {
         println!("Camera light: white, unshadowed");
     }

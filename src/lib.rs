@@ -11,5 +11,7 @@ pub mod shadow;
 pub mod texture;
 pub mod trace;
 
+#[cfg(feature = "cuda")]
+mod bvh;
 mod fragment;
 mod rasterization;

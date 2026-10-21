@@ -123,6 +123,8 @@ pub struct PipelineStats {
     pub vertex_time: Duration,
     pub rasterization_time: Duration,
     pub fragment_time: Duration,
+    /// CUDA diffuse bounce rays and hit shading.
+    pub bounce_time: Duration,
     pub vertices_shaded: usize,
     pub fragments_shaded: usize,
 }
