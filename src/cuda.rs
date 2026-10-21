@@ -23,6 +23,15 @@ use crate::{
     texture::{Texel, UvSample},
 };
 
+/// Diffuse bounce rays per pixel, fixed at build time by the `BOUNCE_RAYS` environment variable.
+pub const BOUNCE_RAYS: u32 = match option_env!("BOUNCE_RAYS") {
+    None => 1,
+    Some(value) => match u32::from_str_radix(value, 10) {
+        Ok(rays) if rays > 0 => rays,
+        _ => panic!("BOUNCE_RAYS must be a positive integer"),
+    },
+};
+
 // Component planes are grouped in warps to keep indexed vertex reads nearby.
 fn padded_count(count: usize) -> usize {
     count.next_multiple_of(32)
@@ -120,7 +129,7 @@ impl<T> Buffer<T> {
         Ok(&mut self.device)
     }
 
-    // Used only for integer atomic buffers.
+    // Used only for integer buffers.
     fn fill(&mut self, byte: u8, stream: &CudaStream) -> io::Result<()> {
         if !self.device.is_empty() {
             unsafe {
@@ -848,8 +857,9 @@ mod kernels {
         }
     }
 
-    /// Adds one cosine-weighted diffuse bounce. Lanes keep shading's 8x4 pixel blocks, so a
-    /// warp shades its hits in ray launch order, across whatever materials they reach.
+    /// Adds a cosine-weighted diffuse bounce from `BOUNCE_RAYS` rays. Lanes keep shading's 8x4
+    /// pixel blocks, so a warp shades each ray's hits in launch order, across whatever materials
+    /// they reach.
     #[kernel]
     pub fn bounce(
         width: u32,
@@ -875,75 +885,79 @@ mod kernels {
         let blocks = (width as usize).div_ceil(8);
         let x = block % blocks * 8 + lane % 8;
         let y = block / blocks * 4 + lane / 8;
-        if x >= width as usize || y >= height as usize {
+        if x >= width as usize
+            || y >= height as usize
+            || winners[y * width as usize + x].load(AtomicOrdering::Relaxed) == u64::MAX
+        {
             return;
         }
         let sample = y * width as usize + x;
-        let (mut primary, mut hit_material) = (u32::MAX, u32::MAX);
-        if winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX {
-            primary = fragment_meta[soa_offset::<2>(sample, 0)];
-            let attributes = FragmentAttributes::load_soa(fragments, sample);
-            let surface = materials[primary as usize].sample(texels, attributes.uv);
-            let normal = if fragment_meta[soa_offset::<2>(sample, 1)] != 0 {
-                attributes.normal
-            } else {
-                -attributes.normal
+        // Each lane owns its pixel's color and hit slots; unwritten slots stay u32::MAX.
+        let slots = sample * (1 + BOUNCE_RAYS as usize);
+        let primary = fragment_meta[soa_offset::<2>(sample, 0)];
+        unsafe { *hits.get_unchecked_mut(slots) = primary };
+        let attributes = FragmentAttributes::load_soa(fragments, sample);
+        let surface = materials[primary as usize].sample(texels, attributes.uv);
+        let normal = if fragment_meta[soa_offset::<2>(sample, 1)] != 0 {
+            attributes.normal
+        } else {
+            -attributes.normal
+        };
+        let position = attributes.world_position;
+        let origin = position + normal * (1e-4 * (1.0 + position.abs().max_element()));
+        let corners = |triangle: u32| {
+            triangles[triangle as usize].vertices.map(|v| {
+                Vec3::from_array(std::array::from_fn(|c| {
+                    vertices[soa_offset::<{ ClipVertex::COMPONENTS }>(v as usize, 4 + c)]
+                }))
+            })
+        };
+        let shading = Shading {
+            texels,
+            lights,
+            maps,
+            depths,
+            camera_position: origin,
+        };
+        let mut radiance = Vec3::ZERO;
+        for ray in 0..BOUNCE_RAYS {
+            let seed = (sample as u32).wrapping_mul(BOUNCE_RAYS).wrapping_add(ray);
+            let direction = cosine_direction(normal, seed);
+            let Some(hit) = bvh::closest_hit(nodes, order, origin, direction, corners) else {
+                continue;
             };
-            let position = attributes.world_position;
-            let origin = position + normal * (1e-4 * (1.0 + position.abs().max_element()));
-            let direction = cosine_direction(normal, sample as u32);
-            let corners = |triangle: u32| {
-                triangles[triangle as usize].vertices.map(|v| {
-                    Vec3::from_array(std::array::from_fn(|c| {
-                        vertices[soa_offset::<{ ClipVertex::COMPONENTS }>(v as usize, 4 + c)]
-                    }))
-                })
+            let triangle = triangles[hit.triangle as usize];
+            let primitive = primitives[triangle.primitive as usize];
+            let [a, b, c] = triangle
+                .vertices
+                .map(|v| ClipVertex::load_soa(vertices, v as usize));
+            let [wa, wb, wc] = hit.barycentric;
+            let hit_attributes = FragmentAttributes {
+                world_position: origin + direction * hit.t,
+                // Hits read level zero; ray cones could select a mip level.
+                uv: UvSample::point(a.uv * wa + b.uv * wb + c.uv * wc),
+                normal: (a.normal * wa + b.normal * wb + c.normal * wc).normalize_or_zero(),
+                tangent: a.tangent * wa + b.tangent * wb + c.tangent * wc,
             };
-            if let Some(hit) = bvh::closest_hit(nodes, order, origin, direction, corners) {
-                let triangle = triangles[hit.triangle as usize];
-                let primitive = primitives[triangle.primitive as usize];
-                let [a, b, c] = triangle
-                    .vertices
-                    .map(|v| ClipVertex::load_soa(vertices, v as usize));
-                let [wa, wb, wc] = hit.barycentric;
-                let hit_attributes = FragmentAttributes {
-                    world_position: origin + direction * hit.t,
-                    // Hits read level zero; ray cones could select a mip level.
-                    uv: UvSample::point(a.uv * wa + b.uv * wb + c.uv * wc),
-                    normal: (a.normal * wa + b.normal * wb + c.normal * wc).normalize_or_zero(),
-                    tangent: a.tangent * wa + b.tangent * wb + c.tangent * wc,
-                };
-                let geometric = (b.world_position - a.world_position)
-                    .cross(c.world_position - a.world_position);
-                let front_facing = (geometric.dot(direction) < 0.0) != primitive.mirrored;
-                let shading = Shading {
-                    texels,
-                    lights,
-                    maps,
-                    depths,
-                    camera_position: origin,
-                };
-                let radiance = crate::fragment::shade(
-                    &shading,
-                    &materials[primitive.material_index as usize],
-                    &hit_attributes,
-                    front_facing,
-                    &mut (),
-                );
-                // Cosine-weighted sampling cancels the Lambertian cosine and 1/pi.
-                let indirect = surface.base_color * (1.0 - surface.metallic) * radiance;
-                // Each lane owns its pixel's color and hit slots.
-                let color = unsafe { colors.get_unchecked_mut(sample) };
-                color[0] += indirect.x;
-                color[1] += indirect.y;
-                color[2] += indirect.z;
-                hit_material = primitive.material_index;
-            }
+            let geometric =
+                (b.world_position - a.world_position).cross(c.world_position - a.world_position);
+            let front_facing = (geometric.dot(direction) < 0.0) != primitive.mirrored;
+            radiance += crate::fragment::shade(
+                &shading,
+                &materials[primitive.material_index as usize],
+                &hit_attributes,
+                front_facing,
+                &mut (),
+            );
+            unsafe { *hits.get_unchecked_mut(slots + 1 + ray as usize) = primitive.material_index };
         }
-        unsafe {
-            *hits.get_unchecked_mut(2 * sample) = primary;
-            *hits.get_unchecked_mut(2 * sample + 1) = hit_material;
-        }
+        // Cosine-weighted sampling cancels the Lambertian cosine and 1/pi.
+        let indirect =
+            surface.base_color * (1.0 - surface.metallic) * (radiance / BOUNCE_RAYS as f32);
+        let color = unsafe { colors.get_unchecked_mut(sample) };
+        color[0] += indirect.x;
+        color[1] += indirect.y;
+        color[2] += indirect.z;
     }
 
     fn cosine_direction(normal: Vec3, seed: u32) -> Vec3 {
@@ -1238,7 +1252,10 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
             None
         } else {
             let (vertex, fragment) = (&self.vertex, &mut self.fragment);
-            fragment.hits.resize(2 * count as usize)?;
+            fragment
+                .hits
+                .resize((1 + BOUNCE_RAYS as usize) * count as usize)?;
+            fragment.hits.fill(255, &vertex.device.stream)?;
             let start = vertex.device.event()?;
             // Buffers live through the synchronous readback.
             unsafe {
@@ -1304,8 +1321,8 @@ impl Pipeline<CudaVertex, CudaRasterization, CudaFragment> {
         })
     }
 
-    /// The last render's primary and bounce-hit material index per pixel, interleaved, with
-    /// `u32::MAX` for none; empty without the bounce.
+    /// The last render's primary material, then each bounce ray's hit material, per pixel,
+    /// with `u32::MAX` for none; empty without the bounce.
     pub fn bounce_materials(&self) -> io::Result<Vec<u32>> {
         if self.vertex.nodes.device.is_empty() {
             return Ok(Vec::new());

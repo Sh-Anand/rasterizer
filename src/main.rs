@@ -294,13 +294,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .save(&output_path)
         .map_err(|error| format!("Failed to save '{}': {error}", output_path.display()))?;
     let output_time = started.elapsed();
+    #[cfg(feature = "cuda")]
     let hits_path = output_path.with_extension("hits");
     #[cfg(feature = "cuda")]
     if config.bounce {
-        // Render width and height as u32, then primary and hit material per pixel.
+        // Render width, height and rays per pixel as u32, then per pixel the primary material
+        // and each ray's hit material.
         let hits = resident.as_ref().unwrap().bounce_materials()?;
-        let mut bytes = Vec::with_capacity(8 + 4 * hits.len());
-        for value in [render_width, render_height].into_iter().chain(hits) {
+        let mut bytes = Vec::with_capacity(12 + 4 * hits.len());
+        let rays = rasterizer::cuda::BOUNCE_RAYS;
+        for value in [render_width, render_height, rays].into_iter().chain(hits) {
             bytes.extend(value.to_le_bytes());
         }
         fs::write(&hits_path, bytes)
@@ -423,10 +426,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if trace {
         println!("Wrote {}", trace_path.display());
     }
+    #[cfg(feature = "cuda")]
     if config.bounce {
         println!("Wrote {}", hits_path.display());
         println!("Lighting: direct diffuse + specular, one diffuse bounce");
-    } else {
+        println!("Bounce rays per pixel: {}", rasterizer::cuda::BOUNCE_RAYS);
+    }
+    if !config.bounce {
         println!("Lighting: direct diffuse + specular");
     }
     if camera_light {

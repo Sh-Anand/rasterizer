@@ -82,7 +82,9 @@ Add one optional cosine-weighted diffuse bounce per pixel, on CUDA only and with
 
 A host BVH splits at the median centroid of the widest axis, with leaves of up to four triangles, and indexes the rank-ordered triangle list, so hits read the resident vertex output and primitive table without duplicated geometry. Surface-area-heuristic builds and child ordering are deferred. Hits interpolate vertex attributes with barycentrics, read texture level zero (no ray cones), and run the shared shader with the ray origin as viewer; misses add nothing.
 
-The bounce kernel keeps shading's 8x4 pixel blocks, so warps shade hits in ray launch order, unsorted. A separate kernel leaves primary shading's code and timing unchanged. Each bounce render writes every pixel's primary and hit material for batching analysis.
+The bounce kernel keeps shading's 8x4 pixel blocks, so warps shade hits in ray launch order, unsorted. A separate kernel leaves primary shading's code and timing unchanged. Each bounce render writes every pixel's primary and hit materials for batching analysis.
+
+Rays per pixel are a build-time constant (`BOUNCE_RAYS`, default 1), so the kernel's ray loop has a fixed trip count; changing it rebuilds. Each lane traces its pixel's rays in sequence, so every loop iteration is one warp-wide batch of hits.
 
 ## Transparency
 

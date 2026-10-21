@@ -66,10 +66,11 @@ or replacing a scene; pointer/length checks cannot detect all changes, so call
 `Pipeline::invalidate_resources()` to make renders fail until then. Camera movement
 alone needs no preparation.
 
-`bounce = true` in `config.toml` adds one ray-traced diffuse bounce per pixel (CUDA only)
-and writes `output/<scene>.hits`: the render width and height as u32, then each pixel's
-primary and bounce-hit material index as u32 pairs (`u32::MAX` for none; the scene's
-material count selects the default material).
+`bounce = true` in `config.toml` adds a ray-traced diffuse bounce (CUDA only), averaging
+`BOUNCE_RAYS` rays per pixel; the count is fixed at build time (`BOUNCE_RAYS=16 ./run.sh
+sponza`) and defaults to 1. Each bounce render writes `output/<scene>.hits`: the render width,
+height and rays per pixel as u32, then per pixel the primary material and each ray's hit
+material (`u32::MAX` for none; the scene's material count selects the default material).
 
 Construct `Pipeline::new(CudaVertex::with_device(...),
 CudaRasterization::with_device(...), CudaFragment::with_device(...))` with the same

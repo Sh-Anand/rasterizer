@@ -5,7 +5,8 @@ supersampling = 1
 # Material texture filtering: "none" (nearest texel of the nearest mip level), "bilinear"
 # (level zero), or "trilinear".
 sampling = "trilinear"
-# One ray-traced, cosine-weighted diffuse bounce per pixel (CUDA only).
+# Ray-traced, cosine-weighted diffuse bounce (CUDA only); build with BOUNCE_RAYS=n for n rays
+# per pixel (default 1).
 bounce = false
 
 [output]
