@@ -10,12 +10,6 @@ pub struct FragmentAttributes {
     pub tangent: Vec4,
 }
 
-#[derive(Clone, Copy)]
-pub enum ShadowProjection {
-    Orthographic,
-    Perspective { far: f32 },
-}
-
 // Left, right, bottom, top, near, far: w + sign * coordinate >= 0.
 const PLANES: [(usize, f32); 6] = [
     (0, 1.0),
@@ -285,7 +279,6 @@ pub(crate) struct Triangle {
     max: Vec2,
     depths: [f32; 3],
     bias: f32,
-    far: Option<f32>,
     pub front_facing: bool,
 }
 
@@ -294,7 +287,7 @@ impl Triangle {
         vertices: &[ScreenVertex; 3],
         mirrored: bool,
         double_sided: bool,
-        shadow: Option<ShadowProjection>,
+        shadow: bool,
     ) -> Option<Self> {
         let [a, b, c] = std::array::from_fn(|i| vertices[i].position);
         let ab = b - a;
@@ -304,24 +297,14 @@ impl Triangle {
         if area == 0.0 || (!front_facing && !double_sided) {
             return None;
         }
-        let far = match shadow {
-            Some(ShadowProjection::Perspective { far }) => Some(far),
-            _ => None,
-        };
-        let depths = std::array::from_fn(|i| {
-            if far.is_some() {
-                vertices[i].inv_w
-            } else {
-                vertices[i].position.z
-            }
-        });
-        let bias = if shadow.is_some() {
+        let depths = std::array::from_fn(|i| vertices[i].position.z);
+        // Shadow depths add a one-texel slope bias covering the PCF footprint.
+        let bias = if shadow {
             let db = depths[1] - depths[0];
             let dc = depths[2] - depths[0];
             let dx = (db * ac.y - dc * ab.y) / area;
             let dy = (ab.x * dc - ac.x * db) / area;
-            let bias = dx.abs() + dy.abs();
-            if far.is_some() { -bias } else { bias }
+            dx.abs() + dy.abs()
         } else {
             0.0
         };
@@ -349,7 +332,6 @@ impl Triangle {
             max: points[0].max(points[1]).max(points[2]),
             depths,
             bias,
-            far,
             front_facing,
         })
     }
@@ -387,14 +369,6 @@ impl Triangle {
             .map(|(depth, weight)| depth * weight)
             .sum::<f32>()
             + self.bias;
-        let depth = if let Some(far) = self.far {
-            if depth <= 0.0 {
-                return None;
-            }
-            depth.recip() / far
-        } else {
-            depth
-        };
         depth.is_finite().then_some(depth)
     }
 }

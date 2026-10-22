@@ -6,10 +6,9 @@
 BOUNCE_RAYS=16 ./run.sh sponza           # 16 bounce rays per pixel (with bounce = true)
 ```
 
-Settings are in `config.toml`; images are written to `output/`. `--camera-light`
-adds an unshadowed light aligned with the camera. The runner builds in release mode
-into `target/gpu`; it requires the one-time CUDA setup below and selects CUDA 13.4 and
-the pinned nightly automatically.
+Settings are in `config.toml`; images are written to `output/`. The runner builds in
+release mode into `target/gpu`; it requires the one-time CUDA setup below and selects
+CUDA 13.4 and the pinned nightly automatically.
 
 ## CUDA
 
@@ -44,17 +43,14 @@ target/gpu/release/rasterizer living-room
 filter results slightly.
 
 `cuda::Renderer::new(device)` owns the stream, kernel module and every device buffer.
-Call `prepare(scene, materials, texels, lights, shadow_config, unshadowed_lights,
-bounce)` once and again after scene changes, then `render(scene, view_projection,
-materials, width, height, camera_position)` for each frame. `prepare` uploads geometry,
-materials, texels and lights and renders the shadow maps; renders reuse them and the
-buffer capacity. Prepare again after editing resources in place or replacing a scene;
-pointer/length checks cannot detect all changes, so call `invalidate_resources()` to
-make renders fail until then. Camera movement alone needs no preparation. Light
-discovery and shadow fitting use prepared host geometry. Transformed vertices,
-visibility, fragment attributes and shadow depths stay on the GPU; only final
-RGB/depth and small error/statistics counters return to the host. Dimensions must be
-nonzero and their product must fit `u32`.
+Call `prepare(scene, materials, texels, light_config, shadow_config, bounce)` once and
+again after any scene or resource change, then `render(scene, view_projection, width,
+height, camera_position)` for each frame. `prepare` uploads geometry, materials and
+texels and renders the light's shadow map, fitted on the host to the prepared geometry;
+renders reuse them and the buffer capacity. Camera movement alone needs no preparation.
+Transformed vertices, visibility, fragment attributes and shadow depths stay on the
+GPU; only final RGB/depth and small error/statistics counters return to the host.
+Dimensions must be nonzero and their product must fit `u32`.
 
 `bounce = true` in `config.toml` adds a ray-traced diffuse bounce, averaging
 `BOUNCE_RAYS` rays per pixel; the count is fixed at build time and defaults to 1. Each

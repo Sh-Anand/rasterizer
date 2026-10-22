@@ -3,8 +3,7 @@ use std::f32::consts::PI;
 use glam::Vec3;
 
 use crate::{
-    lighting::RenderLight, material::Material, rasterization::FragmentAttributes,
-    shadow::ShadowMap, texture::Texel,
+    lighting::Light, material::Material, rasterization::FragmentAttributes, texture::Texel,
 };
 
 /// Fragment-shading resources other than the material table.
@@ -12,9 +11,8 @@ use crate::{
 pub struct Shading<'a> {
     /// Every material texture's mip levels.
     pub texels: &'a [Texel],
-    pub lights: &'a [RenderLight],
-    pub maps: &'a [ShadowMap],
-    /// Every shadow map's depths.
+    pub light: Light,
+    /// The light's shadow-map depths.
     pub depths: &'a [f32],
     pub camera_position: Vec3,
 }
@@ -33,23 +31,15 @@ pub(crate) fn shade(
     let normal = if front_facing { normal } else { -normal };
     let view = (shading.camera_position - position).normalize_or_zero();
     let brdf = Brdf::new(surface.base_color, surface.metallic, surface.roughness);
+    let light = &shading.light;
+    let cosine = normal.dot(light.direction);
     let mut reflected = Vec3::ZERO;
-    for light in shading.lights {
-        let Some(sample) = light.light.sample(position) else {
-            continue;
-        };
-        let cosine = normal.dot(sample.direction);
-        // The BRDF is zero here, so the light contributes nothing and needs no shadow test.
-        if cosine <= 0.0 {
-            continue;
-        }
-        let visibility = match &light.shadow {
-            Some(shadow) => shadow.visibility(shading.maps, shading.depths, position),
-            None => 1.0,
-        };
+    // At or below the horizon the BRDF is zero, so the light needs no shadow test.
+    if cosine > 0.0 {
+        let visibility = light.visibility(shading.depths, position);
         if visibility > 0.0 {
-            reflected += brdf.evaluate(normal, view, sample.direction)
-                * (sample.irradiance * visibility)
+            reflected += brdf.evaluate(normal, view, light.direction)
+                * (light.irradiance * visibility)
                 * cosine.max(0.0);
         }
     }

@@ -12,7 +12,7 @@ Process vertices once for the scene, then resolve visibility across all material
 
 Shade the surviving fragments in one dispatch over framebuffer-order slots, skipping empty slots. Each fragment carries its material index; shading receives the full material table, with a missing index selecting the default glTF material.
 
-Keep shading and sampling code as plain Rust shared by kernels and host preparation. All texture levels live in one texel array and all shadow maps in one depth atlas; textures and maps store offsets, so kernels shade from flat arrays uploaded unchanged. Mip levels and shadow maps stay row-major: with 8x4 shading warps, 8x8 Z-ordered tiles removed only 3-5% more global-load sectors, and their index arithmetic cancelled that saving on the RTX 2000 Ada. Keep resource loading, mip generation, light discovery and shadow fitting on the host. See [README.md](README.md#cuda) for CUDA setup, resource invalidation, and measurement scope.
+Keep shading and sampling code as plain Rust shared by kernels and host preparation. All texture levels live in one texel array, and textures store offsets into it, so kernels shade from a flat array uploaded unchanged. Mip levels and the shadow map stay row-major: with 8x4 shading warps, 8x8 Z-ordered tiles removed only 3-5% more global-load sectors, and their index arithmetic cancelled that saving on the RTX 2000 Ada. Keep resource loading, mip generation and shadow fitting on the host. See [README.md](README.md#cuda) for CUDA setup and measurement scope.
 
 Preserve equal-depth winners by processing the default material first, then ascending glTF material index, with stable primitive and triangle order. Strict less-than depth testing keeps the first winner. This traversal order does not create separate shading batches.
 
@@ -32,7 +32,7 @@ CUDA rasterization handles small triangle bounds within one thread. Larger trian
 
 Visibility atomically minimizes an ordered FP32 depth and stable triangle/fan rank packed into 64 bits. Signed zero compares equally and nonfinite depths are rejected. Triangles are stored in stable material order so a winning rank directly identifies its geometry; shadow passes use the same ranks because ties cannot change a depth-only result. One thread per framebuffer sample reconstructs and interpolates its winning face, initializing empty fragment slots in the same pass. This avoids a second rasterization of all triangles, but still repeats projection/clipping for visible samples. Shading writes black for empty samples.
 
-Shadow passes use the same visibility kernel, skip attribute emission, and unpack winning depths directly into the resident shadow atlas. Camera output reads back RGB and depth only, plus small validation/statistics counters. Invalidation requires preparing again before rendering.
+The shadow pass uses the same visibility kernel, skips attribute emission, and unpacks winning depths directly into the resident shadow map. Camera output reads back RGB and depth only, plus small validation/statistics counters. Renders do not check for stale resources: prepare again after any scene or resource change.
 
 ## Workload traces
 
@@ -48,21 +48,15 @@ This keeps the implementation straightforward, but can increase vertex and trian
 
 ## Shadows
 
-Render shadow maps with the camera's vertex and visibility kernels. Depth passes use the existing shadow depth/bias rules, skip fragment collection and shading, and write directly into the map's depth buffer. Keep light-view construction and visibility filtering in the shadow module. Attribute transformation is shared with camera rendering; a position-only vertex path is deferred. Shadow work belongs to one-time preparation and leaves camera-pass statistics unchanged.
+Render shadow maps with the camera's vertex and visibility kernels. Depth passes use the existing shadow depth/bias rules, skip fragment collection and shading, and write directly into the map's depth buffer. Keep light-view construction and visibility filtering in the lighting module. Attribute transformation is shared with camera rendering; a position-only vertex path is deferred. Shadow work belongs to one-time preparation and leaves camera-pass statistics unchanged.
 
 One orthographic shadow map covers the full scene so off-camera geometry can cast shadows. This keeps fitting simple, but large scenes spread the available resolution thinly. Use a one-texel slope bias to cover the bilinear PCF footprint, plus a configurable constant bias: too little bias causes self-shadowing artifacts; too much detaches shadows from their casters.
 
-Use fixed 2x2 percentage-closer filtering: bilinearly blend four depth-comparison results, not depths. Apply fractional visibility to each light during shading. This reduces jagged edges but does not model an area light's physical penumbra. Keep it independent of material-texture filtering; do not generate depth mipmaps. Clamp directional-map border taps. For emissive lights, remap taps across cube faces with per-face reference depths and average the three comparisons at cube corners.
+Use fixed 2x2 percentage-closer filtering: bilinearly blend four depth-comparison results, not depths. Apply fractional visibility to the light during shading. This reduces jagged edges but does not model a physical penumbra. Keep it independent of material-texture filtering; do not generate depth mipmaps. Clamp border taps.
 
-## Area lights
+## Lights
 
-Use one light list for the configured directional light and emissive triangles from the full, unclipped scene. Emissive triangles remain visible geometry as well as light sources.
-
-Approximate each triangle's illumination with one sample at its world-space centroid, weighted by its area, inverse squared distance, and the receiver and emitter cosines. Emission textures are sampled at the centroid; sidedness follows the material. This is cheap but inaccurate near large triangles and depends on tessellation. Specular highlights also use the centroid, so they do not reproduce the emitter's shape and can be especially inaccurate on smooth surfaces. More samples or area integration can replace it later.
-
-Use rasterized shadow maps at each emitting triangle's centroid: five cube faces aligned to its normal for a one-sided emitter, six for a two-sided emitter. Each sample produces a filtered point-source shadow; this does not integrate visibility over the emitting area or model indirect lighting. Rendering and storage scale with the number of emitting triangles. We keep the per-triangle baseline rather than grouping emitters for now.
-
-Perspective shadow faces store linear light-view depth, normalized by their far distance, with the same one-texel slope bias and configured constant bias. Their range fits the full scene; the near plane is 0.0001 times the far distance, so very nearby occluders can be clipped.
+Light the scene with the configured directional light only. Emissive-triangle area lights were removed: their per-triangle cube shadow maps dominated preparation in scenes with emitters, and the ray-traced bounce already carries emitted light (counting both double-counted it). Emissive surfaces still glow, and light their surroundings only through bounce hits. The camera-aligned debug light was removed with them, leaving one light, so shading reads it from a kernel parameter rather than looping over a light list.
 
 Render direct diffuse and specular lighting, shadows, and surface emission; the optional ray-traced bounce below is the only indirect lighting. Ignore material occlusion maps.
 
@@ -78,7 +72,7 @@ Rays per pixel are a build-time constant (`BOUNCE_RAYS`, default 1), so the kern
 
 ## Transparency
 
-Treat every material as fully opaque. Ignore alpha mode, alpha cutoff, base-color alpha, and texture alpha in camera rendering, shadow maps, and emissive-light collection. Rasterization performs no material texture sampling. Supporting cutouts or blending later requires revisiting visibility and depth ownership.
+Treat every material as fully opaque. Ignore alpha mode, alpha cutoff, base-color alpha, and texture alpha in camera rendering and shadow maps. Rasterization performs no material texture sampling. Supporting cutouts or blending later requires revisiting visibility and depth ownership.
 
 ## Runtime material shading
 
@@ -88,7 +82,7 @@ Sample all of a material's textures together at one UV before lighting, as an on
 
 Use isotropic box-filtered mipmaps, without anisotropic filtering or normal-variance roughness compensation. Oblique textures can blur. Shadow maps use comparison filtering independently of this setting.
 
-Compute direct diffuse and specular together at runtime, sharing each light's direction and shadow lookup. Use GGX distribution, height-correlated Smith visibility, and Schlick Fresnel, with dielectric F0 = 0.04 and metallic F0 = base color. Multiply direct diffuse reflectance by `1 - F_dielectric(V dot H)`; do not apply the metallic-tinted specular Fresnel to this term. This follows the [glTF metallic-roughness mixing model](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#metal-brdf-and-dielectric-brdf), itself an approximation rather than an exactly energy-conserving layered BRDF.
+Compute direct diffuse and specular together at runtime, sharing the light's direction and shadow lookup. Use GGX distribution, height-correlated Smith visibility, and Schlick Fresnel, with dielectric F0 = 0.04 and metallic F0 = base color. Multiply direct diffuse reflectance by `1 - F_dielectric(V dot H)`; do not apply the metallic-tinted specular Fresnel to this term. This follows the [glTF metallic-roughness mixing model](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#metal-brdf-and-dielectric-brdf), itself an approximation rather than an exactly energy-conserving layered BRDF.
 
 No environment reflections or microfacet multiple-scattering compensation is included. Rough metals can therefore lose energy and metals without directly visible lights can appear dark.
 

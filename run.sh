@@ -2,7 +2,7 @@
 set -euo pipefail
 
 case "${1:-}" in
-    -h|--help) echo "Usage: $0 [scene] [--camera-light]"; exit 0 ;;
+    -h|--help) echo "Usage: $0 [scene]"; exit 0 ;;
 esac
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 

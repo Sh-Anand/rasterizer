@@ -7,17 +7,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use glam::Vec3;
-
 use rasterizer::{
     config::Config,
     cuda::{BOUNCE_RAYS, Renderer},
     geometry::{GltfAsset, prepare_scene},
-    lighting::{DirectionalLight, Light, collect_lights},
     material::load_materials,
 };
 
-const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb> [--camera-light]\n\nWithout arguments, list bundled scenes.\n--camera-light: add a white, unshadowed directional light aligned with the camera (off by default).\nRender: ./run.sh living-room";
+const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb>\n\nWithout arguments, list bundled scenes.\nRender: ./run.sh living-room";
 
 fn scene_paths() -> io::Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -104,12 +101,9 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut camera_light = false;
     let mut positional = Vec::new();
     for arg in env::args_os().skip(1) {
-        if arg == "--camera-light" {
-            camera_light = true;
-        } else if arg == "--help" || arg == "-h" {
+        if arg == "--help" || arg == "-h" {
             println!("{USAGE}");
             return Ok(());
         } else if arg.to_string_lossy().starts_with('-') {
@@ -120,9 +114,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut args = positional.into_iter();
     let Some(path) = args.next() else {
-        if camera_light {
-            return Err(format!("Expected a scene.\n\n{USAGE}").into());
-        }
         list_scenes().map_err(|error| format!("Failed to list scenes: {error}"))?;
         return Ok(());
     };
@@ -158,24 +149,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let material_time = started.elapsed();
     eprintln!("Preparing direct-light shadows...");
     let started = Instant::now();
-    let lights = collect_lights(&prepared, &materials, &texels, &config.light)?;
-    let unshadowed = if camera_light {
-        let direction = Vec3::from(config.camera.position) - Vec3::from(config.camera.target);
-        vec![Light::Directional(DirectionalLight::new(
-            direction.to_array(),
-            [1.0; 3],
-            1.0,
-        )?)]
-    } else {
-        Vec::new()
-    };
     renderer.prepare(
         &prepared,
         &materials,
         &texels,
-        lights,
+        &config.light,
         &config.shadow,
-        &unshadowed,
         config.bounce,
     )?;
     let shadow_time = started.elapsed();
@@ -183,7 +162,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rendered = renderer.render(
         &prepared,
         camera_matrix,
-        &materials,
         render_width,
         render_height,
         config.camera.position.into(),
@@ -230,27 +208,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Camera (config.toml): position {:?}, target {:?}",
         config.camera.position, config.camera.target
     );
-    println!("Scenes: {}", document.scenes().len());
-    if let Some(scene) = document.default_scene() {
-        println!(
-            "Default scene: {} ({})",
-            scene.index(),
-            scene.name().unwrap_or("unnamed")
-        );
-    } else {
-        println!("Default scene: none");
-    }
-    println!("Nodes: {}", document.nodes().len());
     println!(
         "Meshes: {} ({primitives} primitives)",
         document.meshes().len()
     );
     println!("Materials: {}", document.materials().len());
     println!("Textures: {}", document.textures().len());
-    println!("Images decoded: {}", asset.images.len());
-    println!("Buffers loaded: {}", asset.buffers.len());
-    println!("Cameras: {}", document.cameras().len());
-    println!("Animations: {}", document.animations().len());
     let triangles: usize = prepared.primitives.iter().map(|p| p.triangles.len()).sum();
     let stats = renderer.stats();
     println!("Triangles loaded (selected scene, before clipping): {triangles}");
@@ -320,15 +283,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("Bounce rays per pixel: {BOUNCE_RAYS}");
     } else {
         println!("Lighting: direct diffuse + specular");
-    }
-    if camera_light {
-        println!("Camera light: white, unshadowed");
-    }
-
-    let extensions: Vec<_> = document.extensions_used().collect();
-    if !extensions.is_empty() {
-        println!("Declared extensions: {}", extensions.join(", "));
-        println!("Extension metadata is retained; extension behavior is not implemented.");
     }
     Ok(())
 }

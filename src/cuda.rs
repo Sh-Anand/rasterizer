@@ -9,17 +9,16 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 
 use crate::{
     bvh::{self, Node},
-    config::ShadowConfig,
+    config::{LightConfig, ShadowConfig},
     fragment::Shading,
     framebuffer::{DepthBuffer, Framebuffer, RenderOutput},
     geometry::{ClipVertex, PreparedScene, PreparedVertex, VertexTransform, check_view_projection},
-    lighting::{Light, RenderLight},
+    lighting::Light,
     material::Material,
     rasterization::{
-        FragmentAttributes, Polygon, ScreenVertex, ShadowProjection, Triangle, UvGradients,
-        clip_triangle, interpolate_attributes, outcode, project_vertex,
+        FragmentAttributes, Polygon, ScreenVertex, Triangle, UvGradients, clip_triangle,
+        interpolate_attributes, outcode, project_vertex,
     },
-    shadow::{ShadowMap, prepare_lights},
     texture::{Texel, UvSample},
 };
 
@@ -190,7 +189,8 @@ pub struct Stats {
 pub struct Renderer {
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
-    resident_key: Option<(usize, usize, usize, usize)>,
+    /// Set by `prepare`.
+    light: Option<Light>,
     stats: Stats,
     vertices: Buffer<f32>,
     primitive_indices: Buffer<u32>,
@@ -210,8 +210,6 @@ pub struct Renderer {
     fragment_meta: Buffer<u32>,
     materials: Buffer<Material>,
     texels: Buffer<Texel>,
-    lights: Buffer<RenderLight>,
-    maps: Buffer<ShadowMap>,
     depths: Buffer<f32>,
     colors: Buffer<[f32; 3]>,
     /// Primary material, then each bounce ray's hit material, per pixel.
@@ -225,7 +223,7 @@ impl Renderer {
         Ok(Self {
             stream: context.default_stream(),
             module: kernels::load(&context).map_err(io::Error::other)?,
-            resident_key: None,
+            light: None,
             stats: Stats::default(),
             vertices: Buffer::new(c),
             primitive_indices: Buffer::new(c),
@@ -244,8 +242,6 @@ impl Renderer {
             fragment_meta: Buffer::new(c),
             materials: Buffer::new(c),
             texels: Buffer::new(c),
-            lights: Buffer::new(c),
-            maps: Buffer::new(c),
             depths: Buffer::new(c),
             colors: Buffer::new(c),
             hits: Buffer::new(c),
@@ -254,11 +250,6 @@ impl Renderer {
 
     pub fn stats(&self) -> &Stats {
         &self.stats
-    }
-
-    /// Invalidate uploaded resources; `prepare` must run again.
-    pub fn invalidate_resources(&mut self) {
-        self.resident_key = None;
     }
 
     fn event(&self) -> io::Result<CudaEvent> {
@@ -398,11 +389,7 @@ mod kernels {
     use cuda_device::{DisjointSlice, SharedArray, atomic::AtomicOrdering, kernel, thread};
 
     #[kernel]
-    pub fn resolve_depth(
-        winners: &[DeviceAtomicU64],
-        offset: usize,
-        mut depth: DisjointSlice<f32>,
-    ) {
+    pub fn resolve_depth(winners: &[DeviceAtomicU64], mut depth: DisjointSlice<f32>) {
         let index = thread::index_1d().get();
         if let Some(winner) = winners.get(index) {
             let key = winner.load(AtomicOrdering::Relaxed);
@@ -414,7 +401,7 @@ mod kernels {
             };
             // Each lane writes one distinct texel in the checked destination range.
             unsafe {
-                *depth.get_unchecked_mut(offset + index) = if key == u64::MAX {
+                *depth.get_unchecked_mut(index) = if key == u64::MAX {
                     f32::INFINITY
                 } else {
                     f32::from_bits(bits)
@@ -528,7 +515,7 @@ mod kernels {
         primitives: &[CudaPrimitive],
         width: u32,
         height: u32,
-        shadow: Option<ShadowProjection>,
+        shadow: bool,
         winners: &[DeviceAtomicU64],
         stats: &[DeviceAtomicU64],
         error: &[DeviceAtomicU64],
@@ -584,7 +571,7 @@ mod kernels {
         primitives: &[CudaPrimitive],
         width: u32,
         height: u32,
-        shadow: Option<ShadowProjection>,
+        shadow: bool,
         winners: &[DeviceAtomicU64],
         stats: &[DeviceAtomicU64],
         error: &[DeviceAtomicU64],
@@ -684,7 +671,7 @@ mod kernels {
                         if fan != rank % 7 {
                             return;
                         }
-                        let Some(setup) = Triangle::new(points, primitive.mirrored, true, None)
+                        let Some(setup) = Triangle::new(points, primitive.mirrored, true, false)
                         else {
                             return;
                         };
@@ -758,8 +745,7 @@ mod kernels {
         winners: &[DeviceAtomicU64],
         materials: &[Material],
         texels: &[Texel],
-        lights: &[RenderLight],
-        maps: &[ShadowMap],
+        light: Light,
         depths: &[f32],
         camera: [f32; 3],
         mut colors: DisjointSlice<[f32; 3]>,
@@ -779,8 +765,7 @@ mod kernels {
         {
             let shading = Shading {
                 texels,
-                lights,
-                maps,
+                light,
                 depths,
                 camera_position: Vec3::from_array(camera),
             };
@@ -834,8 +819,7 @@ mod kernels {
         order: &[u32],
         materials: &[Material],
         texels: &[Texel],
-        lights: &[RenderLight],
-        maps: &[ShadowMap],
+        light: Light,
         depths: &[f32],
         mut colors: DisjointSlice<[f32; 3]>,
         mut hits: DisjointSlice<u32>,
@@ -874,8 +858,7 @@ mod kernels {
         };
         let shading = Shading {
             texels,
-            lights,
-            maps,
+            light,
             depths,
             camera_position: origin,
         };
@@ -957,14 +940,14 @@ impl Renderer {
         &mut self,
         width: u32,
         height: u32,
-        shadow: Option<ShadowProjection>,
+        shadow: bool,
     ) -> io::Result<(CudaEvent, CudaEvent)> {
         let count = sample_count(width, height)?;
         self.winners.resize(count as usize)?;
         // Coverage, projected triangles, winners, queue length/cursor.
         self.counters.resize(5)?;
         self.large.resize(self.triangles.device.len())?;
-        if shadow.is_none() {
+        if !shadow {
             self.fragments
                 .resize(padded_count(count as usize) * FragmentAttributes::COMPONENTS)?;
             self.fragment_meta
@@ -1014,7 +997,7 @@ impl Renderer {
                     .map_err(io::Error::other)?;
             }
         }
-        if shadow.is_none() {
+        if !shadow {
             unsafe {
                 self.module
                     .interpolate(
@@ -1042,6 +1025,7 @@ impl Renderer {
         &mut self,
         width: u32,
         height: u32,
+        light: Light,
         camera_position: Vec3,
     ) -> io::Result<(CudaEvent, CudaEvent)> {
         let start = self.event()?;
@@ -1057,8 +1041,7 @@ impl Renderer {
                 &self.winners.device,
                 &self.materials.device,
                 &self.texels.device,
-                &self.lights.device,
-                &self.maps.device,
+                light,
                 &self.depths.device,
                 camera_position.to_array(),
                 &mut self.colors.device,
@@ -1068,7 +1051,12 @@ impl Renderer {
         Ok((start, self.event()?))
     }
 
-    fn bounce(&mut self, width: u32, height: u32) -> io::Result<(CudaEvent, CudaEvent)> {
+    fn bounce(
+        &mut self,
+        width: u32,
+        height: u32,
+        light: Light,
+    ) -> io::Result<(CudaEvent, CudaEvent)> {
         self.hits
             .resize((1 + BOUNCE_RAYS as usize) * width as usize * height as usize)?;
         self.hits.fill(255, &self.stream)?;
@@ -1090,8 +1078,7 @@ impl Renderer {
                 &self.order.device,
                 &self.materials.device,
                 &self.texels.device,
-                &self.lights.device,
-                &self.maps.device,
+                light,
                 &self.depths.device,
                 &mut self.colors.device,
                 &mut self.hits.device,
@@ -1101,17 +1088,15 @@ impl Renderer {
         Ok((start, self.event()?))
     }
 
-    /// Upload geometry, textures, lights and GPU shadow maps; repeat after scene changes.
-    /// With `bounce`, also build the BVH that adds a diffuse bounce to every render.
-    #[allow(clippy::too_many_arguments)]
+    /// Upload geometry and textures and render the light's shadow map; repeat after scene
+    /// changes. With `bounce`, also build the BVH that adds a diffuse bounce to every render.
     pub fn prepare(
         &mut self,
         scene: &PreparedScene,
         materials: &[Material],
         texels: &[Texel],
-        lights: Vec<Light>,
-        config: &ShadowConfig,
-        unshadowed_lights: &[Light],
+        light: &LightConfig,
+        shadow: &ShadowConfig,
         bounce: bool,
     ) -> io::Result<()> {
         self.stream
@@ -1129,48 +1114,41 @@ impl Renderer {
                 "Primitive material index is outside the material list",
             ));
         }
-        self.resident_key = None;
         self.upload_geometry(scene, materials, bounce)?;
-        let positions = if config.enabled && !lights.is_empty() {
+        let positions = if shadow.enabled {
             scene.world_positions()?
         } else {
             Vec::new()
         };
-        let (mut lights, maps) = prepare_lights(lights, &positions, config)?;
-        lights.extend(unshadowed_lights.iter().map(|&light| RenderLight {
-            light,
-            shadow: None,
-        }));
-        self.depths.resize(maps.last().map_or(0, ShadowMap::end))?;
+        let light = Light::new(light, shadow, &positions)?;
         // The default material follows the scene materials, so every index reads device memory.
         let table: Vec<_> = materials
             .iter()
             .copied()
             .chain([Material::default()])
             .collect();
-        // Materials, lights and maps hold values and array offsets, never host pointers.
+        // Materials hold values and array offsets, never host pointers.
         unsafe {
             self.materials.upload(&table)?;
             self.texels.upload(texels)?;
-            self.lights.upload(&lights)?;
-            self.maps.upload(&maps)?;
         }
-        for map in &maps {
+        self.depths
+            .resize(light.shadow.map_or(0, |map| map.len()))?;
+        if let Some(map) = light.shadow {
             self.transform(scene, map.view_projection)?;
-            self.rasterize(map.width, map.height, Some(map.projection))?;
+            self.rasterize(map.resolution, map.resolution, true)?;
             unsafe {
                 self.module.resolve_depth(
                     &self.stream,
-                    LaunchConfig::for_num_elems(sample_count(map.width, map.height)?),
+                    LaunchConfig::for_num_elems(sample_count(map.resolution, map.resolution)?),
                     &self.winners.device,
-                    map.offset,
                     &mut self.depths.device,
                 )
             }
             .map_err(io::Error::other)?;
             self.check_error(scene)?;
         }
-        self.resident_key = Some(resident_key(scene, materials));
+        self.light = Some(light);
         Ok(())
     }
 
@@ -1179,7 +1157,6 @@ impl Renderer {
         &mut self,
         scene: &PreparedScene,
         view_projection: Mat4,
-        materials: &[Material],
         width: u32,
         height: u32,
         camera_position: Vec3,
@@ -1195,21 +1172,18 @@ impl Renderer {
                 "Non-finite camera position",
             ));
         }
-        if self.resident_key != Some(resident_key(scene, materials)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Call prepare after changing or invalidating scene resources",
-            ));
-        }
+        let light = self
+            .light
+            .ok_or_else(|| io::Error::other("Call prepare before render"))?;
         self.stats = Stats::default();
         let vertex_events = self.transform(scene, view_projection)?;
-        let raster_events = self.rasterize(width, height, None)?;
+        let raster_events = self.rasterize(width, height, false)?;
         self.colors.resize(count as usize)?;
-        let fragment_events = self.shade(width, height, camera_position)?;
+        let fragment_events = self.shade(width, height, light, camera_position)?;
         let bounce_events = if self.nodes.device.is_empty() {
             None
         } else {
-            Some(self.bounce(width, height)?)
+            Some(self.bounce(width, height, light)?)
         };
         let mut color = self
             .colors
@@ -1305,15 +1279,6 @@ fn sample_count(width: u32, height: u32) -> io::Result<u32> {
                 "CUDA framebuffer dimensions must be nonzero and fit u32",
             )
         })
-}
-
-fn resident_key(scene: &PreparedScene, materials: &[Material]) -> (usize, usize, usize, usize) {
-    (
-        scene.primitives.as_ptr() as usize,
-        scene.primitives.len(),
-        materials.as_ptr() as usize,
-        materials.len(),
-    )
 }
 
 fn read_counters(

@@ -1,67 +1,37 @@
 use std::{f32::consts::PI, io};
 
-use glam::Vec3;
+use glam::{IVec2, Mat4, Vec2, Vec3, camera::rh};
 
-use crate::{
-    config::LightConfig,
-    geometry::PreparedScene,
-    material::Material,
-    shadow::LightShadow,
-    texture::{Texel, UvSample},
-};
+use crate::config::{LightConfig, ShadowConfig};
 
+/// The configured directional light and, with shadows enabled, its orthographic shadow map.
 #[derive(Clone, Copy)]
-pub struct RenderLight {
-    pub light: Light,
-    pub shadow: Option<LightShadow>,
-}
-
-#[derive(Clone, Copy)]
-pub enum Light {
-    Directional(DirectionalLight),
-    Area(AreaLight),
+pub struct Light {
+    /// World-space direction from the surface toward the light.
+    pub(crate) direction: Vec3,
+    pub(crate) irradiance: Vec3,
+    pub(crate) shadow: Option<ShadowMap>,
 }
 
 impl Light {
-    #[inline(always)]
-    pub fn sample(&self, position: Vec3) -> Option<LightSample> {
-        match self {
-            Self::Directional(light) => Some(LightSample {
-                direction: light.direction,
-                irradiance: light.irradiance,
-            }),
-            Self::Area(light) => light.sample(position),
-        }
-    }
-}
-
-pub struct LightSample {
-    pub direction: Vec3,
-    pub irradiance: Vec3,
-}
-
-#[derive(Clone, Copy)]
-pub struct DirectionalLight {
-    direction: Vec3,
-    irradiance: Vec3,
-}
-
-impl DirectionalLight {
-    /// World-space direction from the surface toward the light.
-    pub fn new(direction: [f32; 3], color: [f32; 3], intensity: f32) -> io::Result<Self> {
-        let direction = Vec3::from_array(direction).try_normalize().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Light direction must be finite and nonzero",
-            )
-        })?;
-        let color = Vec3::from_array(color);
+    /// The shadow map, if enabled, is fitted around `positions`, every scene vertex in world
+    /// space.
+    pub fn new(light: &LightConfig, shadow: &ShadowConfig, positions: &[Vec3]) -> io::Result<Self> {
+        let direction = Vec3::from_array(light.direction)
+            .try_normalize()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Light direction must be finite and nonzero",
+                )
+            })?;
+        let color = Vec3::from_array(light.color);
         // Intensity 1 gives unit response for a facing white Lambertian surface.
-        let irradiance = color * intensity * PI;
+        let irradiance = color * light.intensity * PI;
         if !color.is_finite()
             || color.min_element() < 0.0
-            || !intensity.is_finite()
-            || intensity < 0.0
+            || !light.intensity.is_finite()
+            || light.intensity < 0.0
             || !irradiance.is_finite()
         {
             return Err(io::Error::new(
@@ -69,119 +39,144 @@ impl DirectionalLight {
                 "Light color and intensity must be finite, nonnegative, and not overflow",
             ));
         }
+        let shadow = shadow
+            .enabled
+            .then(|| ShadowMap::new(light_matrix(positions, direction)?, shadow))
+            .transpose()?;
         Ok(Self {
             direction,
             irradiance,
+            shadow,
         })
     }
 
-    pub fn direction(&self) -> Vec3 {
-        self.direction
+    // CUDA shading must inline depth reads to address the shadow map as global memory.
+    #[inline(always)]
+    pub(crate) fn visibility(&self, depths: &[f32], world_position: Vec3) -> f32 {
+        self.shadow
+            .as_ref()
+            .map_or(1.0, |map| map.visibility(depths, world_position))
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct AreaLight {
-    position: Vec3,
-    normal: Vec3,
-    area: f32,
-    radiance: Vec3,
-    double_sided: bool,
+pub struct ShadowMap {
+    pub view_projection: Mat4,
+    /// Width and height in texels.
+    pub resolution: u32,
+    bias: f32,
 }
 
-impl AreaLight {
-    pub fn position(&self) -> Vec3 {
-        self.position
-    }
-
-    pub fn normal(&self) -> Vec3 {
-        self.normal
-    }
-
-    pub fn double_sided(&self) -> bool {
-        self.double_sided
-    }
-
-    pub fn new(vertices: [Vec3; 3], radiance: Vec3, double_sided: bool) -> io::Result<Self> {
-        let [a, b, c] = vertices;
-        let cross = (b - a).cross(c - a);
-        let position = (a + b + c) / 3.0;
-        let area = cross.length() * 0.5;
-        if !position.is_finite()
-            || !area.is_finite()
-            || !radiance.is_finite()
-            || radiance.min_element() < 0.0
-        {
+impl ShadowMap {
+    fn new(view_projection: Mat4, config: &ShadowConfig) -> io::Result<Self> {
+        if config.resolution == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Area light geometry and emission must be finite, with nonnegative emission",
+                "Shadow resolution must be nonzero",
+            ));
+        }
+        if !(0.0..=1.0).contains(&config.bias) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Shadow bias must be finite and in 0..1",
+            ));
+        }
+        if !view_projection.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Non-finite shadow matrix",
             ));
         }
         Ok(Self {
-            position,
-            normal: cross.normalize_or_zero(),
-            area,
-            radiance,
-            double_sided,
+            view_projection,
+            resolution: config.resolution,
+            bias: config.bias,
         })
     }
 
-    fn sample(self, position: Vec3) -> Option<LightSample> {
-        let offset = self.position - position;
-        let distance_squared = offset.length_squared();
-        if distance_squared == 0.0 || !distance_squared.is_finite() {
+    pub(crate) fn len(&self) -> usize {
+        self.resolution as usize * self.resolution as usize
+    }
+
+    fn visibility(&self, depths: &[f32], world_position: Vec3) -> f32 {
+        self.project(world_position).map_or(1.0, |projected| {
+            pcf(projected.truncate(), |texel| {
+                self.compare(texel, projected.z, depths)
+            })
+        })
+    }
+
+    fn project(&self, world_position: Vec3) -> Option<Vec3> {
+        let clip = self.view_projection * world_position.extend(1.0);
+        if !clip.is_finite() || clip.w <= 0.0 {
             return None;
         }
-        let direction = offset / distance_squared.sqrt();
-        let emitter_cosine = self.normal.dot(-direction);
-        let emitter_cosine = if self.double_sided {
-            emitter_cosine.abs()
-        } else {
-            emitter_cosine.max(0.0)
-        };
-        let weight = self.area * emitter_cosine / distance_squared;
-        Some(LightSample {
-            direction,
-            irradiance: self.radiance * weight,
-        })
+        let ndc = clip.truncate() / clip.w;
+        if !ndc.is_finite() || ndc.z.abs() > 1.0 || ndc.truncate().abs().max_element() > 1.0 {
+            return None;
+        }
+        let uv = Vec2::new(ndc.x + 1.0, 1.0 - ndc.y) * 0.5;
+        let pixel = uv * self.resolution as f32 - 0.5;
+        Some(pixel.extend((clip.z / clip.w + 1.0) * 0.5))
+    }
+
+    fn compare(&self, texel: IVec2, depth: f32, depths: &[f32]) -> f32 {
+        let size = self.resolution as i32;
+        let x = texel.x.clamp(0, size - 1) as usize;
+        let y = texel.y.clamp(0, size - 1) as usize;
+        f32::from(depth <= depths[y * self.resolution as usize + x] + self.bias)
     }
 }
 
-pub fn collect_lights(
-    scene: &PreparedScene,
-    materials: &[Material],
-    texels: &[Texel],
-    config: &LightConfig,
-) -> io::Result<Vec<Light>> {
-    let mut lights = vec![Light::Directional(DirectionalLight::new(
-        config.direction,
-        config.color,
-        config.intensity,
-    )?)];
-    for primitive in &scene.primitives {
-        let Some(index) = primitive.source.material_index else {
-            continue;
-        };
-        let material = &materials[index];
-        if material.emissive_factor == Vec3::ZERO {
-            continue;
+fn pcf(pixel: Vec2, sample: impl Fn(IVec2) -> f32) -> f32 {
+    let base = pixel.floor();
+    let weight = pixel - base;
+    let base = base.as_ivec2();
+    let top = sample(base) * (1.0 - weight.x) + sample(base + IVec2::X) * weight.x;
+    let bottom = sample(base + IVec2::Y) * (1.0 - weight.x) + sample(base + IVec2::ONE) * weight.x;
+    top * (1.0 - weight.y) + bottom * weight.y
+}
+
+fn light_matrix(positions: &[Vec3], direction: Vec3) -> io::Result<Mat4> {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for &position in positions {
+        if !position.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Non-finite shadow caster position",
+            ));
         }
-        for triangle in &primitive.triangles {
-            let vertices = triangle.map(|i| primitive.vertices[i as usize]);
-            let uv = (vertices[0].uv + vertices[1].uv + vertices[2].uv) / 3.0;
-            let radiance = material.emission(texels, UvSample::point(uv));
-            if radiance == Vec3::ZERO {
-                continue;
-            }
-            let mut positions = vertices.map(|v| primitive.model.transform_point3(v.position));
-            if primitive.mirrored {
-                positions.swap(1, 2);
-            }
-            let light = AreaLight::new(positions, radiance, material.double_sided)?;
-            if light.area > 0.0 {
-                lights.push(Light::Area(light));
-            }
-        }
+        min = min.min(position);
+        max = max.max(position);
     }
-    Ok(lights)
+    if min.x == f32::INFINITY {
+        return Ok(Mat4::IDENTITY);
+    }
+    let center = min * 0.5 + max * 0.5;
+    let radius = (max - min).length() * 0.5;
+    let padding = (radius * 0.02).max(1e-4);
+    let eye = center + direction * (radius + 2.0 * padding);
+    let up = if direction.y.abs() > 0.99 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let view = rh::view::look_to_mat4(eye, -direction, up);
+    min = Vec3::splat(f32::INFINITY);
+    max = Vec3::splat(f32::NEG_INFINITY);
+    for &position in positions {
+        let position = view.transform_point3(position);
+        min = min.min(position);
+        max = max.max(position);
+    }
+    let projection = rh::proj::opengl::orthographic(
+        min.x - padding,
+        max.x + padding,
+        min.y - padding,
+        max.y + padding,
+        (-max.z - padding).max(0.0),
+        -min.z + padding,
+    );
+    Ok(projection * view)
 }
