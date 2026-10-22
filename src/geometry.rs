@@ -58,14 +58,6 @@ pub struct PrimitiveSource {
     pub material_index: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ClipPrimitive {
-    pub source: PrimitiveSource,
-    pub mirrored: bool,
-    pub vertices: Vec<ClipVertex>,
-    pub triangles: Vec<[u32; 3]>,
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ClipVertex {
     pub position: Vec4,
@@ -77,12 +69,6 @@ pub struct ClipVertex {
     pub tangent: Vec4,
 }
 
-#[derive(Debug, Clone)]
-pub struct ClipScene {
-    pub scene_index: usize,
-    pub primitives: Vec<ClipPrimitive>,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct VertexTransform {
     model: Mat4,
@@ -90,7 +76,6 @@ pub(crate) struct VertexTransform {
     normal: Mat3,
     linear: Mat3,
     sign: f32,
-    #[cfg(feature = "cuda")]
     pub(crate) flat_shaded: bool,
 }
 
@@ -103,7 +88,6 @@ impl VertexTransform {
             normal: primitive.normal_matrix,
             linear,
             sign: linear.determinant().signum(),
-            #[cfg(feature = "cuda")]
             flat_shaded: primitive.flat_shaded,
         }
     }
@@ -132,23 +116,6 @@ impl ClipVertex {
         } else {
             0
         }
-    }
-
-    pub(crate) fn checked(self, primitive: &PreparedPrimitive) -> io::Result<Self> {
-        let message = match self.invalid(primitive.flat_shaded) {
-            1 => "Non-finite vertex position",
-            2 => "Invalid vertex normal",
-            _ => return Ok(self),
-        };
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Node {}, mesh {}, primitive {}: {message}",
-                primitive.source.node_index,
-                primitive.source.mesh_index,
-                primitive.source.primitive_index,
-            ),
-        ))
     }
 }
 

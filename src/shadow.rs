@@ -5,7 +5,7 @@ use glam::{IVec2, Mat3, Mat4, Vec2, Vec3, Vec4, camera::rh};
 use crate::{
     config::ShadowConfig,
     lighting::{AreaLight, Light, RenderLight},
-    pipeline::ShadowProjection,
+    rasterization::ShadowProjection,
 };
 
 /// Shadow maps of one light, as a range of the shared map list.

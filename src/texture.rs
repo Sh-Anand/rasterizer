@@ -213,14 +213,6 @@ impl Texture {
         self.sample_lod(texels, sample.uv, lod)
     }
 
-    /// Sampling mode, and whether a trilinear sample also reads the next mip level.
-    #[inline(always)]
-    pub(crate) fn reads(&self, sample: UvSample) -> (Sampling, bool) {
-        let trilinear = self.sampling == Sampling::Trilinear;
-        let second_level = trilinear && self.clamp_lod(self.lod(sample)).fract() != 0.0;
-        (self.sampling, second_level)
-    }
-
     #[inline(always)]
     fn lod(&self, sample: UvSample) -> f32 {
         let size = Vec2::new(self.width as f32, self.height as f32);

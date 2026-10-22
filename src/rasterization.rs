@@ -1,10 +1,20 @@
-use crate::{
-    geometry::ClipVertex,
-    pipeline::{FragmentAttributes, ShadowProjection},
-    texture::UvSample,
-};
+use crate::{geometry::ClipVertex, texture::UvSample};
 use glam::{Vec2, Vec3, Vec4};
 use std::ops::Range;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FragmentAttributes {
+    pub world_position: Vec3,
+    pub uv: UvSample,
+    pub normal: Vec3,
+    pub tangent: Vec4,
+}
+
+#[derive(Clone, Copy)]
+pub enum ShadowProjection {
+    Orthographic,
+    Perspective { far: f32 },
+}
 
 // Left, right, bottom, top, near, far: w + sign * coordinate >= 0.
 const PLANES: [(usize, f32); 6] = [

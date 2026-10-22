@@ -2,51 +2,41 @@
 
 Record design decisions and their tradeoffs, not implementation details or progress.
 
-## GPU backend
+## Renderer
 
-Select the CPU or CUDA backend for all three stages together. Mixed CPU/CUDA stage combinations were removed: each paid host packing and transfers, and their extra code served no comparison. Keep postprocessing on the CPU. GPU fragment work consumes generated fragments; rasterization owns coverage and visibility. Keep the CPU renderer as the correctness reference.
+Render on CUDA only. The CPU renderer, the replaceable stage interfaces and the CPU-hosted operation trace were removed: new features such as the ray-traced bounce and NTC decode are GPU-only, so a CPU copy would either diverge or need annotations for every shader feature, and a roughly right image checked by eye suffices for this research code. One renderer owns the stream, kernel module and every device buffer. Rasterization owns coverage and visibility; fragment shading consumes the resident fragments. Keep postprocessing on the CPU.
 
-Prepare scene geometry independently of the camera. Decode attributes, generate missing flat normals and tangents (also regenerating a primitive's supplied tangents when any are invalid or a triangle mixes handedness, as in Sponza, instead of rejecting the scene), and split normal/tangent seams before vertex shading so every backend receives fixed topology and object-space attributes. Vertex shading applies the instance transforms and view projection without changing indices. Keep the existing matrix multiplication and normalization order for the CPU reference.
-
-The replaceable stage interfaces exchange host-resident geometry, fragment attributes, and linear HDR colors; only CPU stages implement them. The CUDA specialization of the same Pipeline keeps these intermediates on one device and stream. Rasterization owns clipping, projection, interpolation, and depth; fragment shading owns material color evaluation. The coordinator allocates the framebuffer and scatters returned colors. Supersampling resolve, exposure, tone mapping, and export remain ordinary framebuffer operations outside the replaceable stages.
+Prepare scene geometry independently of the camera. Decode attributes, generate missing flat normals and tangents (also regenerating a primitive's supplied tangents when any are invalid or a triangle mixes handedness, as in Sponza, instead of rejecting the scene), and split normal/tangent seams before vertex shading so it receives fixed topology and object-space attributes. Vertex shading applies the instance transforms and view projection without changing indices.
 
 Process vertices once for the scene, then resolve visibility across all materials before shading. Retain one final fragment per render-resolution sample, replacing its attributes and material index when a closer fragment wins. This bounds fragment storage by the sample count and eliminates cross-material shading overdraw.
 
-Invoke the fragment stage once for the surviving fragments. The CPU collects compact winners; CUDA uses framebuffer-order slots and skips empty slots in its shading kernel. Each fragment carries its material index; shading receives the full material table, with a missing index selecting the default glTF material. The GPU backend uses one dispatch with access to all referenced material and texture data.
+Shade the surviving fragments in one dispatch over framebuffer-order slots, skipping empty slots. Each fragment carries its material index; shading receives the full material table, with a missing index selecting the default glTF material.
 
-Share shading and sampling algorithms and resource layouts between CPU and CUDA. All texture levels live in one texel array and all shadow maps in one depth atlas; textures and maps store offsets, so both backends shade from the same flat arrays and CUDA uploads them unchanged. Mip levels and shadow maps stay row-major: with 8x4 shading warps, 8x8 Z-ordered tiles removed only 3-5% more global-load sectors, and their index arithmetic cancelled that saving on the RTX 2000 Ada. Keep resource loading, mip generation, light discovery and shadow fitting on the host; render shadow depths on the selected backend. See [README.md](README.md#cuda-backends) for CUDA setup, resource invalidation, and measurement scope.
+Keep shading and sampling code as plain Rust shared by kernels and host preparation. All texture levels live in one texel array and all shadow maps in one depth atlas; textures and maps store offsets, so kernels shade from flat arrays uploaded unchanged. Mip levels and shadow maps stay row-major: with 8x4 shading warps, 8x8 Z-ordered tiles removed only 3-5% more global-load sectors, and their index arithmetic cancelled that saving on the RTX 2000 Ada. Keep resource loading, mip generation, light discovery and shadow fitting on the host. See [README.md](README.md#cuda) for CUDA setup, resource invalidation, and measurement scope.
 
-Preserve equal-depth winners by processing the default material first, then ascending glTF material index, with stable primitive and triangle order. Strict less-than depth testing keeps the first winner. This traversal order does not create separate shading batches; the CPU reference uses the same order for comparisons.
+Preserve equal-depth winners by processing the default material first, then ascending glTF material index, with stable primitive and triangle order. Strict less-than depth testing keeps the first winner. This traversal order does not create separate shading batches.
 
-Each single-sample or SSAA fragment owns one distinct framebuffer sample. The coordinator writes its returned color without further depth arbitration. MSAA would require per-sample ownership masks. This design assumes no shader-side discard or depth replacement.
+Each single-sample or SSAA fragment owns one distinct framebuffer sample, so shading writes its color without further depth arbitration. MSAA would require per-sample ownership masks. This design assumes no shader-side discard or depth replacement.
 
 Shade fragments independently, without quad-based lane exchange. Use analytic perspective-correct UV gradients for texture sampling instead of neighboring fragment values. This avoids helper invocations for UV derivatives, but does not reproduce native quad-packing and helper-lane overhead; shaders needing derivatives of other computed values will need explicit derivative handling.
 
 CUDA implements software rasterization on compute cores; it does not use fixed-function graphics rasterization. Treat fragment-to-lane packing as an explicit model, not an exact reproduction of a vendor's hardware scheduler. CUDA shading gives each warp an 8x4 pixel block rather than a 32x1 row strip: compared with strips it fetched 8-25% fewer global-load sectors and lost fewer lanes to divergence, while fragment attribute loads and color stores stay fully coalesced.
 
-Measure wall time around CPU stage interfaces. Measure CUDA stages with events on the same stream, without synchronizing between camera stages; report remaining frame wall time as setup/readback. Count vertices entering vertex shading and surviving fragments entering fragment shading; SSAA fragments are render-resolution samples. Report scene triangles before clipping, and keep loading, lighting preparation, framebuffer writeback, and output times separate from shader timings.
+Measure stages with events on the same stream, without synchronizing between camera stages; report remaining frame wall time as setup/readback. Count vertices entering vertex shading and surviving fragments entering fragment shading; SSAA fragments are render-resolution samples. Report scene triangles before clipping, and keep loading, lighting preparation, framebuffer writeback, and output times separate from shader timings.
 
-Sum measured backend setup, loading, geometry, materials, and shadow preparation as the one-time cost for a static scene. Sum vertex shading, rasterization, fragment shading, render setup/writeback, and postprocessing as the per-render cost when the camera changes. Report PNG encoding and writing separately, outside both totals. These are grouped measurements of the current render, not a steady-state frame-loop benchmark.
+Sum measured backend setup, loading, geometry, materials, and shadow preparation as the one-time cost for a static scene. Sum vertex shading, rasterization, fragment shading, the bounce, render setup/writeback, and postprocessing as the per-render cost when the camera changes. Report PNG encoding and writing separately, outside both totals. These are grouped measurements of the current render, not a steady-state frame-loop benchmark.
 
-All CPU stages share a Rayon worker pool using all available logical CPUs. Vertex and fragment shading preserve output order. Rasterization projects primitives in parallel, bins triangles by their covered sample rows, then processes disjoint bands in parallel. Each band retains triangle order and owns its depth and fragment storage; no pixel locks are needed. The shadow-map loop remains sequential, with parallel vertex shading and rasterization inside each pass.
-
-The CPU projects each surviving source vertex once and shares its index across triangles. Clipping appends intersection vertices while retaining source indices for unchanged vertices. The reported post-clipping vertex count measures unique surviving source vertices plus generated intersections, not triangle corners. CUDA does not report this count: deduplicating source vertices cost a bitset clear and an atomic per surviving triangle vertex in every visibility pass, including shadow passes. CUDA still reports post-clipping triangles.
+Report post-clipping triangles but not vertices: deduplicating source vertices would cost a bitset clear and an atomic per surviving triangle vertex in every visibility pass, including shadow passes.
 
 CUDA rasterization handles small triangle bounds within one thread. Larger triangles enter a bounded queue with at most one entry per input triangle; cooperative blocks divide their samples according to screen area. Warp reductions aggregate coverage/statistics updates. A fast path avoids clipping scratch for wholly visible triangles. This limits idle lanes and repeated setup for tiny triangles without tile bins or a global clipped-geometry pool.
 
 Visibility atomically minimizes an ordered FP32 depth and stable triangle/fan rank packed into 64 bits. Signed zero compares equally and nonfinite depths are rejected. Triangles are stored in stable material order so a winning rank directly identifies its geometry; shadow passes use the same ranks because ties cannot change a depth-only result. One thread per framebuffer sample reconstructs and interpolates its winning face, initializing empty fragment slots in the same pass. This avoids a second rasterization of all triangles, but still repeats projection/clipping for visible samples. Shading writes black for empty samples.
 
-Shadow passes use the same visibility kernel, skip attribute emission, and unpack winning depths directly into the resident shadow atlas. Camera output reads back RGB and depth only, plus small validation/statistics counters. CUDA stage instances must share one device; invalidation requires preparing resident lights/shadows again before rendering.
+Shadow passes use the same visibility kernel, skip attribute emission, and unpack winning depths directly into the resident shadow atlas. Camera output reads back RGB and depth only, plus small validation/statistics counters. Invalidation requires preparing again before rendering.
 
-## Trace backend
+## Workload traces
 
-Emit a binary operation trace of fragment shading for workload analysis; no image is required. The trace follows the shared GPU shader, evaluating values only to resolve branches. Lanes use the CUDA packing: 32-lane warps covering 8x4 pixel blocks. Emit one record per operation and active mask: diverging lanes produce separate records, while lanes running the same code on different data share one.
-
-Texture texels, shadow depths, descriptors and fragment inputs are all plain loads; each descriptor read counts as one load. Straight-line arithmetic is grouped into FP32, special-function and integer counts. Counts are source-level estimates of shader work, not compiled instructions; compiler artifacts such as local-memory copies are excluded.
-
-The trace runs the CPU vertex and rasterization stages and hooks regions inside the shared shader, so only branches between regions split masks: texture presence, the second trilinear level, facing lights, shadowed lights and visible lights. Branches inside a region (texture wrap modes, normal-map early exits, extra shadow taps at cube-face edges and corners, BRDF early returns) are folded into that region's counts. CUDA shading passes a no-op recorder; its generated code and timing are unchanged.
-
-Deferred: per-lane addresses with coalescing and cache analysis, which buffer each load reads, and per-lane texture or weight identity for decoder batching.
+Take workload data from the GPU's own lane assignment rather than a CPU replay: kernels dump per-lane records, as the bounce writes each pixel's primary and hit materials, to be extended with decoder matrix operations. The removed CPU trace replayed the shared shader on CPU-rasterized fragments with source-level operation estimates. Deferred: per-lane addresses with coalescing and cache analysis.
 
 ## Clipping
 
@@ -58,7 +48,7 @@ This keeps the implementation straightforward, but can increase vertex and trian
 
 ## Shadows
 
-Generate shadow maps through the camera pipeline's selected vertex and rasterization backends. Depth passes use the existing shadow depth/bias rules, skip fragment collection and shading, and write directly into the map's depth buffer. Keep light-view construction and visibility filtering in the shadow module. Attribute transformation is shared with camera rendering; a position-only vertex path is deferred. Shadow work belongs to one-time preparation and leaves camera-pass statistics unchanged.
+Render shadow maps with the camera's vertex and visibility kernels. Depth passes use the existing shadow depth/bias rules, skip fragment collection and shading, and write directly into the map's depth buffer. Keep light-view construction and visibility filtering in the shadow module. Attribute transformation is shared with camera rendering; a position-only vertex path is deferred. Shadow work belongs to one-time preparation and leaves camera-pass statistics unchanged.
 
 One orthographic shadow map covers the full scene so off-camera geometry can cast shadows. This keeps fitting simple, but large scenes spread the available resolution thinly. Use a one-texel slope bias to cover the bilinear PCF footprint, plus a configurable constant bias: too little bias causes self-shadowing artifacts; too much detaches shadows from their casters.
 
@@ -78,7 +68,7 @@ Render direct diffuse and specular lighting, shadows, and surface emission; the 
 
 ## Ray-traced bounce
 
-Add one optional cosine-weighted diffuse bounce per pixel, on CUDA only and without a CPU reference; rasterization keeps primary visibility, as in hybrid engines. The bounce exists to produce incoherent hit shading for tensor-core batching studies, so a roughly right image suffices.
+Add one optional cosine-weighted diffuse bounce per pixel; rasterization keeps primary visibility, as in hybrid engines. The bounce exists to produce incoherent hit shading for tensor-core batching studies, so a roughly right image suffices.
 
 A host BVH splits at the median centroid of the widest axis, with leaves of up to four triangles, and indexes the rank-ordered triangle list, so hits read the resident vertex output and primitive table without duplicated geometry. Surface-area-heuristic builds and child ordering are deferred. Hits interpolate vertex attributes with barycentrics, read texture level zero (no ray cones), and run the shared shader with the ray origin as viewer; misses add nothing.
 
@@ -110,4 +100,4 @@ Prepare shadow maps once per process. Camera movement alone does not require new
 
 Keep the framebuffer in linear HDR and apply manual exposure, per-channel Reinhard tone mapping (`x / (1 + x)`), then sRGB encoding only at PNG export. This simple global curve preserves highlight differences but can desaturate bright colors; no automatic exposure or filmic color transform is modeled. Tone mapping can be disabled to recover clamped output.
 
-Use regular-grid supersampling for the CPU reference renderer. A scale of N renders N times the output width and height, with independent coverage, depth, and shading for N² samples per pixel. Resolve color with a box average in linear HDR before tone mapping and sRGB encoding. This reuses the single-sample rasterizer but multiplies camera-framebuffer storage and pixel shading work by N²; it is not an MSAA execution model for GPU traces. Default to 1 (off). Shadow resolution is independent of supersampling.
+Use regular-grid supersampling. A scale of N renders N times the output width and height, with independent coverage, depth, and shading for N² samples per pixel. Resolve color with a box average in linear HDR before tone mapping and sRGB encoding. This reuses the single-sample rasterizer but multiplies camera-framebuffer storage and pixel shading work by N²; it is not an MSAA execution model for GPU traces. Default to 1 (off). Shadow resolution is independent of supersampling.
