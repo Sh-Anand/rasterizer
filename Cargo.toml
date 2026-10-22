@@ -10,7 +10,7 @@ cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "e84e5b3d74
 cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f" }
 # Device code needs scalar glam types.
 glam = { version = "0.33", features = ["scalar-math"] }
-gltf = { version = "1.4.1", features = ["extensions"] }
+gltf = { version = "1.4.1", features = ["extensions", "KHR_materials_emissive_strength"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 mikktspace = { version = "0.3", default-features = false, features = ["glam"] }
 serde = { version = "1", features = ["derive"] }

@@ -86,7 +86,8 @@ impl Material {
                 textures,
                 ColorSpace::Linear,
             )?,
-            emissive_factor: Vec3::from(material.emissive_factor()),
+            emissive_factor: Vec3::from(material.emissive_factor())
+                * material.emissive_strength().unwrap_or(1.0),
             emissive_texture: load_texture(
                 material.emissive_texture(),
                 textures,

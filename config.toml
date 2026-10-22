@@ -99,3 +99,30 @@ enabled = true
 resolution = 1024
 # Constant bias in normalized depth; slope bias is automatic.
 bias = 0.0001
+
+# Chess-in-a-Cornell-box scenes from the pathtracer repo; their glTF camera, with the vertical
+# field of view widened so 4:3 keeps the original 16:9 horizontal framing.
+[scene_cameras.chess-cube]
+position = [6.2991, 1.9999, 2.5292]
+target = [5.4058, 1.8147, 2.1195]
+up = [-0.1619, 0.9826, -0.0913]
+fov_y_degrees = 30.0
+near = 0.1
+far = 100.0
+
+[scene_cameras.car-chess]
+position = [6.2991, 1.9999, 2.5292]
+target = [5.4058, 1.8147, 2.1195]
+up = [-0.1619, 0.9826, -0.0913]
+fov_y_degrees = 30.0
+near = 0.1
+far = 100.0
+
+# Inside the closed mosaic box, low over a front corner of the board.
+[scene_cameras.chess-mosaic]
+position = [1.65, 0.75, 1.65]
+target = [-0.4, 0.2, -0.4]
+up = [0.0, 1.0, 0.0]
+fov_y_degrees = 55.0
+near = 0.05
+far = 100.0

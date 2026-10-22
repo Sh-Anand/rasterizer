@@ -5,6 +5,7 @@
 ./run.sh living-room                     # build and render output/living-room.png
 BOUNCE_RAYS=16 ./run.sh sponza           # 16 bounce rays per pixel instead of 4
 TRACE=1 ./run.sh sponza                  # also write output/sponza.trace
+python3 assets/scenes/chess-mosaic/build.py --materials 4 --panels 8  # regenerate chess-mosaic
 ```
 
 `TRACE=1` builds record which shader regions every GPU lane executes, as warp-level

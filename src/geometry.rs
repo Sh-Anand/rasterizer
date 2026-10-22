@@ -266,13 +266,12 @@ fn prepare_node(
             if normals.is_none() && primitive.get(&gltf::Semantic::Normals).is_some() {
                 return Err(invalid("Cannot read vertex normals"));
             }
-            if normals.as_ref().is_some_and(|normals| {
+            // Unusable supplied normals fall back to flat normals.
+            let normals = normals.filter(|normals| {
                 normals
                     .iter()
-                    .any(|normal| normal.try_normalize().is_none())
-            }) {
-                return Err(invalid("Invalid vertex normal"));
-            }
+                    .all(|normal| normal.try_normalize().is_some())
+            });
             let tangents = if material.normal_texture().is_some() {
                 let supplied = normals.as_ref().and_then(|_| reader.read_tangents());
                 Some(if let Some(supplied) = supplied {
