@@ -24,7 +24,7 @@ use crate::{
 
 /// Diffuse bounce rays per pixel, fixed at build time by the `BOUNCE_RAYS` environment variable.
 pub const BOUNCE_RAYS: u32 = match option_env!("BOUNCE_RAYS") {
-    None => 1,
+    None => 4,
     Some(value) => match u32::from_str_radix(value, 10) {
         Ok(rays) if rays > 0 => rays,
         _ => panic!("BOUNCE_RAYS must be a positive integer"),

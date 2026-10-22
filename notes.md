@@ -68,7 +68,7 @@ A host BVH splits at the median centroid of the widest axis, with leaves of up t
 
 The bounce kernel keeps shading's 8x4 pixel blocks, so warps shade hits in ray launch order, unsorted. A separate kernel leaves primary shading's code and timing unchanged. Each bounce render writes every pixel's primary and hit materials for batching analysis.
 
-Rays per pixel are a build-time constant (`BOUNCE_RAYS`, default 1), so the kernel's ray loop has a fixed trip count; changing it rebuilds. Each lane traces its pixel's rays in sequence, so every loop iteration is one warp-wide batch of hits.
+Rays per pixel are a build-time constant (`BOUNCE_RAYS`, default 4), so the kernel's ray loop has a fixed trip count; changing it rebuilds. Each lane traces its pixel's rays in sequence, so every loop iteration is one warp-wide batch of hits.
 
 ## Transparency
 

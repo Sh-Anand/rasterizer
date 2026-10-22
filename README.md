@@ -3,7 +3,7 @@
 ```sh
 ./run.sh                                 # list bundled scenes
 ./run.sh living-room                     # build and render output/living-room.png
-BOUNCE_RAYS=16 ./run.sh sponza           # 16 bounce rays per pixel (with bounce = true)
+BOUNCE_RAYS=16 ./run.sh sponza           # 16 bounce rays per pixel instead of 4
 ```
 
 Settings are in `config.toml`; images are written to `output/`. The runner builds in
@@ -53,7 +53,7 @@ GPU; only final RGB/depth and small error/statistics counters return to the host
 Dimensions must be nonzero and their product must fit `u32`.
 
 `bounce = true` in `config.toml` adds a ray-traced diffuse bounce, averaging
-`BOUNCE_RAYS` rays per pixel; the count is fixed at build time and defaults to 1. Each
+`BOUNCE_RAYS` rays per pixel; the count is fixed at build time and defaults to 4. Each
 bounce render writes `output/<scene>.hits`: the render width, height and rays per pixel
 as u32, then per pixel the primary material and each ray's hit material (`u32::MAX` for
 none; the scene's material count selects the default material).
@@ -61,7 +61,7 @@ none; the scene's material count selects the default material).
 The resident rasterizer handles small triangles per thread and distributes large
 triangles through a bounded work queue. Atomic depth/owner selection preserves
 stable material/triangle order for equal depths. A per-pixel pass interpolates
-only final winners. Storage includes dense fragment slots (about 34.6 MB at 800×600)
+only final winners. Storage includes dense fragment slots (about 56.6 MB at 1024×768)
 and an 8-byte queue entry per input triangle; no global clipped-geometry pool is needed.
 
 The CLI reports CUDA event intervals for each stage; setup/readback is the remaining

@@ -1,13 +1,13 @@
-width = 800
-height = 600
+width = 1024
+height = 768
 # Per-axis supersampling: 1 = off, 2 = 4 samples/pixel, 4 = 16 samples/pixel.
 supersampling = 1
 # Material texture filtering: "none" (nearest texel of the nearest mip level), "bilinear"
 # (level zero), or "trilinear".
 sampling = "trilinear"
 # Ray-traced, cosine-weighted diffuse bounce (CUDA only); build with BOUNCE_RAYS=n for n rays
-# per pixel (default 1).
-bounce = false
+# per pixel (default 4).
+bounce = true
 
 [output]
 # Linear brightness multiplier; 2.0 is one stop brighter.
