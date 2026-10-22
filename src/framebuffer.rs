@@ -13,7 +13,8 @@ pub struct RenderOutput {
 pub struct Framebuffer {
     /// Linear HDR RGB, before exposure and tone mapping.
     pub color: Vec<Vec3>,
-    pub depth: DepthBuffer,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Framebuffer {
@@ -24,8 +25,8 @@ impl Framebuffer {
     ) -> image::ImageResult<image::RgbImage> {
         output.validate()?;
         if supersampling == 0
-            || !self.depth.width.is_multiple_of(supersampling)
-            || !self.depth.height.is_multiple_of(supersampling)
+            || !self.width.is_multiple_of(supersampling)
+            || !self.height.is_multiple_of(supersampling)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -33,14 +34,14 @@ impl Framebuffer {
             )
             .into());
         }
-        let width = self.depth.width / supersampling;
-        let height = self.depth.height / supersampling;
+        let width = self.width / supersampling;
+        let height = self.height / supersampling;
         let samples = supersampling as f32 * supersampling as f32;
         let mut image = image::RgbImage::new(width, height);
         for (x, y, pixel) in image.enumerate_pixels_mut() {
             let mut color = Vec3::ZERO;
             for sy in y * supersampling..(y + 1) * supersampling {
-                let start = sy as usize * self.depth.width as usize + (x * supersampling) as usize;
+                let start = sy as usize * self.width as usize + (x * supersampling) as usize;
                 color += self.color[start..start + supersampling as usize]
                     .iter()
                     .copied()
@@ -54,10 +55,4 @@ impl Framebuffer {
         }
         Ok(image)
     }
-}
-
-pub struct DepthBuffer {
-    pub width: u32,
-    pub height: u32,
-    pub values: Vec<f32>,
 }

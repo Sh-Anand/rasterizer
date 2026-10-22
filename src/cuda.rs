@@ -11,7 +11,7 @@ use crate::{
     bvh::{self, Node},
     config::{LightConfig, ShadowConfig},
     fragment::Shading,
-    framebuffer::{DepthBuffer, Framebuffer, RenderOutput},
+    framebuffer::{Framebuffer, RenderOutput},
     geometry::{ClipVertex, PreparedScene, PreparedVertex, VertexTransform, check_view_projection},
     lighting::Light,
     material::Material,
@@ -204,7 +204,6 @@ pub struct Renderer {
     error: Buffer<DeviceAtomicU64>,
     winners: Buffer<DeviceAtomicU64>,
     counters: Buffer<DeviceAtomicU64>,
-    depth: Buffer<f32>,
     large: Buffer<[u32; 2]>,
     fragments: Buffer<f32>,
     fragment_meta: Buffer<u32>,
@@ -212,6 +211,8 @@ pub struct Renderer {
     texels: Buffer<Texel>,
     depths: Buffer<f32>,
     colors: Buffer<[f32; 3]>,
+    /// Primary diffuse albedo per pixel, written by shading for the bounce.
+    albedo: Buffer<[f32; 3]>,
     /// Primary material, then each bounce ray's hit material, per pixel.
     hits: Buffer<u32>,
 }
@@ -236,7 +237,6 @@ impl Renderer {
             error: Buffer::new(c),
             winners: Buffer::new(c),
             counters: Buffer::new(c),
-            depth: Buffer::new(c),
             large: Buffer::new(c),
             fragments: Buffer::new(c),
             fragment_meta: Buffer::new(c),
@@ -244,6 +244,7 @@ impl Renderer {
             texels: Buffer::new(c),
             depths: Buffer::new(c),
             colors: Buffer::new(c),
+            albedo: Buffer::new(c),
             hits: Buffer::new(c),
         })
     }
@@ -256,12 +257,13 @@ impl Renderer {
         self.stream.record_event(Some(0)).map_err(io::Error::other)
     }
 
-    /// Material indices must be checked against the material list.
+    /// Material indices must be checked against the material list. `world` holds every
+    /// vertex's world position when the bounce needs a BVH.
     fn upload_geometry(
         &mut self,
         scene: &PreparedScene,
         materials: &[Material],
-        bounce: bool,
+        world: Option<&[Vec3]>,
     ) -> io::Result<()> {
         let count = scene
             .primitives
@@ -284,20 +286,11 @@ impl Renderer {
         let mut vertices = vec![0.0; padded_count(count as usize) * PreparedVertex::COMPONENTS];
         let mut indices = Vec::with_capacity(count as usize);
         let mut primitives = Vec::with_capacity(scene.primitives.len());
-        let mut world = Vec::new();
         for (i, primitive) in scene.primitives.iter().enumerate() {
             let i = u32::try_from(i).map_err(io::Error::other)?;
             let base = indices.len() as u32;
             for (index, vertex) in primitive.vertices.iter().enumerate() {
                 vertex.store_soa(base as usize + index, |offset, v| vertices[offset] = v);
-            }
-            if bounce {
-                world.extend(
-                    primitive
-                        .vertices
-                        .iter()
-                        .map(|v| primitive.model.transform_point3(v.position)),
-                );
             }
             indices.extend(std::iter::repeat_n(i, primitive.vertices.len()));
             let material_index = primitive.source.material_index;
@@ -324,14 +317,12 @@ impl Renderer {
         }
         // Ranks index this stable material order, with the default material first.
         triangles.sort_by_key(|t| scene.primitives[t.primitive as usize].source.material_index);
-        let corners: Vec<_> = if bounce {
+        let corners: Vec<_> = world.map_or(Vec::new(), |world| {
             triangles
                 .iter()
                 .map(|t| t.vertices.map(|v| world[v as usize]))
                 .collect()
-        } else {
-            Vec::new()
-        };
+        });
         let (nodes, order) = bvh::build(&corners);
         // Geometry and descriptors contain values and indices, never host pointers.
         unsafe {
@@ -380,6 +371,326 @@ impl Renderer {
             }
         }
         Ok((start, self.event()?))
+    }
+
+    fn rasterize(
+        &mut self,
+        width: u32,
+        height: u32,
+        shadow: bool,
+    ) -> io::Result<(CudaEvent, CudaEvent)> {
+        let count = sample_count(width, height)?;
+        self.winners.resize(count as usize)?;
+        // Coverage, projected triangles, winners, queue length/cursor.
+        self.counters.resize(5)?;
+        self.large.resize(self.triangles.device.len())?;
+        if !shadow {
+            self.fragments
+                .resize(padded_count(count as usize) * FragmentAttributes::COMPONENTS)?;
+            self.fragment_meta
+                .resize(padded_count(count as usize) * 2)?;
+        }
+        let start = self.event()?;
+        self.winners.fill(255, &self.stream)?;
+        self.counters.fill(0, &self.stream)?;
+        if !self.triangles.device.is_empty() {
+            unsafe {
+                self.module
+                    .rasterize_small(
+                        &self.stream,
+                        LaunchConfig::for_num_elems(self.triangles.device.len() as u32),
+                        &self.output.device,
+                        &self.triangles.device,
+                        &self.primitives.device,
+                        width,
+                        height,
+                        shadow,
+                        &self.winners.device,
+                        &self.counters.device,
+                        &self.error.device,
+                        &mut self.large.device,
+                    )
+                    .map_err(io::Error::other)?;
+                self.module
+                    .rasterize_large(
+                        &self.stream,
+                        LaunchConfig {
+                            grid_dim: (256, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        &self.output.device,
+                        &self.triangles.device,
+                        &self.primitives.device,
+                        width,
+                        height,
+                        shadow,
+                        &self.winners.device,
+                        &self.counters.device,
+                        &self.error.device,
+                        &self.large.device,
+                    )
+                    .map_err(io::Error::other)?;
+            }
+        }
+        if !shadow {
+            unsafe {
+                self.module
+                    .interpolate(
+                        &self.stream,
+                        LaunchConfig::for_num_elems(count),
+                        &self.output.device,
+                        &self.triangles.device,
+                        &self.primitives.device,
+                        width,
+                        height,
+                        &self.winners.device,
+                        &self.counters.device,
+                        &self.error.device,
+                        &mut self.fragments.device,
+                        &mut self.fragment_meta.device,
+                    )
+                    .map_err(io::Error::other)?;
+            }
+        }
+        Ok((start, self.event()?))
+    }
+
+    fn shade(
+        &mut self,
+        width: u32,
+        height: u32,
+        light: Light,
+        camera_position: Vec3,
+    ) -> io::Result<(CudaEvent, CudaEvent)> {
+        let bounce = !self.nodes.device.is_empty();
+        if bounce {
+            self.albedo.resize(width as usize * height as usize)?;
+        }
+        let start = self.event()?;
+        // Buffers live through the synchronous readback.
+        unsafe {
+            self.module.shade(
+                &self.stream,
+                tile_launch(width, height),
+                width,
+                height,
+                &self.fragments.device,
+                &self.fragment_meta.device,
+                &self.winners.device,
+                &self.materials.device,
+                &self.texels.device,
+                light,
+                &self.depths.device,
+                camera_position.to_array(),
+                bounce,
+                &mut self.colors.device,
+                &mut self.albedo.device,
+            )
+        }
+        .map_err(io::Error::other)?;
+        Ok((start, self.event()?))
+    }
+
+    fn bounce(
+        &mut self,
+        width: u32,
+        height: u32,
+        light: Light,
+    ) -> io::Result<(CudaEvent, CudaEvent)> {
+        self.hits
+            .resize((1 + BOUNCE_RAYS as usize) * width as usize * height as usize)?;
+        self.hits.fill(255, &self.stream)?;
+        let start = self.event()?;
+        // Buffers live through the synchronous readback.
+        unsafe {
+            self.module.bounce(
+                &self.stream,
+                tile_launch(width, height),
+                width,
+                height,
+                &self.fragments.device,
+                &self.fragment_meta.device,
+                &self.winners.device,
+                &self.output.device,
+                &self.triangles.device,
+                &self.primitives.device,
+                &self.nodes.device,
+                &self.order.device,
+                &self.materials.device,
+                &self.texels.device,
+                light,
+                &self.depths.device,
+                &self.albedo.device,
+                &mut self.colors.device,
+                &mut self.hits.device,
+            )
+        }
+        .map_err(io::Error::other)?;
+        Ok((start, self.event()?))
+    }
+
+    /// Upload geometry and textures and render the light's shadow map; repeat after scene
+    /// changes. With `bounce`, also build the BVH that adds a diffuse bounce to every render.
+    pub fn prepare(
+        &mut self,
+        scene: &PreparedScene,
+        materials: &[Material],
+        texels: &[Texel],
+        light: &LightConfig,
+        shadow: &ShadowConfig,
+        bounce: bool,
+    ) -> io::Result<()> {
+        self.stream
+            .context()
+            .bind_to_thread()
+            .map_err(io::Error::other)?;
+        u32::try_from(materials.len()).map_err(io::Error::other)?;
+        if scene.primitives.iter().any(|p| {
+            p.source
+                .material_index
+                .is_some_and(|i| i >= materials.len())
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Primitive material index is outside the material list",
+            ));
+        }
+        let positions = if shadow.enabled || bounce {
+            scene.world_positions()?
+        } else {
+            Vec::new()
+        };
+        self.upload_geometry(scene, materials, bounce.then_some(&positions[..]))?;
+        let light = Light::new(light, shadow, &positions)?;
+        // The default material follows the scene materials, so every index reads device memory.
+        let table: Vec<_> = materials
+            .iter()
+            .copied()
+            .chain([Material::default()])
+            .collect();
+        // Materials hold values and array offsets, never host pointers.
+        unsafe {
+            self.materials.upload(&table)?;
+            self.texels.upload(texels)?;
+        }
+        self.depths
+            .resize(light.shadow.map_or(0, |map| map.len()))?;
+        if let Some(map) = light.shadow {
+            self.transform(scene, map.view_projection)?;
+            self.rasterize(map.resolution, map.resolution, true)?;
+            unsafe {
+                self.module.resolve_depth(
+                    &self.stream,
+                    LaunchConfig::for_num_elems(sample_count(map.resolution, map.resolution)?),
+                    &self.winners.device,
+                    &mut self.depths.device,
+                )
+            }
+            .map_err(io::Error::other)?;
+            self.check_error(scene)?;
+        }
+        self.light = Some(light);
+        Ok(())
+    }
+
+    /// Keep all intermediate camera and shadow data on the device.
+    pub fn render(
+        &mut self,
+        scene: &PreparedScene,
+        view_projection: Mat4,
+        width: u32,
+        height: u32,
+        camera_position: Vec3,
+    ) -> io::Result<RenderOutput> {
+        self.stream
+            .context()
+            .bind_to_thread()
+            .map_err(io::Error::other)?;
+        let count = sample_count(width, height)?;
+        if !camera_position.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Non-finite camera position",
+            ));
+        }
+        let light = self
+            .light
+            .ok_or_else(|| io::Error::other("Call prepare before render"))?;
+        self.stats = Stats::default();
+        let vertex_events = self.transform(scene, view_projection)?;
+        let raster_events = self.rasterize(width, height, false)?;
+        self.colors.resize(count as usize)?;
+        let fragment_events = self.shade(width, height, light, camera_position)?;
+        let bounce_events = if self.nodes.device.is_empty() {
+            None
+        } else {
+            Some(self.bounce(width, height, light)?)
+        };
+        let mut color = self
+            .colors
+            .device
+            .to_host_vec(&self.stream)
+            .map_err(io::Error::other)?;
+        color.truncate(count as usize);
+        self.check_error(scene)?;
+        let counters = read_counters(&self.counters.device, &self.stream)?;
+        self.stats.vertex_time = elapsed(&vertex_events)?;
+        self.stats.rasterization_time = elapsed(&raster_events)?;
+        self.stats.fragment_time = elapsed(&fragment_events)?;
+        if let Some(events) = &bounce_events {
+            self.stats.bounce_time = elapsed(events)?;
+        }
+        self.stats.vertices_shaded = self.primitive_indices.device.len();
+        self.stats.fragments_shaded = counters[2] as usize;
+        Ok(RenderOutput {
+            framebuffer: Framebuffer {
+                color: color.into_iter().map(Vec3::from_array).collect(),
+                width,
+                height,
+            },
+            covered_fragments: counters[0],
+            screen_triangles: counters[1] as usize,
+        })
+    }
+
+    /// The last render's primary material, then each bounce ray's hit material, per pixel,
+    /// with `u32::MAX` for none; empty without the bounce.
+    pub fn bounce_materials(&self) -> io::Result<Vec<u32>> {
+        if self.nodes.device.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.hits
+            .device
+            .to_host_vec(&self.stream)
+            .map_err(io::Error::other)
+    }
+
+    fn check_error(&self, scene: &PreparedScene) -> io::Result<()> {
+        let error = read_counters(&self.error.device, &self.stream)?[0];
+        if error == u64::MAX {
+            return Ok(());
+        }
+        let primitive = scene
+            .primitives
+            .get((error >> 32) as usize)
+            .ok_or_else(|| io::Error::other("Invalid CUDA error primitive"))?;
+        let message = match error as u32 {
+            1 => "Non-finite vertex position",
+            2 => "Invalid vertex normal",
+            11 => crate::rasterization::RasterError::ClipOverflow.message(),
+            12 => crate::rasterization::RasterError::InvalidProjection.message(),
+            _ => crate::rasterization::RasterError::ProjectionOverflow.message(),
+        };
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Node {}, mesh {}, primitive {}: {message}",
+                primitive.source.node_index,
+                primitive.source.mesh_index,
+                primitive.source.primitive_index
+            ),
+        ))
     }
 }
 
@@ -655,13 +966,11 @@ mod kernels {
         error: &[DeviceAtomicU64],
         mut fragments: DisjointSlice<f32>,
         mut fragment_meta: DisjointSlice<u32>,
-        mut depth: DisjointSlice<f32>,
     ) {
         let index = thread::index_1d().get();
         let mut shaded = 0;
-        if let Some(z) = depth.get_mut(thread::index_1d()) {
-            *z = f32::INFINITY;
-            let key = winners[index].load(AtomicOrdering::Relaxed);
+        if let Some(winner) = winners.get(index) {
+            let key = winner.load(AtomicOrdering::Relaxed);
             if key != u64::MAX && error[0].load(AtomicOrdering::Relaxed) == u64::MAX {
                 let rank = key as u32;
                 let triangle = triangles[(rank / 7) as usize];
@@ -693,7 +1002,6 @@ mod kernels {
                             *fragment_meta.get_unchecked_mut(soa_offset::<2>(index, 1)) =
                                 u32::from(setup.front_facing);
                         }
-                        *z = setup.depth(barycentric).unwrap();
                         shaded = 1;
                     })
                 {
@@ -704,7 +1012,7 @@ mod kernels {
                 }
             }
             if key != u64::MAX && shaded == 0 {
-                winners[index].store(u64::MAX, AtomicOrdering::Relaxed);
+                winner.store(u64::MAX, AtomicOrdering::Relaxed);
             }
         }
         count_warp(&stats[2], shaded);
@@ -748,7 +1056,9 @@ mod kernels {
         light: Light,
         depths: &[f32],
         camera: [f32; 3],
+        bounce: bool,
         mut colors: DisjointSlice<[f32; 3]>,
+        mut albedo: DisjointSlice<[f32; 3]>,
     ) {
         // Each warp shades an 8x4 pixel block, one 8-pixel row per group of 8 lanes.
         let index = thread::index_1d().get();
@@ -764,17 +1074,27 @@ mod kernels {
             && winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX
         {
             let shading = Shading {
-                texels,
                 light,
                 depths,
                 camera_position: Vec3::from_array(camera),
             };
+            let material = &materials[fragment_meta[soa_offset::<2>(sample, 0)] as usize];
+            let attributes = FragmentAttributes::load_soa(fragments, sample);
+            let surface = material.sample(texels, attributes.uv);
             color = crate::fragment::shade(
                 &shading,
-                &materials[fragment_meta[soa_offset::<2>(sample, 0)] as usize],
-                &FragmentAttributes::load_soa(fragments, sample),
+                material,
+                &surface,
+                &attributes,
                 fragment_meta[soa_offset::<2>(sample, 1)] != 0,
             );
+            if bounce {
+                // Each lane owns its pixel's albedo.
+                unsafe {
+                    *albedo.get_unchecked_mut(sample) =
+                        (surface.base_color * (1.0 - surface.metallic)).to_array();
+                }
+            }
         }
         // Transpose each row's colors so its lanes store contiguous floats in host RGB order.
         let valid = (width as usize - row_start).min(8) * 3;
@@ -821,6 +1141,7 @@ mod kernels {
         texels: &[Texel],
         light: Light,
         depths: &[f32],
+        albedo: &[[f32; 3]],
         mut colors: DisjointSlice<[f32; 3]>,
         mut hits: DisjointSlice<u32>,
     ) {
@@ -841,7 +1162,6 @@ mod kernels {
         let primary = fragment_meta[soa_offset::<2>(sample, 0)];
         unsafe { *hits.get_unchecked_mut(slots) = primary };
         let attributes = FragmentAttributes::load_soa(fragments, sample);
-        let surface = materials[primary as usize].sample(texels, attributes.uv);
         let normal = if fragment_meta[soa_offset::<2>(sample, 1)] != 0 {
             attributes.normal
         } else {
@@ -857,7 +1177,6 @@ mod kernels {
             })
         };
         let shading = Shading {
-            texels,
             light,
             depths,
             camera_position: origin,
@@ -885,17 +1204,14 @@ mod kernels {
             let geometric =
                 (b.world_position - a.world_position).cross(c.world_position - a.world_position);
             let front_facing = (geometric.dot(direction) < 0.0) != primitive.mirrored;
-            radiance += crate::fragment::shade(
-                &shading,
-                &materials[primitive.material_index as usize],
-                &hit_attributes,
-                front_facing,
-            );
+            let material = &materials[primitive.material_index as usize];
+            let surface = material.sample(texels, hit_attributes.uv);
+            radiance +=
+                crate::fragment::shade(&shading, material, &surface, &hit_attributes, front_facing);
             unsafe { *hits.get_unchecked_mut(slots + 1 + ray as usize) = primitive.material_index };
         }
         // Cosine-weighted sampling cancels the Lambertian cosine and 1/pi.
-        let indirect =
-            surface.base_color * (1.0 - surface.metallic) * (radiance / BOUNCE_RAYS as f32);
+        let indirect = Vec3::from_array(albedo[sample]) * (radiance / BOUNCE_RAYS as f32);
         let color = unsafe { colors.get_unchecked_mut(sample) };
         color[0] += indirect.x;
         color[1] += indirect.y;
@@ -933,331 +1249,6 @@ fn elapsed(events: &(CudaEvent, CudaEvent)) -> io::Result<Duration> {
     Ok(Duration::from_secs_f32(
         events.0.elapsed_ms(&events.1).map_err(io::Error::other)? * 0.001,
     ))
-}
-
-impl Renderer {
-    fn rasterize(
-        &mut self,
-        width: u32,
-        height: u32,
-        shadow: bool,
-    ) -> io::Result<(CudaEvent, CudaEvent)> {
-        let count = sample_count(width, height)?;
-        self.winners.resize(count as usize)?;
-        // Coverage, projected triangles, winners, queue length/cursor.
-        self.counters.resize(5)?;
-        self.large.resize(self.triangles.device.len())?;
-        if !shadow {
-            self.fragments
-                .resize(padded_count(count as usize) * FragmentAttributes::COMPONENTS)?;
-            self.fragment_meta
-                .resize(padded_count(count as usize) * 2)?;
-            self.depth.resize(count as usize)?;
-        }
-        let start = self.event()?;
-        self.winners.fill(255, &self.stream)?;
-        self.counters.fill(0, &self.stream)?;
-        if !self.triangles.device.is_empty() {
-            unsafe {
-                self.module
-                    .rasterize_small(
-                        &self.stream,
-                        LaunchConfig::for_num_elems(self.triangles.device.len() as u32),
-                        &self.output.device,
-                        &self.triangles.device,
-                        &self.primitives.device,
-                        width,
-                        height,
-                        shadow,
-                        &self.winners.device,
-                        &self.counters.device,
-                        &self.error.device,
-                        &mut self.large.device,
-                    )
-                    .map_err(io::Error::other)?;
-                self.module
-                    .rasterize_large(
-                        &self.stream,
-                        LaunchConfig {
-                            grid_dim: (256, 1, 1),
-                            block_dim: (128, 1, 1),
-                            shared_mem_bytes: 0,
-                        },
-                        &self.output.device,
-                        &self.triangles.device,
-                        &self.primitives.device,
-                        width,
-                        height,
-                        shadow,
-                        &self.winners.device,
-                        &self.counters.device,
-                        &self.error.device,
-                        &self.large.device,
-                    )
-                    .map_err(io::Error::other)?;
-            }
-        }
-        if !shadow {
-            unsafe {
-                self.module
-                    .interpolate(
-                        &self.stream,
-                        LaunchConfig::for_num_elems(count),
-                        &self.output.device,
-                        &self.triangles.device,
-                        &self.primitives.device,
-                        width,
-                        height,
-                        &self.winners.device,
-                        &self.counters.device,
-                        &self.error.device,
-                        &mut self.fragments.device,
-                        &mut self.fragment_meta.device,
-                        &mut self.depth.device,
-                    )
-                    .map_err(io::Error::other)?;
-            }
-        }
-        Ok((start, self.event()?))
-    }
-
-    fn shade(
-        &mut self,
-        width: u32,
-        height: u32,
-        light: Light,
-        camera_position: Vec3,
-    ) -> io::Result<(CudaEvent, CudaEvent)> {
-        let start = self.event()?;
-        // Buffers live through the synchronous readback.
-        unsafe {
-            self.module.shade(
-                &self.stream,
-                tile_launch(width, height),
-                width,
-                height,
-                &self.fragments.device,
-                &self.fragment_meta.device,
-                &self.winners.device,
-                &self.materials.device,
-                &self.texels.device,
-                light,
-                &self.depths.device,
-                camera_position.to_array(),
-                &mut self.colors.device,
-            )
-        }
-        .map_err(io::Error::other)?;
-        Ok((start, self.event()?))
-    }
-
-    fn bounce(
-        &mut self,
-        width: u32,
-        height: u32,
-        light: Light,
-    ) -> io::Result<(CudaEvent, CudaEvent)> {
-        self.hits
-            .resize((1 + BOUNCE_RAYS as usize) * width as usize * height as usize)?;
-        self.hits.fill(255, &self.stream)?;
-        let start = self.event()?;
-        // Buffers live through the synchronous readback.
-        unsafe {
-            self.module.bounce(
-                &self.stream,
-                tile_launch(width, height),
-                width,
-                height,
-                &self.fragments.device,
-                &self.fragment_meta.device,
-                &self.winners.device,
-                &self.output.device,
-                &self.triangles.device,
-                &self.primitives.device,
-                &self.nodes.device,
-                &self.order.device,
-                &self.materials.device,
-                &self.texels.device,
-                light,
-                &self.depths.device,
-                &mut self.colors.device,
-                &mut self.hits.device,
-            )
-        }
-        .map_err(io::Error::other)?;
-        Ok((start, self.event()?))
-    }
-
-    /// Upload geometry and textures and render the light's shadow map; repeat after scene
-    /// changes. With `bounce`, also build the BVH that adds a diffuse bounce to every render.
-    pub fn prepare(
-        &mut self,
-        scene: &PreparedScene,
-        materials: &[Material],
-        texels: &[Texel],
-        light: &LightConfig,
-        shadow: &ShadowConfig,
-        bounce: bool,
-    ) -> io::Result<()> {
-        self.stream
-            .context()
-            .bind_to_thread()
-            .map_err(io::Error::other)?;
-        u32::try_from(materials.len()).map_err(io::Error::other)?;
-        if scene.primitives.iter().any(|p| {
-            p.source
-                .material_index
-                .is_some_and(|i| i >= materials.len())
-        }) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Primitive material index is outside the material list",
-            ));
-        }
-        self.upload_geometry(scene, materials, bounce)?;
-        let positions = if shadow.enabled {
-            scene.world_positions()?
-        } else {
-            Vec::new()
-        };
-        let light = Light::new(light, shadow, &positions)?;
-        // The default material follows the scene materials, so every index reads device memory.
-        let table: Vec<_> = materials
-            .iter()
-            .copied()
-            .chain([Material::default()])
-            .collect();
-        // Materials hold values and array offsets, never host pointers.
-        unsafe {
-            self.materials.upload(&table)?;
-            self.texels.upload(texels)?;
-        }
-        self.depths
-            .resize(light.shadow.map_or(0, |map| map.len()))?;
-        if let Some(map) = light.shadow {
-            self.transform(scene, map.view_projection)?;
-            self.rasterize(map.resolution, map.resolution, true)?;
-            unsafe {
-                self.module.resolve_depth(
-                    &self.stream,
-                    LaunchConfig::for_num_elems(sample_count(map.resolution, map.resolution)?),
-                    &self.winners.device,
-                    &mut self.depths.device,
-                )
-            }
-            .map_err(io::Error::other)?;
-            self.check_error(scene)?;
-        }
-        self.light = Some(light);
-        Ok(())
-    }
-
-    /// Keep all intermediate camera and shadow data on the device.
-    pub fn render(
-        &mut self,
-        scene: &PreparedScene,
-        view_projection: Mat4,
-        width: u32,
-        height: u32,
-        camera_position: Vec3,
-    ) -> io::Result<RenderOutput> {
-        self.stream
-            .context()
-            .bind_to_thread()
-            .map_err(io::Error::other)?;
-        let count = sample_count(width, height)?;
-        if !camera_position.is_finite() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Non-finite camera position",
-            ));
-        }
-        let light = self
-            .light
-            .ok_or_else(|| io::Error::other("Call prepare before render"))?;
-        self.stats = Stats::default();
-        let vertex_events = self.transform(scene, view_projection)?;
-        let raster_events = self.rasterize(width, height, false)?;
-        self.colors.resize(count as usize)?;
-        let fragment_events = self.shade(width, height, light, camera_position)?;
-        let bounce_events = if self.nodes.device.is_empty() {
-            None
-        } else {
-            Some(self.bounce(width, height, light)?)
-        };
-        let mut color = self
-            .colors
-            .device
-            .to_host_vec(&self.stream)
-            .map_err(io::Error::other)?;
-        color.truncate(count as usize);
-        let depth = self
-            .depth
-            .device
-            .to_host_vec(&self.stream)
-            .map_err(io::Error::other)?;
-        self.check_error(scene)?;
-        let counters = read_counters(&self.counters.device, &self.stream)?;
-        self.stats.vertex_time = elapsed(&vertex_events)?;
-        self.stats.rasterization_time = elapsed(&raster_events)?;
-        self.stats.fragment_time = elapsed(&fragment_events)?;
-        if let Some(events) = &bounce_events {
-            self.stats.bounce_time = elapsed(events)?;
-        }
-        self.stats.vertices_shaded = self.primitive_indices.device.len();
-        self.stats.fragments_shaded = counters[2] as usize;
-        Ok(RenderOutput {
-            framebuffer: Framebuffer {
-                color: color.into_iter().map(Vec3::from_array).collect(),
-                depth: DepthBuffer {
-                    width,
-                    height,
-                    values: depth,
-                },
-            },
-            covered_fragments: counters[0],
-            screen_triangles: counters[1] as usize,
-        })
-    }
-
-    /// The last render's primary material, then each bounce ray's hit material, per pixel,
-    /// with `u32::MAX` for none; empty without the bounce.
-    pub fn bounce_materials(&self) -> io::Result<Vec<u32>> {
-        if self.nodes.device.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.hits
-            .device
-            .to_host_vec(&self.stream)
-            .map_err(io::Error::other)
-    }
-
-    fn check_error(&self, scene: &PreparedScene) -> io::Result<()> {
-        let error = read_counters(&self.error.device, &self.stream)?[0];
-        if error == u64::MAX {
-            return Ok(());
-        }
-        let primitive = scene
-            .primitives
-            .get((error >> 32) as usize)
-            .ok_or_else(|| io::Error::other("Invalid CUDA error primitive"))?;
-        let message = match error as u32 {
-            1 => "Non-finite vertex position",
-            2 => "Invalid vertex normal",
-            11 => crate::rasterization::RasterError::ClipOverflow.message(),
-            12 => crate::rasterization::RasterError::InvalidProjection.message(),
-            _ => crate::rasterization::RasterError::ProjectionOverflow.message(),
-        };
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Node {}, mesh {}, primitive {}: {message}",
-                primitive.source.node_index,
-                primitive.source.mesh_index,
-                primitive.source.primitive_index
-            ),
-        ))
-    }
 }
 
 /// One 32-lane block per 8x4 pixel tile.

@@ -49,7 +49,7 @@ height, camera_position)` for each frame. `prepare` uploads geometry, materials 
 texels and renders the light's shadow map, fitted on the host to the prepared geometry;
 renders reuse them and the buffer capacity. Camera movement alone needs no preparation.
 Transformed vertices, visibility, fragment attributes and shadow depths stay on the
-GPU; only final RGB/depth and small error/statistics counters return to the host.
+GPU; only final RGB and small error/statistics counters return to the host.
 Dimensions must be nonzero and their product must fit `u32`.
 
 `bounce = true` in `config.toml` adds a ray-traced diffuse bounce, averaging

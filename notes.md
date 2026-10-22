@@ -32,7 +32,7 @@ CUDA rasterization handles small triangle bounds within one thread. Larger trian
 
 Visibility atomically minimizes an ordered FP32 depth and stable triangle/fan rank packed into 64 bits. Signed zero compares equally and nonfinite depths are rejected. Triangles are stored in stable material order so a winning rank directly identifies its geometry; shadow passes use the same ranks because ties cannot change a depth-only result. One thread per framebuffer sample reconstructs and interpolates its winning face, initializing empty fragment slots in the same pass. This avoids a second rasterization of all triangles, but still repeats projection/clipping for visible samples. Shading writes black for empty samples.
 
-The shadow pass uses the same visibility kernel, skips attribute emission, and unpacks winning depths directly into the resident shadow map. Camera output reads back RGB and depth only, plus small validation/statistics counters. Renders do not check for stale resources: prepare again after any scene or resource change.
+The shadow pass uses the same visibility kernel, skips attribute emission, and unpacks winning depths directly into the resident shadow map. Camera output reads back RGB only, plus small validation/statistics counters; camera depth stays internal to visibility. Renders do not check for stale resources: prepare again after any scene or resource change.
 
 ## Workload traces
 
@@ -66,7 +66,7 @@ Add one optional cosine-weighted diffuse bounce per pixel; rasterization keeps p
 
 A host BVH splits at the median centroid of the widest axis, with leaves of up to four triangles, and indexes the rank-ordered triangle list, so hits read the resident vertex output and primitive table without duplicated geometry. Surface-area-heuristic builds and child ordering are deferred. Hits interpolate vertex attributes with barycentrics, read texture level zero (no ray cones), and run the shared shader with the ray origin as viewer; misses add nothing.
 
-The bounce kernel keeps shading's 8x4 pixel blocks, so warps shade hits in ray launch order, unsorted. A separate kernel leaves primary shading's code and timing unchanged. Each bounce render writes every pixel's primary and hit materials for batching analysis.
+The bounce kernel keeps shading's 8x4 pixel blocks, so warps shade hits in ray launch order, unsorted. A separate kernel keeps primary shading's timing separate. Each shading point samples its material once: primary shading writes each pixel's diffuse albedo for the bounce instead of the bounce re-sampling it, so a neural decode never runs twice for one pixel. Each bounce render writes every pixel's primary and hit materials for batching analysis.
 
 Rays per pixel are a build-time constant (`BOUNCE_RAYS`, default 4), so the kernel's ray loop has a fixed trip count; changing it rebuilds. Each lane traces its pixel's rays in sequence, so every loop iteration is one warp-wide batch of hits.
 

@@ -23,7 +23,6 @@ impl GltfAsset {
 /// Object-space geometry with normal/tangent seams split.
 #[derive(Debug, Clone)]
 pub struct PreparedScene {
-    pub scene_index: usize,
     pub primitives: Vec<PreparedPrimitive>,
 }
 
@@ -139,10 +138,7 @@ pub fn prepare_scene(asset: &GltfAsset) -> io::Result<PreparedScene> {
     for node in scene.nodes() {
         prepare_node(asset, node, Mat4::IDENTITY, &mut primitives)?;
     }
-    Ok(PreparedScene {
-        scene_index: scene.index(),
-        primitives,
-    })
+    Ok(PreparedScene { primitives })
 }
 
 fn prepare_node(
@@ -486,7 +482,7 @@ impl PreparedScene {
                 } else {
                     Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Non-finite shadow caster position",
+                        "Non-finite world-space vertex position",
                     ))
                 }
             })

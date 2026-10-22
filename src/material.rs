@@ -109,7 +109,8 @@ impl Material {
             normal,
             metallic: self.metallic_factor * metallic_roughness.z,
             roughness: self.roughness_factor * metallic_roughness.y,
-            emission: self.emission(texels, uv),
+            emission: self.emissive_factor
+                * sample_texture(&self.emissive_texture, texels, uv).truncate(),
         }
     }
 
@@ -127,11 +128,6 @@ impl Material {
         (t * sampled.x + b * sampled.y + normal * sampled.z)
             .try_normalize()
             .unwrap_or(normal)
-    }
-
-    #[inline(always)]
-    pub fn emission(&self, texels: &[Texel], uv: UvSample) -> Vec3 {
-        self.emissive_factor * sample_texture(&self.emissive_texture, texels, uv).truncate()
     }
 }
 

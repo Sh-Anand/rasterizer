@@ -3,30 +3,31 @@ use std::f32::consts::PI;
 use glam::Vec3;
 
 use crate::{
-    lighting::Light, material::Material, rasterization::FragmentAttributes, texture::Texel,
+    lighting::Light,
+    material::{Material, MaterialSample},
+    rasterization::FragmentAttributes,
 };
 
-/// Fragment-shading resources other than the material table.
+/// Lighting resources for shading.
 #[derive(Clone, Copy)]
 pub struct Shading<'a> {
-    /// Every material texture's mip levels.
-    pub texels: &'a [Texel],
     pub light: Light,
     /// The light's shadow-map depths.
     pub depths: &'a [f32],
     pub camera_position: Vec3,
 }
 
-// CUDA shading must inline this to address texels and shadow depths as global memory.
+/// Lights a surface whose material the caller sampled once at its UV.
+// CUDA shading must inline this to address shadow depths as global memory.
 #[inline(always)]
 pub(crate) fn shade(
     shading: &Shading<'_>,
     material: &Material,
+    surface: &MaterialSample,
     attributes: &FragmentAttributes,
     front_facing: bool,
 ) -> Vec3 {
     let position = attributes.world_position;
-    let surface = material.sample(shading.texels, attributes.uv);
     let normal = material.shading_normal(surface.normal, attributes.normal, attributes.tangent);
     let normal = if front_facing { normal } else { -normal };
     let view = (shading.camera_position - position).normalize_or_zero();
