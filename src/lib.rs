@@ -5,6 +5,7 @@ pub mod geometry;
 pub mod lighting;
 pub mod material;
 pub mod texture;
+pub mod trace;
 
 mod bvh;
 mod fragment;

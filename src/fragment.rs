@@ -6,6 +6,7 @@ use crate::{
     lighting::Light,
     material::{Material, MaterialSample},
     rasterization::FragmentAttributes,
+    trace::{Site, mark},
 };
 
 /// Lighting resources for shading.
@@ -26,7 +27,13 @@ pub(crate) fn shade(
     surface: &MaterialSample,
     attributes: &FragmentAttributes,
     front_facing: bool,
+    sites: &mut u32,
 ) -> Vec3 {
+    if material.normal_texture.is_some() {
+        mark(sites, Site::NormalMap);
+    }
+    mark(sites, Site::Surface);
+    mark(sites, Site::Light);
     let position = attributes.world_position;
     let normal = material.shading_normal(surface.normal, attributes.normal, attributes.tangent);
     let normal = if front_facing { normal } else { -normal };
@@ -37,8 +44,12 @@ pub(crate) fn shade(
     let mut reflected = Vec3::ZERO;
     // At or below the horizon the BRDF is zero, so the light needs no shadow test.
     if cosine > 0.0 {
+        if light.shadow.is_some() {
+            mark(sites, Site::Shadow);
+        }
         let visibility = light.visibility(shading.depths, position);
         if visibility > 0.0 {
+            mark(sites, Site::Brdf);
             reflected += brdf.evaluate(normal, view, light.direction)
                 * (light.irradiance * visibility)
                 * cosine.max(0.0);

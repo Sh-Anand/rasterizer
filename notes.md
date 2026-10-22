@@ -36,7 +36,11 @@ The shadow pass uses the same visibility kernel, skips attribute emission, and u
 
 ## Workload traces
 
-Take workload data from the GPU's own lane assignment rather than a CPU replay: kernels dump per-lane records, as the bounce writes each pixel's primary and hit materials, to be extended with decoder matrix operations. The removed CPU trace replayed the shared shader on CPU-rasterized fragments with source-level operation estimates. Deferred: per-lane addresses with coalescing and cache analysis.
+Trace the GPU kernels' own lane assignment rather than replaying shading on the CPU. A `TRACE` build (an environment variable read at compile time) makes each lane mark a bit for every straight-line shader region it executes, and stores the bits with its material per pixel and pass: primary shading, then each bounce ray. Normal builds compile the marks away, so their code and timing are unchanged; trace builds are for traces, not timing.
+
+The host groups lanes into one record per 32-lane warp (an 8x4 pixel block), pass, region and active mask, as the removed CPU trace did. Texture regions also split by material, since each material reads its own textures and a neural decoder would use its own weights. Only branches between regions split masks: texture presence, the second trilinear level, a hit or miss, the shadow test and a lit surface; branches inside a region fold into its counts.
+
+Attach source-level operation estimates on the host (loads, stores, FP32, special-function and integer counts per region), not compiled instruction counts; texture texels, shadow depths, descriptors and fragment inputs are all plain loads. Traversal cost varies per ray and is not modeled. Deferred: per-lane addresses with coalescing and cache analysis.
 
 ## Clipping
 

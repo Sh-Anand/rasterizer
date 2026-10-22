@@ -20,6 +20,7 @@ use crate::{
         interpolate_attributes, outcode, project_vertex,
     },
     texture::{Texel, UvSample},
+    trace::{Site, TRACE, mark},
 };
 
 /// Diffuse bounce rays per pixel, fixed at build time by the `BOUNCE_RAYS` environment variable.
@@ -213,6 +214,8 @@ pub struct Renderer {
     colors: Buffer<[f32; 3]>,
     /// Primary diffuse albedo per pixel, written by shading for the bounce.
     albedo: Buffer<[f32; 3]>,
+    /// With `TRACE`, the region bits and material of each pixel's primary and bounce lanes.
+    trace: Buffer<u32>,
     /// Primary material, then each bounce ray's hit material, per pixel.
     hits: Buffer<u32>,
 }
@@ -245,6 +248,7 @@ impl Renderer {
             depths: Buffer::new(c),
             colors: Buffer::new(c),
             albedo: Buffer::new(c),
+            trace: Buffer::new(c),
             hits: Buffer::new(c),
         })
     }
@@ -467,6 +471,11 @@ impl Renderer {
         if bounce {
             self.albedo.resize(width as usize * height as usize)?;
         }
+        if TRACE {
+            self.trace
+                .resize(2 * (1 + BOUNCE_RAYS as usize) * width as usize * height as usize)?;
+            self.trace.fill(0, &self.stream)?;
+        }
         let start = self.event()?;
         // Buffers live through the synchronous readback.
         unsafe {
@@ -486,6 +495,7 @@ impl Renderer {
                 bounce,
                 &mut self.colors.device,
                 &mut self.albedo.device,
+                &mut self.trace.device,
             )
         }
         .map_err(io::Error::other)?;
@@ -524,6 +534,7 @@ impl Renderer {
                 &self.albedo.device,
                 &mut self.colors.device,
                 &mut self.hits.device,
+                &mut self.trace.device,
             )
         }
         .map_err(io::Error::other)?;
@@ -652,6 +663,18 @@ impl Renderer {
             covered_fragments: counters[0],
             screen_triangles: counters[1] as usize,
         })
+    }
+
+    /// With `TRACE`, the last render's region bits and material per pixel and pass, as
+    /// `trace::write` reads them; otherwise empty.
+    pub fn trace_lanes(&self) -> io::Result<Vec<u32>> {
+        if !TRACE {
+            return Ok(Vec::new());
+        }
+        self.trace
+            .device
+            .to_host_vec(&self.stream)
+            .map_err(io::Error::other)
     }
 
     /// The last render's primary material, then each bounce ray's hit material, per pixel,
@@ -1059,6 +1082,7 @@ mod kernels {
         bounce: bool,
         mut colors: DisjointSlice<[f32; 3]>,
         mut albedo: DisjointSlice<[f32; 3]>,
+        mut trace: DisjointSlice<u32>,
     ) {
         // Each warp shades an 8x4 pixel block, one 8-pixel row per group of 8 lanes.
         let index = thread::index_1d().get();
@@ -1078,15 +1102,26 @@ mod kernels {
                 depths,
                 camera_position: Vec3::from_array(camera),
             };
-            let material = &materials[fragment_meta[soa_offset::<2>(sample, 0)] as usize];
+            let material_index = fragment_meta[soa_offset::<2>(sample, 0)];
+            let material = &materials[material_index as usize];
             let attributes = FragmentAttributes::load_soa(fragments, sample);
-            let surface = material.sample(texels, attributes.uv);
+            let mut sites = 0;
+            mark(&mut sites, Site::Input);
+            let surface = material.sample(texels, attributes.uv, &mut sites);
             color = crate::fragment::shade(
                 &shading,
                 material,
                 &surface,
                 &attributes,
                 fragment_meta[soa_offset::<2>(sample, 1)] != 0,
+                &mut sites,
+            );
+            mark(&mut sites, Site::Output);
+            store_trace(
+                &mut trace,
+                sample * (1 + BOUNCE_RAYS as usize),
+                sites,
+                material_index,
             );
             if bounce {
                 // Each lane owns its pixel's albedo.
@@ -1144,6 +1179,7 @@ mod kernels {
         albedo: &[[f32; 3]],
         mut colors: DisjointSlice<[f32; 3]>,
         mut hits: DisjointSlice<u32>,
+        mut trace: DisjointSlice<u32>,
     ) {
         let index = thread::index_1d().get();
         let (block, lane) = (index / 32, index % 32);
@@ -1185,9 +1221,14 @@ mod kernels {
         for ray in 0..BOUNCE_RAYS {
             let seed = (sample as u32).wrapping_mul(BOUNCE_RAYS).wrapping_add(ray);
             let direction = cosine_direction(normal, seed);
+            let mut sites = 0;
+            mark(&mut sites, Site::Traverse);
+            // Slots are recomputed at each store: keeping one live across traversal cost 15%.
             let Some(hit) = bvh::closest_hit(nodes, order, origin, direction, corners) else {
+                store_trace(&mut trace, slots + 1 + ray as usize, sites, u32::MAX);
                 continue;
             };
+            mark(&mut sites, Site::Hit);
             let triangle = triangles[hit.triangle as usize];
             let primitive = primitives[triangle.primitive as usize];
             let [a, b, c] = triangle
@@ -1205,10 +1246,22 @@ mod kernels {
                 (b.world_position - a.world_position).cross(c.world_position - a.world_position);
             let front_facing = (geometric.dot(direction) < 0.0) != primitive.mirrored;
             let material = &materials[primitive.material_index as usize];
-            let surface = material.sample(texels, hit_attributes.uv);
-            radiance +=
-                crate::fragment::shade(&shading, material, &surface, &hit_attributes, front_facing);
+            let surface = material.sample(texels, hit_attributes.uv, &mut sites);
+            radiance += crate::fragment::shade(
+                &shading,
+                material,
+                &surface,
+                &hit_attributes,
+                front_facing,
+                &mut sites,
+            );
             unsafe { *hits.get_unchecked_mut(slots + 1 + ray as usize) = primitive.material_index };
+            store_trace(
+                &mut trace,
+                slots + 1 + ray as usize,
+                sites,
+                primitive.material_index,
+            );
         }
         // Cosine-weighted sampling cancels the Lambertian cosine and 1/pi.
         let indirect = Vec3::from_array(albedo[sample]) * (radiance / BOUNCE_RAYS as f32);
@@ -1216,6 +1269,17 @@ mod kernels {
         color[0] += indirect.x;
         color[1] += indirect.y;
         color[2] += indirect.z;
+    }
+
+    /// With `TRACE`, stores a lane's region bits and material; the caller owns `slot`.
+    #[inline(always)]
+    fn store_trace(trace: &mut DisjointSlice<u32>, slot: usize, sites: u32, material: u32) {
+        if TRACE {
+            unsafe {
+                *trace.get_unchecked_mut(2 * slot) = sites;
+                *trace.get_unchecked_mut(2 * slot + 1) = material;
+            }
+        }
     }
 
     fn cosine_direction(normal: Vec3, seed: u32) -> Vec3 {

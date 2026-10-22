@@ -12,6 +12,7 @@ use rasterizer::{
     cuda::{BOUNCE_RAYS, Renderer},
     geometry::{GltfAsset, prepare_scene},
     material::load_materials,
+    trace::{self, TRACE},
 };
 
 const USAGE: &str = "Usage: rasterizer <scene-name|path.gltf|path.glb>\n\nWithout arguments, list bundled scenes.\nRender: ./run.sh living-room";
@@ -194,6 +195,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(&hits_path, bytes)
             .map_err(|error| format!("Failed to save '{}': {error}", hits_path.display()))?;
     }
+    let trace_path = output_path.with_extension("trace");
+    if TRACE {
+        trace::write(
+            &trace_path,
+            render_width,
+            render_height,
+            &renderer.trace_lanes()?,
+            config.sampling,
+            config.bounce,
+        )
+        .map_err(|error| format!("Failed to save '{}': {error}", trace_path.display()))?;
+    }
 
     let document = &asset.document;
     let primitives: usize = document.meshes().map(|mesh| mesh.primitives().len()).sum();
@@ -283,6 +296,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("Bounce rays per pixel: {BOUNCE_RAYS}");
     } else {
         println!("Lighting: direct diffuse + specular");
+    }
+    if TRACE {
+        println!("Wrote {}", trace_path.display());
     }
     Ok(())
 }

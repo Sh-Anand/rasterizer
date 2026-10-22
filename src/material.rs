@@ -5,6 +5,7 @@ use glam::{Vec3, Vec4};
 use crate::{
     geometry::GltfAsset,
     texture::{ColorSpace, Sampling, Texel, Texture, TextureLoader, UvSample},
+    trace::{Site, TRACE, mark},
 };
 
 /// Returns the materials and the texel array their textures index.
@@ -97,7 +98,35 @@ impl Material {
 
     /// Reads every texture at one UV, as a texture-set decoder produces all channels at once.
     #[inline(always)]
-    pub fn sample(&self, texels: &[Texel], uv: UvSample) -> MaterialSample {
+    pub(crate) fn sample(&self, texels: &[Texel], uv: UvSample, sites: &mut u32) -> MaterialSample {
+        trace_texture(
+            sites,
+            &self.base_color_texture,
+            uv,
+            Site::BaseColor,
+            Site::BaseColorLevel,
+        );
+        trace_texture(
+            sites,
+            &self.normal_texture,
+            uv,
+            Site::Normal,
+            Site::NormalLevel,
+        );
+        trace_texture(
+            sites,
+            &self.metallic_roughness_texture,
+            uv,
+            Site::MetallicRoughness,
+            Site::MetallicRoughnessLevel,
+        );
+        trace_texture(
+            sites,
+            &self.emissive_texture,
+            uv,
+            Site::Emissive,
+            Site::EmissiveLevel,
+        );
         let base_color = sample_texture(&self.base_color_texture, texels, uv);
         let mut normal =
             sample_texture(&self.normal_texture, texels, uv).truncate() * 2.0 - Vec3::ONE;
@@ -128,6 +157,26 @@ impl Material {
         (t * sampled.x + b * sampled.y + normal * sampled.z)
             .try_normalize()
             .unwrap_or(normal)
+    }
+}
+
+/// Marks a texture's first mip level, then the second a trilinear sample may read.
+#[inline(always)]
+fn trace_texture(
+    sites: &mut u32,
+    texture: &Option<Texture>,
+    uv: UvSample,
+    site: Site,
+    level: Site,
+) {
+    if !TRACE {
+        return;
+    }
+    if let Some(texture) = texture {
+        mark(sites, site);
+        if texture.reads_second_level(uv) {
+            mark(sites, level);
+        }
     }
 }
 
