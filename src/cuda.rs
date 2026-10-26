@@ -1262,8 +1262,7 @@ mod kernels {
                         world_position: origin + direction * hit.t,
                         // Hits read level zero; ray cones could select a mip level.
                         uv: UvSample::point(a.uv * wa + b.uv * wb + c.uv * wc),
-                        normal: (a.normal * wa + b.normal * wb + c.normal * wc)
-                            .normalize_or_zero(),
+                        normal: (a.normal * wa + b.normal * wb + c.normal * wc).normalize_or_zero(),
                         tangent: a.tangent * wa + b.tangent * wb + c.tangent * wc,
                     };
                     let geometric = (b.world_position - a.world_position)
@@ -1291,7 +1290,7 @@ mod kernels {
                 unsafe { *hits.get_unchecked_mut(slots + 1 + ray as usize) = material_index };
             }
             if covered {
-                let traced = if hit.is_some() { material_index } else { u32::MAX };
+                let traced = hit.as_ref().map_or(u32::MAX, |_| material_index);
                 store_trace(&mut trace, slots + 1 + ray as usize, sites, traced);
             }
         }

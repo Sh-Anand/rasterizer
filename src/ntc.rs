@@ -22,7 +22,11 @@ const LAYERS: [(usize, usize); 4] = [(48, 64), (64, 48), (48, 32), (32, 16)];
 const OUTPUTS: [usize; 4] = [0, 64, 112, 144];
 /// Each layer's first weight word. dp4a rows hold a layer's int8 inputs in order; tensor-core
 /// rows hold each lane's fragment words together, padded to whole 16-byte loads (see `load`).
-const WEIGHTS: [usize; 4] = if MMA { [0, 1024, 1792, 2304] } else { [0, 768, 1536, 1920] };
+const WEIGHTS: [usize; 4] = if MMA {
+    [0, 1024, 1792, 2304]
+} else {
+    [0, 768, 1536, 1920]
+};
 /// Weight words, then scale and bias words: dp4a sets keep all scales, then all biases;
 /// tensor-core sets keep each column pair's two scales and two biases together.
 const WEIGHT_WORDS: usize = if MMA { 2432 } else { 2048 };
@@ -35,18 +39,17 @@ const INPUT_SCALE: f32 = 127.5;
 /// 1.5 * 2^23. A float below 2^22 in magnitude plus this holds its rounded integer in the low
 /// mantissa bits, which replaces conversion-unit instructions with an add.
 const MAGIC: f32 = 12_582_912.0;
-const MAGIC_BITS: u32 = 0x4B40_0000;
 /// Decode on tensor cores unless the build sets `NTC_DP4A`, which decodes each lane with dp4a.
 pub const MMA: bool = option_env!("NTC_DP4A").is_none();
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct ColorMip {
     latent: u32,
     position_lod: f32,
     position_scale: f32,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct Latent {
     /// Words from the set's first word; each texel packs its 16 4-bit features in two words.
     offset: u32,
@@ -55,7 +58,7 @@ struct Latent {
 }
 
 /// One texture set; its weights and latents are words in the texel array.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct NeuralSet {
     /// First word: weights, scales, biases, then the loaded latent levels.
     offset: u32,
@@ -136,7 +139,8 @@ impl NeuralSet {
             }
         };
         let level = Words::new(texels, (self.offset + latent.offset) as usize);
-        let tap = |dx, dy| level.pair(2 * (wrap(y + dy, height) * width + wrap(x + dx, width)) as usize);
+        let tap =
+            |dx, dy| level.pair(2 * (wrap(y + dy, height) * width + wrap(x + dx, width)) as usize);
         let taps = [tap(0, 0), tap(1, 0), tap(0, 1), tap(1, 1)];
         let weights = [
             (1.0 - t.x) * (1.0 - t.y),
@@ -383,7 +387,7 @@ fn tile<const KC: usize, const HALVES: usize>(
     // 32-bit loads: wider ones need aligned register quads, which spilled more and ran slower.
     let [s0, s1, b0, b1] = vectors.words(16 * tile + 4 * thread);
     // B fragments of output 8 tile + group: one word per 16-input chunk.
-    let lanes = if KC == 2 { 2 } else { 4 };
+    let lanes = lane_words(KC);
     let w: [u32; KC] = weights.words((8 * tile + group) * 4 * lanes + thread * lanes);
     let mut sums = [[b0 as i32, b1 as i32, b0 as i32, b1 as i32]; 2];
     for m in 0..2 {
@@ -403,6 +407,12 @@ fn tile<const KC: usize, const HALVES: usize>(
     (sums, [f32::from_bits(s0), f32::from_bits(s1)])
 }
 
+/// Words per lane in a tensor-core weight row of `chunks` 16-input chunks, padded so each
+/// lane's words start 16-byte aligned (8-byte for two chunks).
+const fn lane_words(chunks: usize) -> usize {
+    if chunks == 2 { 2 } else { 4 }
+}
+
 /// Clamped HGELU of a hidden output v, given 80 v (loading scales hidden layers by 80),
 /// quantized to int8 for the next layer in the low byte.
 #[inline(always)]
@@ -411,11 +421,16 @@ fn activate(v80: f32) -> u32 {
     let low = f32::from_bits((v80.to_bits() as i32).min(240f32.to_bits() as i32) as u32);
     // round(80 min(v, 3) sat(v / 3 + 1 / 2)) - 113 in the low byte. Ties round up rather than
     // to even as in HLSL, which needs the product to land exactly on a half.
-    fma_rn_f32(low, fma_rn_sat_f32(v80, 0.333333 / 80.0, 0.5), MAGIC - 113.0).to_bits()
+    fma_rn_f32(
+        low,
+        fma_rn_sat_f32(v80, 0.333333 / 80.0, 0.5),
+        MAGIC - 113.0,
+    )
+    .to_bits()
 }
 
-/// A hidden layer's sum. Loading adds `MAGIC_BITS` to hidden biases, so the int32 sum is the
-/// bit pattern of `MAGIC` plus the sum, exact while the sum stays below 2^22 (also checked).
+/// A hidden layer's sum. Loading adds `MAGIC`'s bit pattern to hidden biases, so the int32 sum
+/// is the bit pattern of `MAGIC` plus the sum, exact while the sum stays below 2^22.
 #[inline(always)]
 fn hidden_sum(sum: i32) -> f32 {
     f32::from_bits(sum as u32) - MAGIC
@@ -438,7 +453,11 @@ fn finish(srgb: u32, values: [f32; 9]) -> [f32; 9] {
 /// Packs the low bytes of four words.
 #[inline(always)]
 fn pack(words: [u32; 4]) -> u32 {
-    prmt(prmt(words[0], words[1], 0x40), prmt(words[2], words[3], 0x40), 0x5410)
+    prmt(
+        prmt(words[0], words[1], 0x40),
+        prmt(words[2], words[3], 0x40),
+        0x5410,
+    )
 }
 
 /// A texture set's words in the texel array.
@@ -640,37 +659,42 @@ pub(crate) fn load(path: &Path, texels: &mut Vec<Texel>) -> io::Result<NeuralSet
             let scale = f32::from_le_bytes(s[4 * row..][..4].try_into().unwrap());
             scales.extend_from_slice(&(if last { scale } else { 80.0 * scale }).to_le_bytes());
             let bias = i32::from_le_bytes(b[4 * row..][..4].try_into().unwrap());
-            let offset = if last { 0 } else { MAGIC_BITS as i32 };
+            if !last && bias.unsigned_abs() >= (1 << 22) - (inputs << 14) as u32 {
+                return Err(invalid("hidden sums can exceed 2^22"));
+            }
+            let offset = if last { 0 } else { MAGIC.to_bits() as i32 };
             biases.extend_from_slice(&(bias + offset).to_le_bytes());
             if !MMA {
                 weights.extend_from_slice(w);
                 continue;
             }
             // Inputs in the previous layer's accumulator order; see `hidden_layer`.
+            let source = |k: usize| k / 16 * 16 + k % 4 / 2 * 8 + k % 16 / 4 * 2 + k % 2;
             let w: Vec<u8> = (0..inputs)
-                .map(|k| {
-                    w[if index == 0 { k } else { k / 16 * 16 + k % 4 / 2 * 8 + k % 16 / 4 * 2 + k % 2 }]
-                })
+                .map(|k| w[if index == 0 { k } else { source(k) }])
                 .collect();
             // Lane t's fragment words, inputs 16c + 4t.. of each chunk c, padded; see `tile`.
             let chunks = inputs / 16;
             for t in 0..4 {
-                for c in 0..if chunks == 2 { 2 } else { 4 } {
-                    weights.extend(if c < chunks { &w[16 * c + 4 * t..][..4] } else { &[0; 4] });
+                for c in 0..lane_words(chunks) {
+                    weights.extend(if c < chunks {
+                        &w[16 * c + 4 * t..][..4]
+                    } else {
+                        &[0; 4]
+                    });
                 }
             }
         }
-        let bias = b.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap()));
-        if !last && bias.map(i32::unsigned_abs).max() >= Some((1 << 22) - (inputs << 14) as u32) {
-            return Err(invalid("hidden sums can exceed 2^22"));
-        }
     }
     let vectors = if MMA {
-        scales.chunks_exact(8).zip(biases.chunks_exact(8)).flat_map(|(s, b)| [s, b].concat()).collect()
+        scales
+            .chunks_exact(8)
+            .zip(biases.chunks_exact(8))
+            .flat_map(|(s, b)| [s, b].concat())
+            .collect()
     } else {
         [scales, biases].concat()
     };
-    debug_assert_eq!(weights.len(), 4 * WEIGHT_WORDS);
     let mut bytes = [weights, vectors].concat();
 
     if doc.latent_shape.num_features != 16 {
@@ -678,7 +702,11 @@ pub(crate) fn load(path: &Path, texels: &mut Vec<Texel>) -> io::Result<NeuralSet
     }
     let mut latents = [Latent::default(); MAX_LATENTS];
     for (level, image) in doc.latents.iter().enumerate() {
-        let Some(layers) = image.layer_views.iter().map(|&v| view(v)).collect::<Option<Vec<_>>>()
+        let Some(layers) = image
+            .layer_views
+            .iter()
+            .map(|&v| view(v))
+            .collect::<Option<Vec<_>>>()
         else {
             continue;
         };
@@ -701,7 +729,14 @@ pub(crate) fn load(path: &Path, texels: &mut Vec<Texel>) -> io::Result<NeuralSet
     let mut first_mip = 0;
     for (mip, info) in doc.color_mips[..mips].iter().enumerate() {
         match info.latent_mip {
-            Some(latent) if latents[latent..].iter().take(2).filter(|l| l.width > 0).count() == 2 => {
+            Some(latent)
+                if latents[latent..]
+                    .iter()
+                    .take(2)
+                    .filter(|l| l.width > 0)
+                    .count()
+                    == 2 =>
+            {
                 color_mips[mip] = ColorMip {
                     latent: latent as u32,
                     position_lod: info.position_lod,

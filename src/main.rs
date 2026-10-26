@@ -203,6 +203,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             render_width,
             render_height,
             &renderer.trace_lanes()?,
+            &materials,
             config.sampling,
             config.bounce,
         )

@@ -6,6 +6,7 @@
 BOUNCE_RAYS=16 ./run.sh sponza           # 16 bounce rays per pixel instead of 4
 TRACE=1 ./run.sh sponza                  # also write output/sponza.trace
 NTC_DP4A=1 ./run.sh flight-helmet        # decode neural textures with dp4a, not tensor cores
+python3 scopes.py output/flight-helmet.trace  # replay a trace's neural decodes on tensor-core scopes
 python3 assets/scenes/chess-mosaic/build.py --materials 4 --panels 8  # regenerate chess-mosaic
 ```
 

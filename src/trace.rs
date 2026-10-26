@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fs, io, path::Path};
 
-use crate::{cuda::BOUNCE_RAYS, texture::Sampling};
+use crate::{cuda::BOUNCE_RAYS, material::Material, texture::Sampling};
 
 /// Set at build time by the `TRACE` environment variable; normal builds record nothing.
 pub const TRACE: bool = option_env!("TRACE").is_some();
@@ -103,32 +103,36 @@ fn is_texture(site: Site) -> bool {
             | Site::MetallicRoughnessLevel
             | Site::Emissive
             | Site::EmissiveLevel
-            | Site::Neural
     )
 }
 
 /// Writes one record per 32-lane warp (an 8x4 pixel block), pass, region and active mask;
-/// texture and neural regions also split by material, since each material reads its own
-/// textures or network.
+/// texture regions also split by material, since each material reads its own textures, and
+/// neural regions by texture set, since each set has its own network.
 /// `lanes` holds, per pixel and pass (primary, then each of `BOUNCE_RAYS` bounce rays), the
 /// region bits and material of that lane.
 ///
-/// The little-endian file holds `b"RTRC"`, version 4, then the width, height and pass count as
+/// The little-endian file holds `b"RTRC"`, version 5, then the width, height and pass count as
 /// u32, then records: warp u32, pass u8, `Site` number u8, material u32 (`u32::MAX` outside
-/// texture regions), lane mask u32, then loads, stores, fp, sfu and int counts per lane as u16.
+/// texture regions; in neural regions the first material decoding the set), lane mask u32, then
+/// loads, stores, fp, sfu and int counts per lane as u16.
 pub fn write(
     path: impl AsRef<Path>,
     width: u32,
     height: u32,
     lanes: &[u32],
+    materials: &[Material],
     sampling: Sampling,
     bounce: bool,
 ) -> io::Result<()> {
+    // Neural records key each texture set by the first material decoding it.
+    let first = |m: &Material| materials.iter().position(|n| n.neural == m.neural).unwrap();
+    let sets: Vec<_> = materials.iter().map(first).collect();
     let (width, height) = (width as usize, height as usize);
     let stride = 1 + BOUNCE_RAYS as usize;
     let passes = if bounce { stride } else { 1 };
     let mut bytes = Vec::new();
-    for value in [*b"RTRC", 4u32.to_le_bytes()] {
+    for value in [*b"RTRC", 5u32.to_le_bytes()] {
         bytes.extend(value);
     }
     for value in [width, height, passes] {
@@ -147,7 +151,11 @@ pub fn write(
                 let (sites, material) = (lanes[slot], lanes[slot + 1]);
                 for (bit, &site) in SITES.iter().enumerate() {
                     if sites >> bit & 1 != 0 {
-                        let material = if is_texture(site) { material } else { u32::MAX };
+                        let material = match site {
+                            Site::Neural => sets[material as usize] as u32,
+                            _ if is_texture(site) => material,
+                            _ => u32::MAX,
+                        };
                         *masks.entry((bit, material)).or_default() |= 1 << lane;
                     }
                 }
