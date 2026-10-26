@@ -146,7 +146,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&output_dir)
         .map_err(|error| format!("Failed to create '{}': {error}", output_dir.display()))?;
     let started = Instant::now();
-    let (materials, texels) = load_materials(&asset, config.sampling)?;
+    let ntc = config.ntc.then(|| path.with_file_name("ntc"));
+    let (materials, texels) = load_materials(&asset, config.sampling, ntc.as_deref())?;
     let material_time = started.elapsed();
     eprintln!("Preparing direct-light shadows...");
     let started = Instant::now();
@@ -225,7 +226,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Meshes: {} ({primitives} primitives)",
         document.meshes().len()
     );
-    println!("Materials: {}", document.materials().len());
+    println!(
+        "Materials: {} ({} neural)",
+        document.materials().len(),
+        materials.iter().filter(|m| m.neural.is_some()).count()
+    );
     println!("Textures: {}", document.textures().len());
     let triangles: usize = prepared.primitives.iter().map(|p| p.triangles.len()).sum();
     let stats = renderer.stats();

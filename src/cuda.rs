@@ -1068,6 +1068,7 @@ mod kernels {
     }
 
     #[kernel]
+    #[cuda_device::launch_bounds(32, SHADE_BLOCKS)]
     pub fn shade(
         width: u32,
         height: u32,
@@ -1092,22 +1093,32 @@ mod kernels {
         let x = row_start + lane % 8;
         let y = block / blocks * 4 + lane / 8;
         let sample = y * width as usize + x;
-        let mut color = Vec3::ZERO;
-        if x < width as usize
+        // Empty samples take the default material: every lane samples one, since the
+        // tensor-core decoder runs warp-wide.
+        let covered = x < width as usize
             && y < height as usize
-            && winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX
-        {
+            && winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX;
+        let material_index = if covered {
+            fragment_meta[soa_offset::<2>(sample, 0)]
+        } else {
+            materials.len() as u32 - 1
+        };
+        let material = &materials[material_index as usize];
+        let attributes = if covered {
+            FragmentAttributes::load_soa(fragments, sample)
+        } else {
+            FragmentAttributes::default()
+        };
+        let mut sites = 0;
+        mark(&mut sites, Site::Input);
+        let surface = material.sample(texels, attributes.uv, &mut sites);
+        let mut color = Vec3::ZERO;
+        if covered {
             let shading = Shading {
                 light,
                 depths,
                 camera_position: Vec3::from_array(camera),
             };
-            let material_index = fragment_meta[soa_offset::<2>(sample, 0)];
-            let material = &materials[material_index as usize];
-            let attributes = FragmentAttributes::load_soa(fragments, sample);
-            let mut sites = 0;
-            mark(&mut sites, Site::Input);
-            let surface = material.sample(texels, attributes.uv, &mut sites);
             color = crate::fragment::shade(
                 &shading,
                 material,
@@ -1161,6 +1172,9 @@ mod kernels {
     /// pixel blocks, so a warp shades each ray's hits in launch order, across whatever materials
     /// they reach.
     #[kernel]
+    // 24 resident 32-lane blocks, the most an SM holds, cap registers at 80: traversal gains
+    // more from the occupancy than the decoders lose to spills.
+    #[cuda_device::launch_bounds(32, 24)]
     pub fn bounce(
         width: u32,
         height: u32,
@@ -1186,25 +1200,31 @@ mod kernels {
         let blocks = (width as usize).div_ceil(8);
         let x = block % blocks * 8 + lane % 8;
         let y = block / blocks * 4 + lane / 8;
-        if x >= width as usize
-            || y >= height as usize
-            || winners[y * width as usize + x].load(AtomicOrdering::Relaxed) == u64::MAX
-        {
-            return;
-        }
         let sample = y * width as usize + x;
+        // Lanes of empty samples and misses stay to sample the default material, since the
+        // tensor-core decoder runs warp-wide.
+        let covered = x < width as usize
+            && y < height as usize
+            && winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX;
         // Each lane owns its pixel's color and hit slots; unwritten slots stay u32::MAX.
         let slots = sample * (1 + BOUNCE_RAYS as usize);
-        let primary = fragment_meta[soa_offset::<2>(sample, 0)];
-        unsafe { *hits.get_unchecked_mut(slots) = primary };
-        let attributes = FragmentAttributes::load_soa(fragments, sample);
-        let normal = if fragment_meta[soa_offset::<2>(sample, 1)] != 0 {
-            attributes.normal
+        let (origin, normal) = if covered {
+            let primary = fragment_meta[soa_offset::<2>(sample, 0)];
+            unsafe { *hits.get_unchecked_mut(slots) = primary };
+            let attributes = FragmentAttributes::load_soa(fragments, sample);
+            let normal = if fragment_meta[soa_offset::<2>(sample, 1)] != 0 {
+                attributes.normal
+            } else {
+                -attributes.normal
+            };
+            let position = attributes.world_position;
+            (
+                position + normal * (1e-4 * (1.0 + position.abs().max_element())),
+                normal,
+            )
         } else {
-            -attributes.normal
+            (Vec3::ZERO, Vec3::Z)
         };
-        let position = attributes.world_position;
-        let origin = position + normal * (1e-4 * (1.0 + position.abs().max_element()));
         let corners = |triangle: u32| {
             triangles[triangle as usize].vertices.map(|v| {
                 Vec3::from_array(std::array::from_fn(|c| {
@@ -1224,52 +1244,70 @@ mod kernels {
             let mut sites = 0;
             mark(&mut sites, Site::Traverse);
             // Slots are recomputed at each store: keeping one live across traversal cost 15%.
-            let Some(hit) = bvh::closest_hit(nodes, order, origin, direction, corners) else {
-                store_trace(&mut trace, slots + 1 + ray as usize, sites, u32::MAX);
-                continue;
+            let hit = if covered {
+                bvh::closest_hit(nodes, order, origin, direction, corners)
+            } else {
+                None
             };
-            mark(&mut sites, Site::Hit);
-            let triangle = triangles[hit.triangle as usize];
-            let primitive = primitives[triangle.primitive as usize];
-            let [a, b, c] = triangle
-                .vertices
-                .map(|v| ClipVertex::load_soa(vertices, v as usize));
-            let [wa, wb, wc] = hit.barycentric;
-            let hit_attributes = FragmentAttributes {
-                world_position: origin + direction * hit.t,
-                // Hits read level zero; ray cones could select a mip level.
-                uv: UvSample::point(a.uv * wa + b.uv * wb + c.uv * wc),
-                normal: (a.normal * wa + b.normal * wb + c.normal * wc).normalize_or_zero(),
-                tangent: a.tangent * wa + b.tangent * wb + c.tangent * wc,
+            let (material_index, hit_attributes, front_facing) = match &hit {
+                Some(hit) => {
+                    mark(&mut sites, Site::Hit);
+                    let triangle = triangles[hit.triangle as usize];
+                    let primitive = primitives[triangle.primitive as usize];
+                    let [a, b, c] = triangle
+                        .vertices
+                        .map(|v| ClipVertex::load_soa(vertices, v as usize));
+                    let [wa, wb, wc] = hit.barycentric;
+                    let hit_attributes = FragmentAttributes {
+                        world_position: origin + direction * hit.t,
+                        // Hits read level zero; ray cones could select a mip level.
+                        uv: UvSample::point(a.uv * wa + b.uv * wb + c.uv * wc),
+                        normal: (a.normal * wa + b.normal * wb + c.normal * wc)
+                            .normalize_or_zero(),
+                        tangent: a.tangent * wa + b.tangent * wb + c.tangent * wc,
+                    };
+                    let geometric = (b.world_position - a.world_position)
+                        .cross(c.world_position - a.world_position);
+                    let front_facing = (geometric.dot(direction) < 0.0) != primitive.mirrored;
+                    (primitive.material_index, hit_attributes, front_facing)
+                }
+                None => (
+                    materials.len() as u32 - 1,
+                    FragmentAttributes::default(),
+                    false,
+                ),
             };
-            let geometric =
-                (b.world_position - a.world_position).cross(c.world_position - a.world_position);
-            let front_facing = (geometric.dot(direction) < 0.0) != primitive.mirrored;
-            let material = &materials[primitive.material_index as usize];
+            let material = &materials[material_index as usize];
             let surface = material.sample(texels, hit_attributes.uv, &mut sites);
-            radiance += crate::fragment::shade(
-                &shading,
-                material,
-                &surface,
-                &hit_attributes,
-                front_facing,
-                &mut sites,
-            );
-            unsafe { *hits.get_unchecked_mut(slots + 1 + ray as usize) = primitive.material_index };
-            store_trace(
-                &mut trace,
-                slots + 1 + ray as usize,
-                sites,
-                primitive.material_index,
-            );
+            if hit.is_some() {
+                radiance += crate::fragment::shade(
+                    &shading,
+                    material,
+                    &surface,
+                    &hit_attributes,
+                    front_facing,
+                    &mut sites,
+                );
+                unsafe { *hits.get_unchecked_mut(slots + 1 + ray as usize) = material_index };
+            }
+            if covered {
+                let traced = if hit.is_some() { material_index } else { u32::MAX };
+                store_trace(&mut trace, slots + 1 + ray as usize, sites, traced);
+            }
         }
-        // Cosine-weighted sampling cancels the Lambertian cosine and 1/pi.
-        let indirect = Vec3::from_array(albedo[sample]) * (radiance / BOUNCE_RAYS as f32);
-        let color = unsafe { colors.get_unchecked_mut(sample) };
-        color[0] += indirect.x;
-        color[1] += indirect.y;
-        color[2] += indirect.z;
+        if covered {
+            // Cosine-weighted sampling cancels the Lambertian cosine and 1/pi.
+            let indirect = Vec3::from_array(albedo[sample]) * (radiance / BOUNCE_RAYS as f32);
+            let color = unsafe { colors.get_unchecked_mut(sample) };
+            color[0] += indirect.x;
+            color[1] += indirect.y;
+            color[2] += indirect.z;
+        }
     }
+
+    /// Resident blocks per SM for shading, capping registers at 65536 / (32 blocks): 128 for the
+    /// tensor-core decoder, which otherwise takes 206, and 96 for dp4a, the fastest for each.
+    const SHADE_BLOCKS: u32 = if crate::ntc::MMA { 16 } else { 20 };
 
     /// With `TRACE`, stores a lane's region bits and material; the caller owns `slot`.
     #[inline(always)]

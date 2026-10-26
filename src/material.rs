@@ -1,23 +1,44 @@
-use std::io;
+use std::{collections::HashMap, io, path::Path};
 
 use glam::{Vec3, Vec4};
 
 use crate::{
     geometry::GltfAsset,
+    ntc::{self, NeuralSet},
     texture::{ColorSpace, Sampling, Texel, Texture, TextureLoader, UvSample},
     trace::{Site, TRACE, mark},
 };
 
-/// Returns the materials and the texel array their textures index.
+/// Returns the materials and the texel array their textures index. With `ntc`, a material
+/// named M with a texture set `ntc/M.ntc` decodes it instead of its base color, normal and
+/// metallic-roughness textures; materials sharing a file share one set.
 pub fn load_materials(
     asset: &GltfAsset,
     sampling: Sampling,
+    ntc: Option<&Path>,
 ) -> io::Result<(Vec<Material>, Vec<Texel>)> {
     let mut textures = TextureLoader::new(&asset.images, sampling);
+    let mut sets = HashMap::new();
     let materials = asset
         .document
         .materials()
-        .map(|material| Material::new(material, &mut textures))
+        .map(|material| {
+            let neural = ntc
+                .zip(material.name())
+                .map(|(dir, name)| dir.join(format!("{name}.ntc")))
+                .filter(|path| path.is_file())
+                .map(|path| -> io::Result<NeuralSet> {
+                    let key = path.canonicalize()?;
+                    if let Some(&set) = sets.get(&key) {
+                        return Ok(set);
+                    }
+                    let set = ntc::load(&path, &mut textures.texels)?;
+                    sets.insert(key, set);
+                    Ok(set)
+                })
+                .transpose()?;
+            Material::new(material, &mut textures, neural)
+        })
         .collect::<io::Result<_>>()?;
     Ok((materials, textures.texels))
 }
@@ -43,6 +64,8 @@ pub struct Material {
     pub metallic_roughness_texture: Option<Texture>,
     pub emissive_factor: Vec3,
     pub emissive_texture: Option<Texture>,
+    /// Replaces the base color, normal and metallic-roughness textures.
+    pub neural: Option<NeuralSet>,
     pub double_sided: bool,
 }
 
@@ -58,20 +81,31 @@ impl Default for Material {
             metallic_roughness_texture: None,
             emissive_factor: Vec3::ZERO,
             emissive_texture: None,
+            neural: None,
             double_sided: false,
         }
     }
 }
 
 impl Material {
-    fn new(material: gltf::Material<'_>, textures: &mut TextureLoader<'_>) -> io::Result<Self> {
+    fn new(
+        material: gltf::Material<'_>,
+        textures: &mut TextureLoader<'_>,
+        neural: Option<NeuralSet>,
+    ) -> io::Result<Self> {
         let pbr = material.pbr_metallic_roughness();
         let normal = material.normal_texture();
+        let conventional = neural.is_none();
         Ok(Self {
             base_color_factor: Vec4::from(pbr.base_color_factor()).truncate(),
-            base_color_texture: load_texture(pbr.base_color_texture(), textures, ColorSpace::Srgb)?,
+            base_color_texture: load_texture(
+                pbr.base_color_texture().filter(|_| conventional),
+                textures,
+                ColorSpace::Srgb,
+            )?,
             normal_scale: normal.as_ref().map_or(1.0, |info| info.scale()),
             normal_texture: normal
+                .filter(|_| conventional)
                 .map(|info| {
                     check_texture_transform(
                         info.extension_value("KHR_texture_transform").is_some(),
@@ -82,7 +116,7 @@ impl Material {
             metallic_factor: pbr.metallic_factor(),
             roughness_factor: pbr.roughness_factor(),
             metallic_roughness_texture: load_texture(
-                pbr.metallic_roughness_texture(),
+                pbr.metallic_roughness_texture().filter(|_| conventional),
                 textures,
                 ColorSpace::Linear,
             )?,
@@ -93,11 +127,13 @@ impl Material {
                 textures,
                 ColorSpace::Srgb,
             )?,
+            neural,
             double_sided: material.double_sided(),
         })
     }
 
     /// Reads every texture at one UV, as a texture-set decoder produces all channels at once.
+    /// Every lane of a warp must call this together: the tensor-core decoder is warp-wide.
     #[inline(always)]
     pub(crate) fn sample(&self, texels: &[Texel], uv: UvSample, sites: &mut u32) -> MaterialSample {
         trace_texture(
@@ -128,14 +164,28 @@ impl Material {
             Site::Emissive,
             Site::EmissiveLevel,
         );
-        let base_color = sample_texture(&self.base_color_texture, texels, uv);
-        let mut normal =
-            sample_texture(&self.normal_texture, texels, uv).truncate() * 2.0 - Vec3::ONE;
+        let c = ntc::sample(texels, self.neural.as_ref(), uv);
+        // ORM channels put roughness and metallic where metallic-roughness textures do.
+        let (base_color, normal, metallic_roughness) = match &self.neural {
+            Some(_) => {
+                mark(sites, Site::Neural);
+                (
+                    Vec3::new(c[0], c[1], c[2]),
+                    Vec3::new(c[6], c[7], c[8]),
+                    Vec3::new(c[3], c[4], c[5]),
+                )
+            }
+            None => (
+                sample_texture(&self.base_color_texture, texels, uv).truncate(),
+                sample_texture(&self.normal_texture, texels, uv).truncate(),
+                sample_texture(&self.metallic_roughness_texture, texels, uv).truncate(),
+            ),
+        };
+        let mut normal = normal * 2.0 - Vec3::ONE;
         normal.x *= self.normal_scale;
         normal.y *= self.normal_scale;
-        let metallic_roughness = sample_texture(&self.metallic_roughness_texture, texels, uv);
         MaterialSample {
-            base_color: self.base_color_factor * base_color.truncate(),
+            base_color: self.base_color_factor * base_color,
             normal,
             metallic: self.metallic_factor * metallic_roughness.z,
             roughness: self.roughness_factor * metallic_roughness.y,
@@ -144,9 +194,13 @@ impl Material {
         }
     }
 
+    pub fn has_normal_map(&self) -> bool {
+        self.normal_texture.is_some() || self.neural.is_some()
+    }
+
     /// Applies a sampled tangent-space normal.
     pub fn shading_normal(&self, sampled: Vec3, normal: Vec3, tangent: Vec4) -> Vec3 {
-        if self.normal_texture.is_none() || self.normal_scale == 0.0 || tangent.w == 0.0 {
+        if !self.has_normal_map() || self.normal_scale == 0.0 || tangent.w == 0.0 {
             return normal;
         }
         let Some(t) =

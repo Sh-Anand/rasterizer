@@ -5,12 +5,16 @@
 ./run.sh living-room                     # build and render output/living-room.png
 BOUNCE_RAYS=16 ./run.sh sponza           # 16 bounce rays per pixel instead of 4
 TRACE=1 ./run.sh sponza                  # also write output/sponza.trace
+NTC_DP4A=1 ./run.sh flight-helmet        # decode neural textures with dp4a, not tensor cores
 python3 assets/scenes/chess-mosaic/build.py --materials 4 --panels 8  # regenerate chess-mosaic
 ```
 
 `TRACE=1` builds record which shader regions every GPU lane executes, as warp-level
 records with active masks and source-level operation estimates; the format is documented
 on `trace::write`. Trace builds are for traces only; time normal builds.
+
+With `ntc = true`, a material named M decodes the RTXNTC texture set
+`assets/scenes/<scene>/ntc/M.ntc` instead of its textures; FlightHelmet ships NVIDIA's sets.
 
 Settings are in `config.toml`; images are written to `output/`. The runner builds in
 release mode into `target/gpu`; it requires the one-time CUDA setup below and selects

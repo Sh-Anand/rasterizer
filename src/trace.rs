@@ -18,6 +18,7 @@ pub(crate) enum Site {
     MetallicRoughnessLevel,
     Emissive,
     EmissiveLevel,
+    Neural,
     NormalMap,
     Surface,
     Light,
@@ -28,7 +29,7 @@ pub(crate) enum Site {
     Hit,
 }
 
-const SITES: [Site; 17] = [
+const SITES: [Site; 18] = [
     Site::Input,
     Site::BaseColor,
     Site::BaseColorLevel,
@@ -38,6 +39,7 @@ const SITES: [Site; 17] = [
     Site::MetallicRoughnessLevel,
     Site::Emissive,
     Site::EmissiveLevel,
+    Site::Neural,
     Site::NormalMap,
     Site::Surface,
     Site::Light,
@@ -71,6 +73,10 @@ fn ops(site: Site, sampling: Sampling, bounce: bool) -> [u16; 5] {
         | Site::NormalLevel
         | Site::MetallicRoughnessLevel
         | Site::EmissiveLevel => [4, 0, 64, 0, 52],
+        // The dp4a decoder: descriptor, 8 latent taps, then 504 weight and 78 scale/bias 16-byte
+        // loads; the integer count includes 2016 dp4a. Latent filtering runs on ALUs, not
+        // texture units. On tensor cores each record is instead one warp-wide network pass.
+        Site::Neural => [605, 0, 850, 21, 2575],
         Site::NormalMap => [0, 0, 67, 4, 0],
         Site::Surface => [0, 0, 47, 2, 0],
         // The light and its shadow map arrive as kernel parameters.
@@ -97,15 +103,17 @@ fn is_texture(site: Site) -> bool {
             | Site::MetallicRoughnessLevel
             | Site::Emissive
             | Site::EmissiveLevel
+            | Site::Neural
     )
 }
 
 /// Writes one record per 32-lane warp (an 8x4 pixel block), pass, region and active mask;
-/// texture regions also split by material, since each material reads its own textures.
+/// texture and neural regions also split by material, since each material reads its own
+/// textures or network.
 /// `lanes` holds, per pixel and pass (primary, then each of `BOUNCE_RAYS` bounce rays), the
 /// region bits and material of that lane.
 ///
-/// The little-endian file holds `b"RTRC"`, version 3, then the width, height and pass count as
+/// The little-endian file holds `b"RTRC"`, version 4, then the width, height and pass count as
 /// u32, then records: warp u32, pass u8, `Site` number u8, material u32 (`u32::MAX` outside
 /// texture regions), lane mask u32, then loads, stores, fp, sfu and int counts per lane as u16.
 pub fn write(
@@ -120,7 +128,7 @@ pub fn write(
     let stride = 1 + BOUNCE_RAYS as usize;
     let passes = if bounce { stride } else { 1 };
     let mut bytes = Vec::new();
-    for value in [*b"RTRC", 3u32.to_le_bytes()] {
+    for value in [*b"RTRC", 4u32.to_le_bytes()] {
         bytes.extend(value);
     }
     for value in [width, height, passes] {

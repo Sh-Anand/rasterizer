@@ -5,6 +5,9 @@ supersampling = 1
 # Material texture filtering: "none" (nearest texel of the nearest mip level), "bilinear"
 # (level zero), or "trilinear".
 sampling = "trilinear"
+# Decode materials that have an RTXNTC texture set assets/scenes/<scene>/ntc/<material>.ntc,
+# always at the nearest texel of the nearest decodable mip level, whatever the sampling.
+ntc = true
 # Ray-traced, cosine-weighted diffuse bounce (CUDA only); build with BOUNCE_RAYS=n for n rays
 # per pixel (default 4).
 bounce = true

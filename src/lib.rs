@@ -4,6 +4,7 @@ pub mod framebuffer;
 pub mod geometry;
 pub mod lighting;
 pub mod material;
+pub mod ntc;
 pub mod texture;
 pub mod trace;
 

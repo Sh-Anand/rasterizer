@@ -41,7 +41,8 @@ pub(crate) enum ColorSpace {
     Linear,
 }
 
-/// A linear RGBA texel, aligned so the GPU reads it with one 16-byte load.
+/// A linear RGBA texel, aligned so the GPU reads it with one 16-byte load. Neural texture sets
+/// store their weights and latents as raw words in texels.
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
 pub struct Texel(pub Vec4);
@@ -221,11 +222,7 @@ impl Texture {
 
     #[inline(always)]
     fn lod(&self, sample: UvSample) -> f32 {
-        let size = Vec2::new(self.width as f32, self.height as f32);
-        let rho_squared = (sample.dx * size)
-            .length_squared()
-            .max((sample.dy * size).length_squared());
-        (0.5 * rho_squared.log2()).max(0.0)
+        lod(Vec2::new(self.width as f32, self.height as f32), sample)
     }
 
     #[inline(always)]
@@ -277,6 +274,15 @@ impl Texture {
         let bottom = texel(x0, y0 + 1).lerp(texel(x0 + 1, y0 + 1), tx);
         top.lerp(bottom, ty)
     }
+}
+
+/// Level of detail of a `size`-texel image from the larger UV gradient.
+#[inline(always)]
+pub(crate) fn lod(size: Vec2, sample: UvSample) -> f32 {
+    let rho_squared = (sample.dx * size)
+        .length_squared()
+        .max((sample.dy * size).length_squared());
+    (0.5 * rho_squared.log2()).max(0.0)
 }
 
 fn wrap_uv(value: f32, mode: WrappingMode) -> f32 {

@@ -29,7 +29,7 @@ pub(crate) fn shade(
     front_facing: bool,
     sites: &mut u32,
 ) -> Vec3 {
-    if material.normal_texture.is_some() {
+    if material.has_normal_map() {
         mark(sites, Site::NormalMap);
     }
     mark(sites, Site::Surface);

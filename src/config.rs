@@ -15,6 +15,9 @@ pub struct Config {
     pub supersampling: u32,
     #[serde(default)]
     pub sampling: Sampling,
+    /// Decode the scene's `ntc/<material>.ntc` texture sets instead of their textures.
+    #[serde(default)]
+    pub ntc: bool,
     #[serde(default)]
     pub bounce: bool,
     pub camera: CameraConfig,
