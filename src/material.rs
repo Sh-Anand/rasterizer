@@ -10,8 +10,8 @@ use crate::{
 };
 
 /// Returns the materials and the texel array their textures index. With `ntc`, a material
-/// named M with a texture set `ntc/M.ntc` decodes it instead of its base color, normal and
-/// metallic-roughness textures; materials sharing a file share one set.
+/// named M (or numbered M, unnamed) with a texture set `ntc/M.ntc` decodes it instead of its base
+/// color, normal and metallic-roughness textures; materials sharing a file share one set.
 pub fn load_materials(
     asset: &GltfAsset,
     sampling: Sampling,
@@ -22,10 +22,13 @@ pub fn load_materials(
     let materials = asset
         .document
         .materials()
-        .map(|material| {
+        .enumerate()
+        .map(|(index, material)| {
+            let name = material
+                .name()
+                .map_or_else(|| index.to_string(), str::to_owned);
             let neural = ntc
-                .zip(material.name())
-                .map(|(dir, name)| dir.join(format!("{name}.ntc")))
+                .map(|dir| dir.join(format!("{name}.ntc")))
                 .filter(|path| path.is_file())
                 .map(|path| -> io::Result<NeuralSet> {
                     let key = path.canonicalize()?;

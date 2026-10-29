@@ -3,3 +3,5 @@
 /.oxide-artifacts/
 /rasterizer*.ll
 /rasterizer.ptx
+/assets/scenes/*/ntc/
+!/assets/scenes/flight-helmet/ntc/
