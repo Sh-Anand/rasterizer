@@ -6,9 +6,9 @@ import sys
 
 import numpy as np
 
-# The decoder's (inputs, outputs) per layer, and `Site::Neural` in trace.rs.
+# The decoder's (inputs, outputs) per layer, and `Site::Network` in trace.rs.
 LAYERS = [(48, 64), (64, 48), (48, 32), (32, 16)]
-NEURAL = 9
+NETWORK = 10
 # Outputs M, samples N and inputs K per operation.
 SCOPES = {'quad 8x4x8': (8, 4, 8), 'warp 16x16x16': (16, 16, 16), 'SM 128x256x16': (128, 256, 16)}
 # Windows in warps: one SM holds 48 resident warps on Ada.
@@ -30,13 +30,14 @@ DP4A, HEAVY = 4111, 2184  # dp4a network per warp decode, of which on fmaheavy
 SET = 8192 + 160 * 8  # weight, scale and bias bytes per set fetch
 REGROUP, REGROUP_SHUFFLES = 30, 21  # in-warp lane permutation; the quad scope then moves inputs and outputs
 SORT, SORT_BYTES = 90, 32 * 2 * 84  # per warp decode, sorting across an SM through shared memory
-RECORD = np.dtype([('warp', '<u4'), ('pass', 'u1'), ('site', 'u1'), ('material', '<u4'),
-                   ('mask', '<u4'), ('ops', '<u2', 5)])
+RECORD = np.dtype([('warp', '<u4'), ('pass', 'u1'), ('site', 'u1'), ('material', '<u4'), ('mask', '<u4')])
 
 data = open(sys.argv[1], 'rb').read()
-assert data[:4] == b'RTRC' and int.from_bytes(data[4:8], 'little') == 5, 'needs an RTRC version 5 trace'
-records = np.frombuffer(data, RECORD, offset=20)
-records = records[records['site'] == NEURAL]
+assert data[:4] == b'RTRC' and int.from_bytes(data[4:8], 'little') == 6, 'needs an RTRC version 6 trace'
+# Skip the op table: per site, a u16 count per op type for its work and for its critical path.
+sites, ops = (int.from_bytes(data[i:i + 4], 'little') for i in (20, 24))
+records = np.frombuffer(data, RECORD, offset=28 + 4 * sites * ops)
+records = records[records['site'] == NETWORK]
 useful = sum(i * o for i, o in LAYERS)
 
 def counts(r, window):

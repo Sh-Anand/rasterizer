@@ -171,7 +171,8 @@ impl Material {
         // ORM channels put roughness and metallic where metallic-roughness textures do.
         let (base_color, normal, metallic_roughness) = match &self.neural {
             Some(_) => {
-                mark(sites, Site::Neural);
+                mark(sites, Site::Latents);
+                mark(sites, Site::Network);
                 (
                     Vec3::new(c[0], c[1], c[2]),
                     Vec3::new(c[6], c[7], c[8]),
