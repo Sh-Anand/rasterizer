@@ -1,6 +1,10 @@
 use std::{collections::BTreeMap, fs, io, path::Path};
 
-use crate::{cuda::BOUNCE_RAYS, material::Material, texture::Sampling};
+use crate::{
+    cuda::{BOUNCES, SLOTS},
+    material::Material,
+    texture::Sampling,
+};
 
 /// Set at build time by the `TRACE` environment variable; normal builds record nothing.
 pub const TRACE: bool = option_env!("TRACE").is_some();
@@ -161,11 +165,12 @@ fn is_texture(site: Site) -> bool {
 /// texture regions also split by material, since each material reads its own textures, and
 /// network regions by texture set, since each set's network runs separately on matrix hardware.
 /// Latent regions do not split: lanes with different sets run them together.
-/// `lanes` holds, per pixel and pass (primary, then each of `BOUNCE_RAYS` bounce rays), the
-/// region bits and material of that lane.
+/// `lanes` holds, per pixel and pass (primary, then each bounce ray's hits by depth), the region
+/// bits and material of that lane.
 ///
-/// The little-endian file holds `b"RTRC"`, version 6, then the width, height, pass count, `Site`
-/// count and op-type count as u32; then per `Site`, its per-lane op counts in `OPS` order and its
+/// The little-endian file holds `b"RTRC"`, version 7, then the width, height, pass count,
+/// bounces per path (0 without the bounce; pass 1 + r b + d is ray r at depth d), `Site` count
+/// and op-type count as u32; then per `Site`, its per-lane op counts in `OPS` order and its
 /// critical path's (see `ops`) as u16; then records: warp u32, pass u8, `Site` number u8,
 /// material u32 (`u32::MAX` outside texture regions; in network regions the first material
 /// decoding the set), lane mask u32.
@@ -182,13 +187,13 @@ pub fn write(
     let first = |m: &Material| materials.iter().position(|n| n.neural == m.neural).unwrap();
     let sets: Vec<_> = materials.iter().map(first).collect();
     let (width, height) = (width as usize, height as usize);
-    let stride = 1 + BOUNCE_RAYS as usize;
-    let passes = if bounce { stride } else { 1 };
+    let passes = if bounce { SLOTS } else { 1 };
+    let bounces = if bounce { BOUNCES as usize } else { 0 };
     let mut bytes = Vec::new();
-    for value in [*b"RTRC", 6u32.to_le_bytes()] {
+    for value in [*b"RTRC", 7u32.to_le_bytes()] {
         bytes.extend(value);
     }
-    for value in [width, height, passes, SITES.len(), OPS] {
+    for value in [width, height, passes, bounces, SITES.len(), OPS] {
         bytes.extend((value as u32).to_le_bytes());
     }
     for site in SITES {
@@ -206,7 +211,7 @@ pub fn write(
                 if x >= width || y >= height {
                     continue;
                 }
-                let slot = 2 * ((y * width + x) * stride + pass);
+                let slot = 2 * ((y * width + x) * SLOTS + pass);
                 let (sites, material) = (lanes[slot], lanes[slot + 1]);
                 for (bit, &site) in SITES.iter().enumerate() {
                     if sites >> bit & 1 != 0 {

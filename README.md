@@ -4,6 +4,7 @@
 ./run.sh                                 # list bundled scenes
 ./run.sh living-room                     # build and render output/living-room.png
 BOUNCE_RAYS=16 ./run.sh sponza           # 16 bounce rays per pixel instead of 4
+BOUNCES=2 ./run.sh sponza                # continue each bounce ray for a second bounce
 TRACE=1 ./run.sh sponza                  # also write output/sponza.trace
 NTC_DP4A=1 ./run.sh flight-helmet        # decode neural textures with dp4a, not tensor cores
 python3 scopes.py output/flight-helmet.trace  # replay a trace's neural decodes on tensor-core scopes
@@ -64,11 +65,11 @@ Transformed vertices, visibility, fragment attributes and shadow depths stay on 
 GPU; only final RGB and small error/statistics counters return to the host.
 Dimensions must be nonzero and their product must fit `u32`.
 
-`bounce = true` in `config.toml` adds a ray-traced diffuse bounce, averaging
-`BOUNCE_RAYS` rays per pixel; the count is fixed at build time and defaults to 4. Each
-bounce render writes `output/<scene>.hits`: the render width, height and rays per pixel
-as u32, then per pixel the primary material and each ray's hit material (`u32::MAX` for
-none; the scene's material count selects the default material).
+`bounce = true` in `config.toml` adds ray-traced diffuse light, averaging `BOUNCE_RAYS`
+paths per pixel of `BOUNCES` bounces each; both are fixed at build time and default to 4
+and 1. Each bounce render writes `output/<scene>.hits`: the render width, height, rays per
+pixel and bounces as u32, then per pixel the primary material and each ray's hit materials
+by depth (`u32::MAX` for none; the scene's material count selects the default material).
 
 The resident rasterizer handles small triangles per thread and distributes large
 triangles through a bounded work queue. Atomic depth/owner selection preserves

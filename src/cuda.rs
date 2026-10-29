@@ -32,6 +32,19 @@ pub const BOUNCE_RAYS: u32 = match option_env!("BOUNCE_RAYS") {
     },
 };
 
+/// Diffuse bounces per path, fixed at build time by the `BOUNCES` environment variable.
+pub const BOUNCES: u32 = match option_env!("BOUNCES") {
+    None => 1,
+    Some(value) => match u32::from_str_radix(value, 10) {
+        Ok(bounces) if bounces > 0 => bounces,
+        _ => panic!("BOUNCES must be a positive integer"),
+    },
+};
+
+/// Per-pixel slots in the hit and trace buffers: the primary surface, then each ray's hits by
+/// depth.
+pub const SLOTS: usize = 1 + (BOUNCE_RAYS * BOUNCES) as usize;
+
 // Component planes are grouped in warps to keep indexed vertex reads nearby.
 fn padded_count(count: usize) -> usize {
     count.next_multiple_of(32)
@@ -473,7 +486,7 @@ impl Renderer {
         }
         if TRACE {
             self.trace
-                .resize(2 * (1 + BOUNCE_RAYS as usize) * width as usize * height as usize)?;
+                .resize(2 * SLOTS * width as usize * height as usize)?;
             self.trace.fill(0, &self.stream)?;
         }
         let start = self.event()?;
@@ -508,8 +521,7 @@ impl Renderer {
         height: u32,
         light: Light,
     ) -> io::Result<(CudaEvent, CudaEvent)> {
-        self.hits
-            .resize((1 + BOUNCE_RAYS as usize) * width as usize * height as usize)?;
+        self.hits.resize(SLOTS * width as usize * height as usize)?;
         self.hits.fill(255, &self.stream)?;
         let start = self.event()?;
         // Buffers live through the synchronous readback.
@@ -1128,12 +1140,7 @@ mod kernels {
                 &mut sites,
             );
             mark(&mut sites, Site::Output);
-            store_trace(
-                &mut trace,
-                sample * (1 + BOUNCE_RAYS as usize),
-                sites,
-                material_index,
-            );
+            store_trace(&mut trace, sample * SLOTS, sites, material_index);
             if bounce {
                 // Each lane owns its pixel's albedo.
                 unsafe {
@@ -1168,9 +1175,9 @@ mod kernels {
         }
     }
 
-    /// Adds a cosine-weighted diffuse bounce from `BOUNCE_RAYS` rays. Lanes keep shading's 8x4
-    /// pixel blocks, so a warp shades each ray's hits in launch order, across whatever materials
-    /// they reach.
+    /// Adds cosine-weighted diffuse light from `BOUNCE_RAYS` paths of `BOUNCES` bounces. Lanes keep
+    /// shading's 8x4 pixel blocks, so a warp shades each ray's hits in launch order, depth by
+    /// depth, across whatever materials they reach.
     #[kernel]
     // 24 resident 32-lane blocks, the most an SM holds, cap registers at 80: traversal gains
     // more from the occupancy than the decoders lose to spills.
@@ -1207,7 +1214,7 @@ mod kernels {
             && y < height as usize
             && winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX;
         // Each lane owns its pixel's color and hit slots; unwritten slots stay u32::MAX.
-        let slots = sample * (1 + BOUNCE_RAYS as usize);
+        let slots = sample * SLOTS;
         let (origin, normal) = if covered {
             let primary = fragment_meta[soa_offset::<2>(sample, 0)];
             unsafe { *hits.get_unchecked_mut(slots) = primary };
@@ -1232,66 +1239,90 @@ mod kernels {
                 }))
             })
         };
-        let shading = Shading {
-            light,
-            depths,
-            camera_position: origin,
-        };
         let mut radiance = Vec3::ZERO;
         for ray in 0..BOUNCE_RAYS {
-            let seed = (sample as u32).wrapping_mul(BOUNCE_RAYS).wrapping_add(ray);
-            let direction = cosine_direction(normal, seed);
-            let mut sites = 0;
-            mark(&mut sites, Site::Traverse);
-            // Slots are recomputed at each store: keeping one live across traversal cost 15%.
-            let hit = if covered {
-                bvh::closest_hit(nodes, order, origin, direction, corners)
-            } else {
-                None
-            };
-            let (material_index, hit_attributes, front_facing) = match &hit {
-                Some(hit) => {
-                    mark(&mut sites, Site::Hit);
-                    let triangle = triangles[hit.triangle as usize];
-                    let primitive = primitives[triangle.primitive as usize];
-                    let [a, b, c] = triangle
-                        .vertices
-                        .map(|v| ClipVertex::load_soa(vertices, v as usize));
-                    let [wa, wb, wc] = hit.barycentric;
-                    let hit_attributes = FragmentAttributes {
-                        world_position: origin + direction * hit.t,
-                        // Hits read level zero; ray cones could select a mip level.
-                        uv: UvSample::point(a.uv * wa + b.uv * wb + c.uv * wc),
-                        normal: (a.normal * wa + b.normal * wb + c.normal * wc).normalize_or_zero(),
-                        tangent: a.tangent * wa + b.tangent * wb + c.tangent * wc,
+            // A path continues from each hit, weighted by its diffuse albedo; a miss ends it.
+            let (mut origin, mut normal, mut weight, mut alive) =
+                (origin, normal, Vec3::ONE, covered);
+            for depth in 0..BOUNCES {
+                let path = ray * BOUNCES + depth;
+                // Each depth draws from its own range, so first bounces match any `BOUNCES`.
+                let seed = (sample as u32)
+                    .wrapping_mul(BOUNCE_RAYS)
+                    .wrapping_add(ray)
+                    .wrapping_add((depth * BOUNCE_RAYS).wrapping_mul(width * height));
+                let direction = cosine_direction(normal, seed);
+                let mut sites = 0;
+                mark(&mut sites, Site::Traverse);
+                // Slots are recomputed at each store: keeping one live across traversal cost 15%.
+                let hit = if alive {
+                    bvh::closest_hit(nodes, order, origin, direction, corners)
+                } else {
+                    None
+                };
+                let (material_index, hit_attributes, front_facing) = match &hit {
+                    Some(hit) => {
+                        mark(&mut sites, Site::Hit);
+                        let triangle = triangles[hit.triangle as usize];
+                        let primitive = primitives[triangle.primitive as usize];
+                        let [a, b, c] = triangle
+                            .vertices
+                            .map(|v| ClipVertex::load_soa(vertices, v as usize));
+                        let [wa, wb, wc] = hit.barycentric;
+                        let hit_attributes = FragmentAttributes {
+                            world_position: origin + direction * hit.t,
+                            // Hits read level zero; ray cones could select a mip level.
+                            uv: UvSample::point(a.uv * wa + b.uv * wb + c.uv * wc),
+                            normal: (a.normal * wa + b.normal * wb + c.normal * wc)
+                                .normalize_or_zero(),
+                            tangent: a.tangent * wa + b.tangent * wb + c.tangent * wc,
+                        };
+                        let geometric = (b.world_position - a.world_position)
+                            .cross(c.world_position - a.world_position);
+                        let front_facing = (geometric.dot(direction) < 0.0) != primitive.mirrored;
+                        (primitive.material_index, hit_attributes, front_facing)
+                    }
+                    None => (
+                        materials.len() as u32 - 1,
+                        FragmentAttributes::default(),
+                        false,
+                    ),
+                };
+                let material = &materials[material_index as usize];
+                let surface = material.sample(texels, hit_attributes.uv, &mut sites);
+                if hit.is_some() {
+                    let shading = Shading {
+                        light,
+                        depths,
+                        camera_position: origin,
                     };
-                    let geometric = (b.world_position - a.world_position)
-                        .cross(c.world_position - a.world_position);
-                    let front_facing = (geometric.dot(direction) < 0.0) != primitive.mirrored;
-                    (primitive.material_index, hit_attributes, front_facing)
+                    radiance += weight
+                        * crate::fragment::shade(
+                            &shading,
+                            material,
+                            &surface,
+                            &hit_attributes,
+                            front_facing,
+                            &mut sites,
+                        );
+                    unsafe { *hits.get_unchecked_mut(slots + 1 + path as usize) = material_index };
+                    if depth + 1 < BOUNCES {
+                        // The next bounce leaves the side the ray arrived from.
+                        normal = if front_facing {
+                            hit_attributes.normal
+                        } else {
+                            -hit_attributes.normal
+                        };
+                        let position = hit_attributes.world_position;
+                        origin = position + normal * (1e-4 * (1.0 + position.abs().max_element()));
+                        weight *= surface.base_color * (1.0 - surface.metallic);
+                    }
                 }
-                None => (
-                    materials.len() as u32 - 1,
-                    FragmentAttributes::default(),
-                    false,
-                ),
-            };
-            let material = &materials[material_index as usize];
-            let surface = material.sample(texels, hit_attributes.uv, &mut sites);
-            if hit.is_some() {
-                radiance += crate::fragment::shade(
-                    &shading,
-                    material,
-                    &surface,
-                    &hit_attributes,
-                    front_facing,
-                    &mut sites,
-                );
-                unsafe { *hits.get_unchecked_mut(slots + 1 + ray as usize) = material_index };
-            }
-            if covered {
-                let traced = hit.as_ref().map_or(u32::MAX, |_| material_index);
-                store_trace(&mut trace, slots + 1 + ray as usize, sites, traced);
+                alive = hit.is_some();
+                if covered {
+                    let traced = hit.as_ref().map_or(u32::MAX, |_| material_index);
+                    store_trace(&mut trace, slots + 1 + path as usize, sites, traced);
+                }
             }
         }
         if covered {

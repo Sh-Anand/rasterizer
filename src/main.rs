@@ -9,7 +9,7 @@ use std::{
 
 use rasterizer::{
     config::Config,
-    cuda::{BOUNCE_RAYS, Renderer},
+    cuda::{BOUNCE_RAYS, BOUNCES, Renderer},
     geometry::{GltfAsset, prepare_scene},
     material::load_materials,
     trace::{self, TRACE},
@@ -183,11 +183,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let output_time = started.elapsed();
     let hits_path = output_path.with_extension("hits");
     if config.bounce {
-        // Render width, height and rays per pixel as u32, then per pixel the primary material
-        // and each ray's hit material.
+        // Render width, height, rays per pixel and bounces per ray as u32, then per pixel the
+        // primary material and each ray's hit materials by depth.
         let hits = renderer.bounce_materials()?;
-        let mut bytes = Vec::with_capacity(12 + 4 * hits.len());
-        for value in [render_width, render_height, BOUNCE_RAYS]
+        let mut bytes = Vec::with_capacity(16 + 4 * hits.len());
+        for value in [render_width, render_height, BOUNCE_RAYS, BOUNCES]
             .into_iter()
             .chain(hits)
         {
@@ -298,8 +298,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Wrote {}", output_path.display());
     if config.bounce {
         println!("Wrote {}", hits_path.display());
-        println!("Lighting: direct diffuse + specular, one diffuse bounce");
-        println!("Bounce rays per pixel: {BOUNCE_RAYS}");
+        println!("Lighting: direct diffuse + specular, diffuse bounces");
+        println!("Bounce rays per pixel: {BOUNCE_RAYS}, bounces per ray: {BOUNCES}");
     } else {
         println!("Lighting: direct diffuse + specular");
     }

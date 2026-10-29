@@ -9,7 +9,7 @@ sampling = "trilinear"
 # always at the nearest texel of the nearest decodable mip level, whatever the sampling.
 ntc = true
 # Ray-traced, cosine-weighted diffuse bounce (CUDA only); build with BOUNCE_RAYS=n for n rays
-# per pixel (default 4).
+# per pixel (default 4) and BOUNCES=n for n bounces per ray (default 1).
 bounce = true
 
 [output]
