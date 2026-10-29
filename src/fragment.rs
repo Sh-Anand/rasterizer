@@ -6,6 +6,7 @@ use crate::{
     lighting::Light,
     material::{Material, MaterialSample},
     rasterization::FragmentAttributes,
+    texture::Texel,
     trace::{Site, mark},
 };
 
@@ -16,9 +17,12 @@ pub struct Shading<'a> {
     /// The light's shadow-map depths.
     pub depths: &'a [f32],
     pub camera_position: Vec3,
+    /// Neural materials' weights and latents.
+    pub texels: &'a [Texel],
 }
 
-/// Lights a surface whose material the caller sampled once at its UV.
+/// Lights a surface whose material the caller sampled once at its UV, returning its light and
+/// the weight of light it scatters from a cosine-weighted direction (its diffuse albedo).
 // CUDA shading must inline this to address shadow depths as global memory.
 #[inline(always)]
 pub(crate) fn shade(
@@ -28,7 +32,33 @@ pub(crate) fn shade(
     attributes: &FragmentAttributes,
     front_facing: bool,
     sites: &mut u32,
-) -> Vec3 {
+) -> (Vec3, Vec3) {
+    if let Some(appearance) = &material.appearance {
+        // A neural material samples its own direction and decodes the BSDF there and toward
+        // the light; the light's test and shadow are as below.
+        mark(sites, Site::Light);
+        let light = &shading.light;
+        let position = attributes.world_position;
+        let normal = if front_facing {
+            attributes.normal
+        } else {
+            -attributes.normal
+        };
+        let view = (shading.camera_position - position).normalize_or_zero();
+        let point = appearance.sample(shading.texels, attributes, normal, view, sites);
+        let mut reflected = Vec3::ZERO;
+        if normal.dot(light.direction) > 0.0 {
+            if light.shadow.is_some() {
+                mark(sites, Site::Shadow);
+            }
+            let visibility = light.visibility(shading.depths, position);
+            if visibility > 0.0 {
+                reflected += appearance.eval(shading.texels, &point, light.direction, sites)
+                    * (light.irradiance * visibility);
+            }
+        }
+        return (reflected + surface.emission, point.weight);
+    }
     if material.has_normal_map() {
         mark(sites, Site::NormalMap);
     }
@@ -55,7 +85,10 @@ pub(crate) fn shade(
                 * cosine.max(0.0);
         }
     }
-    reflected + surface.emission
+    (
+        reflected + surface.emission,
+        surface.base_color * (1.0 - surface.metallic),
+    )
 }
 
 const DIELECTRIC_F0: f32 = 0.04;

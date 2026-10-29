@@ -18,6 +18,8 @@ on `trace::write`. Trace builds are for traces only; time normal builds.
 
 With `ntc = true`, a material named M decodes the RTXNTC texture set
 `assets/scenes/<scene>/ntc/M.ntc` instead of its textures; FlightHelmet ships NVIDIA's sets.
+With `neural_materials = true`, every material is instead a neural material (latents, sampler
+and decoder networks) with seeded stand-in weights, for traces: images are wrong.
 
 Settings are in `config.toml`; images are written to `output/`. The runner builds in
 release mode into `target/gpu`; it requires the one-time CUDA setup below and selects

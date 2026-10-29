@@ -33,7 +33,7 @@ SORT, SORT_BYTES = 90, 32 * 2 * 84  # per warp decode, sorting across an SM thro
 RECORD = np.dtype([('warp', '<u4'), ('pass', 'u1'), ('site', 'u1'), ('material', '<u4'), ('mask', '<u4')])
 
 data = open(sys.argv[1], 'rb').read()
-assert data[:4] == b'RTRC' and int.from_bytes(data[4:8], 'little') == 7, 'needs an RTRC version 7 trace'
+assert data[:4] == b'RTRC' and int.from_bytes(data[4:8], 'little') == 8, 'needs an RTRC version 8 trace'
 bounces, sites, ops = (int.from_bytes(data[i:i + 4], 'little') for i in (20, 24, 28))
 # Skip the op table: per site, a u16 count per op type for its work and for its critical path.
 records = np.frombuffer(data, RECORD, offset=32 + 4 * sites * ops)

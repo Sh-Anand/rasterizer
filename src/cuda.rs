@@ -1130,8 +1130,10 @@ mod kernels {
                 light,
                 depths,
                 camera_position: Vec3::from_array(camera),
+                texels,
             };
-            color = crate::fragment::shade(
+            let scattered;
+            (color, scattered) = crate::fragment::shade(
                 &shading,
                 material,
                 &surface,
@@ -1144,8 +1146,7 @@ mod kernels {
             if bounce {
                 // Each lane owns its pixel's albedo.
                 unsafe {
-                    *albedo.get_unchecked_mut(sample) =
-                        (surface.base_color * (1.0 - surface.metallic)).to_array();
+                    *albedo.get_unchecked_mut(sample) = scattered.to_array();
                 }
             }
         }
@@ -1295,16 +1296,17 @@ mod kernels {
                         light,
                         depths,
                         camera_position: origin,
+                        texels,
                     };
-                    radiance += weight
-                        * crate::fragment::shade(
-                            &shading,
-                            material,
-                            &surface,
-                            &hit_attributes,
-                            front_facing,
-                            &mut sites,
-                        );
+                    let (shaded, scattered) = crate::fragment::shade(
+                        &shading,
+                        material,
+                        &surface,
+                        &hit_attributes,
+                        front_facing,
+                        &mut sites,
+                    );
+                    radiance += weight * shaded;
                     unsafe { *hits.get_unchecked_mut(slots + 1 + path as usize) = material_index };
                     if depth + 1 < BOUNCES {
                         // The next bounce leaves the side the ray arrived from.
@@ -1315,7 +1317,7 @@ mod kernels {
                         };
                         let position = hit_attributes.world_position;
                         origin = position + normal * (1e-4 * (1.0 + position.abs().max_element()));
-                        weight *= surface.base_color * (1.0 - surface.metallic);
+                        weight *= scattered;
                     }
                 }
                 alive = hit.is_some();

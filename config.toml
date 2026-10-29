@@ -8,6 +8,9 @@ sampling = "trilinear"
 # Decode materials that have an RTXNTC texture set assets/scenes/<scene>/ntc/<material>.ntc,
 # always at the nearest texel of the nearest decodable mip level, whatever the sampling.
 ntc = true
+# Make every material a neural material (Zeltner et al. 2024's latents, sampler and decoder) with
+# seeded stand-in weights instead of trained ones, overriding ntc: images are wrong, work is not.
+neural_materials = false
 # Ray-traced, cosine-weighted diffuse bounce (CUDA only); build with BOUNCE_RAYS=n for n rays
 # per pixel (default 4) and BOUNCES=n for n bounces per ray (default 1).
 bounce = true

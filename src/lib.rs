@@ -1,3 +1,4 @@
+pub mod appearance;
 pub mod config;
 pub mod cuda;
 pub mod framebuffer;

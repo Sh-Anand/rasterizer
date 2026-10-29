@@ -18,6 +18,9 @@ pub struct Config {
     /// Decode the scene's `ntc/<material>.ntc` texture sets instead of their textures.
     #[serde(default)]
     pub ntc: bool,
+    /// Make every material a neural material with stand-in weights, overriding `ntc`.
+    #[serde(default)]
+    pub neural_materials: bool,
     #[serde(default)]
     pub bounce: bool,
     pub camera: CameraConfig,

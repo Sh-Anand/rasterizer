@@ -147,7 +147,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("Failed to create '{}': {error}", output_dir.display()))?;
     let started = Instant::now();
     let ntc = config.ntc.then(|| path.with_file_name("ntc"));
-    let (materials, texels) = load_materials(&asset, config.sampling, ntc.as_deref())?;
+    let (materials, texels) = load_materials(
+        &asset,
+        config.sampling,
+        ntc.as_deref(),
+        config.neural_materials,
+    )?;
     let material_time = started.elapsed();
     eprintln!("Preparing direct-light shadows...");
     let started = Instant::now();

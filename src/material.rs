@@ -3,6 +3,7 @@ use std::{collections::HashMap, io, path::Path};
 use glam::{Vec3, Vec4};
 
 use crate::{
+    appearance::{self, Appearance},
     geometry::GltfAsset,
     ntc::{self, NeuralSet},
     texture::{ColorSpace, Sampling, Texel, Texture, TextureLoader, UvSample},
@@ -11,14 +12,18 @@ use crate::{
 
 /// Returns the materials and the texel array their textures index. With `ntc`, a material
 /// named M (or numbered M, unnamed) with a texture set `ntc/M.ntc` decodes it instead of its base
-/// color, normal and metallic-roughness textures; materials sharing a file share one set.
+/// color, normal and metallic-roughness textures; materials sharing a file share one set. With
+/// `neural`, every material is a neural material with stand-in weights instead, and only
+/// emission stays conventional.
 pub fn load_materials(
     asset: &GltfAsset,
     sampling: Sampling,
     ntc: Option<&Path>,
+    neural: bool,
 ) -> io::Result<(Vec<Material>, Vec<Texel>)> {
     let mut textures = TextureLoader::new(&asset.images, sampling);
     let mut sets = HashMap::new();
+    let latents = neural.then(|| appearance::load_latents(&mut textures.texels));
     let materials = asset
         .document
         .materials()
@@ -27,7 +32,10 @@ pub fn load_materials(
             let name = material
                 .name()
                 .map_or_else(|| index.to_string(), str::to_owned);
+            let appearance = latents
+                .map(|latents| Appearance::load(index as u32, latents, &mut textures.texels));
             let neural = ntc
+                .filter(|_| appearance.is_none())
                 .map(|dir| dir.join(format!("{name}.ntc")))
                 .filter(|path| path.is_file())
                 .map(|path| -> io::Result<NeuralSet> {
@@ -40,7 +48,7 @@ pub fn load_materials(
                     Ok(set)
                 })
                 .transpose()?;
-            Material::new(material, &mut textures, neural)
+            Material::new(material, &mut textures, neural, appearance)
         })
         .collect::<io::Result<_>>()?;
     Ok((materials, textures.texels))
@@ -69,6 +77,8 @@ pub struct Material {
     pub emissive_texture: Option<Texture>,
     /// Replaces the base color, normal and metallic-roughness textures.
     pub neural: Option<NeuralSet>,
+    /// Replaces those textures and the BRDF.
+    pub appearance: Option<Appearance>,
     pub double_sided: bool,
 }
 
@@ -85,6 +95,7 @@ impl Default for Material {
             emissive_factor: Vec3::ZERO,
             emissive_texture: None,
             neural: None,
+            appearance: None,
             double_sided: false,
         }
     }
@@ -95,10 +106,11 @@ impl Material {
         material: gltf::Material<'_>,
         textures: &mut TextureLoader<'_>,
         neural: Option<NeuralSet>,
+        appearance: Option<Appearance>,
     ) -> io::Result<Self> {
         let pbr = material.pbr_metallic_roughness();
         let normal = material.normal_texture();
-        let conventional = neural.is_none();
+        let conventional = neural.is_none() && appearance.is_none();
         Ok(Self {
             base_color_factor: Vec4::from(pbr.base_color_factor()).truncate(),
             base_color_texture: load_texture(
@@ -131,6 +143,7 @@ impl Material {
                 ColorSpace::Srgb,
             )?,
             neural,
+            appearance,
             double_sided: material.double_sided(),
         })
     }
