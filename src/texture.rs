@@ -1,23 +1,22 @@
 use std::{collections::HashMap, io};
 
-use glam::{Vec2, Vec3, Vec4};
+use glam::{Vec2, Vec4};
 use gltf::{
     image::{Data, Format},
     texture::WrappingMode,
 };
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Sampling {
     /// Nearest texel of the nearest mip level.
     None,
     Bilinear,
-    #[default]
     Trilinear,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub struct UvSample {
     pub uv: Vec2,
     pub dx: Vec2,
@@ -147,7 +146,7 @@ impl MipLevel {
             ));
         }
         let decode = |value| match color_space {
-            ColorSpace::Srgb => decode_srgb(value),
+            ColorSpace::Srgb => decode_srgb(f32::from(value) / 255.0),
             ColorSpace::Linear => f32::from(value) / 255.0,
         };
         let pixels = image
@@ -309,23 +308,11 @@ fn wrap_index(index: i64, size: u32, mode: WrappingMode) -> usize {
     }) as usize
 }
 
-fn decode_srgb(value: u8) -> f32 {
-    let value = f32::from(value) / 255.0;
+#[inline(always)]
+pub(crate) fn decode_srgb(value: f32) -> f32 {
     if value <= 0.04045 {
         value / 12.92
     } else {
         ((value + 0.055) / 1.055).powf(2.4)
     }
-}
-
-pub fn encode_srgb(color: Vec3) -> [u8; 3] {
-    color.to_array().map(|value| {
-        let value = value.clamp(0.0, 1.0);
-        let encoded = if value <= 0.0031308 {
-            value * 12.92
-        } else {
-            1.055 * value.powf(1.0 / 2.4) - 0.055
-        };
-        (encoded * 255.0).round() as u8
-    })
 }

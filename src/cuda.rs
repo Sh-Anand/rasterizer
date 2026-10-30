@@ -10,9 +10,8 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 use crate::{
     bvh::{self, Node},
     config::{LightConfig, ShadowConfig},
-    fragment::Shading,
-    framebuffer::{Framebuffer, RenderOutput},
-    geometry::{ClipVertex, PreparedScene, PreparedVertex, VertexTransform, check_view_projection},
+    fragment::{Shading, uniform},
+    geometry::{ClipVertex, PreparedScene, PreparedVertex, VertexTransform},
     lighting::Light,
     material::Material,
     rasterization::{
@@ -41,8 +40,7 @@ pub const BOUNCES: u32 = match option_env!("BOUNCES") {
     },
 };
 
-/// Per-pixel slots in the hit and trace buffers: the primary surface, then each ray's hits by
-/// depth.
+/// Per-pixel slots in the trace buffer: the primary surface, then each ray's hits by depth.
 pub const SLOTS: usize = 1 + (BOUNCE_RAYS * BOUNCES) as usize;
 
 // Component planes are grouped in warps to keep indexed vertex reads nearby.
@@ -195,8 +193,6 @@ pub struct Stats {
     pub fragment_time: Duration,
     /// Diffuse bounce rays and hit shading.
     pub bounce_time: Duration,
-    pub vertices_shaded: usize,
-    pub fragments_shaded: usize,
 }
 
 /// Renders on one CUDA stream, keeping geometry, shading resources and intermediates resident.
@@ -215,9 +211,9 @@ pub struct Renderer {
     /// Bounce BVH over `triangles`; empty without the bounce.
     nodes: Buffer<Node>,
     order: Buffer<u32>,
-    error: Buffer<DeviceAtomicU64>,
     winners: Buffer<DeviceAtomicU64>,
-    counters: Buffer<DeviceAtomicU64>,
+    /// Large-triangle queue length and cursor.
+    queue: Buffer<DeviceAtomicU64>,
     large: Buffer<[u32; 2]>,
     fragments: Buffer<f32>,
     fragment_meta: Buffer<u32>,
@@ -229,8 +225,6 @@ pub struct Renderer {
     albedo: Buffer<[f32; 3]>,
     /// With `TRACE`, the region bits and material of each pixel's primary and bounce lanes.
     trace: Buffer<u32>,
-    /// Primary material, then each bounce ray's hit material, per pixel.
-    hits: Buffer<u32>,
 }
 
 impl Renderer {
@@ -250,9 +244,8 @@ impl Renderer {
             primitives: Buffer::new(c),
             nodes: Buffer::new(c),
             order: Buffer::new(c),
-            error: Buffer::new(c),
             winners: Buffer::new(c),
-            counters: Buffer::new(c),
+            queue: Buffer::new(c),
             large: Buffer::new(c),
             fragments: Buffer::new(c),
             fragment_meta: Buffer::new(c),
@@ -262,7 +255,6 @@ impl Renderer {
             colors: Buffer::new(c),
             albedo: Buffer::new(c),
             trace: Buffer::new(c),
-            hits: Buffer::new(c),
         })
     }
 
@@ -274,66 +266,38 @@ impl Renderer {
         self.stream.record_event(Some(0)).map_err(io::Error::other)
     }
 
-    /// Material indices must be checked against the material list. `world` holds every
-    /// vertex's world position when the bounce needs a BVH.
+    /// `world` holds every vertex's world position when the bounce needs a BVH.
     fn upload_geometry(
         &mut self,
         scene: &PreparedScene,
         materials: &[Material],
         world: Option<&[Vec3]>,
     ) -> io::Result<()> {
-        let count = scene
-            .primitives
-            .iter()
-            .try_fold(0u32, |count, primitive| {
-                count.checked_add(u32::try_from(primitive.vertices.len()).ok()?)
-            })
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Too many CUDA vertices"))?;
-        let triangle_count = scene
-            .primitives
-            .iter()
-            .try_fold(0u32, |count, primitive| {
-                count.checked_add(u32::try_from(primitive.triangles.len()).ok()?)
-            })
-            .filter(|&n| n <= u32::MAX / 7)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "Too many CUDA triangles")
-            })?;
-        let mut triangles = Vec::with_capacity(triangle_count as usize);
-        let mut vertices = vec![0.0; padded_count(count as usize) * PreparedVertex::COMPONENTS];
-        let mut indices = Vec::with_capacity(count as usize);
+        let count = scene.primitives.iter().map(|p| p.vertices.len()).sum();
+        let mut triangles = Vec::new();
+        let mut vertices = vec![0.0; padded_count(count) * PreparedVertex::COMPONENTS];
+        let mut indices = Vec::with_capacity(count);
         let mut primitives = Vec::with_capacity(scene.primitives.len());
         for (i, primitive) in scene.primitives.iter().enumerate() {
-            let i = u32::try_from(i).map_err(io::Error::other)?;
             let base = indices.len() as u32;
             for (index, vertex) in primitive.vertices.iter().enumerate() {
                 vertex.store_soa(base as usize + index, |offset, v| vertices[offset] = v);
             }
-            indices.extend(std::iter::repeat_n(i, primitive.vertices.len()));
-            let material_index = primitive.source.material_index;
+            indices.extend(std::iter::repeat_n(i as u32, primitive.vertices.len()));
             primitives.push(CudaPrimitive {
-                material_index: material_index.unwrap_or(materials.len()) as u32,
+                material_index: primitive.material_index.unwrap_or(materials.len()) as u32,
                 mirrored: primitive.mirrored,
-                double_sided: material_index.is_some_and(|i| materials[i].double_sided),
+                double_sided: primitive
+                    .material_index
+                    .is_some_and(|i| materials[i].double_sided),
             });
-            for triangle in &primitive.triangles {
-                if triangle
-                    .iter()
-                    .any(|&v| v as usize >= primitive.vertices.len())
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Triangle vertex index is outside the primitive",
-                    ));
-                }
-                triangles.push(CudaTriangle {
-                    vertices: triangle.map(|v| base + v),
-                    primitive: i,
-                });
-            }
+            triangles.extend(primitive.triangles.iter().map(|triangle| CudaTriangle {
+                vertices: triangle.map(|v| base + v),
+                primitive: i as u32,
+            }));
         }
         // Ranks index this stable material order, with the default material first.
-        triangles.sort_by_key(|t| scene.primitives[t.primitive as usize].source.material_index);
+        triangles.sort_by_key(|t| scene.primitives[t.primitive as usize].material_index);
         let corners: Vec<_> = world.map_or(Vec::new(), |world| {
             triangles
                 .iter()
@@ -358,7 +322,6 @@ impl Renderer {
         scene: &PreparedScene,
         view_projection: Mat4,
     ) -> io::Result<(CudaEvent, CudaEvent)> {
-        check_view_projection(view_projection)?;
         let count = self.primitive_indices.device.len();
         let transforms: Vec<_> = scene
             .primitives
@@ -369,9 +332,7 @@ impl Renderer {
         unsafe { self.transforms.upload(&transforms)? };
         self.output
             .resize(padded_count(count) * ClipVertex::COMPONENTS)?;
-        self.error.resize(1)?;
         let start = self.event()?;
-        self.error.fill(255, &self.stream)?;
         if count != 0 {
             unsafe {
                 self.module
@@ -381,7 +342,6 @@ impl Renderer {
                         &self.vertices.device,
                         &self.primitive_indices.device,
                         &self.transforms.device,
-                        &self.error.device,
                         &mut self.output.device,
                     )
                     .map_err(io::Error::other)?;
@@ -396,10 +356,9 @@ impl Renderer {
         height: u32,
         shadow: bool,
     ) -> io::Result<(CudaEvent, CudaEvent)> {
-        let count = sample_count(width, height)?;
+        let count = width * height;
         self.winners.resize(count as usize)?;
-        // Coverage, projected triangles, winners, queue length/cursor.
-        self.counters.resize(5)?;
+        self.queue.resize(2)?;
         self.large.resize(self.triangles.device.len())?;
         if !shadow {
             self.fragments
@@ -409,7 +368,7 @@ impl Renderer {
         }
         let start = self.event()?;
         self.winners.fill(255, &self.stream)?;
-        self.counters.fill(0, &self.stream)?;
+        self.queue.fill(0, &self.stream)?;
         if !self.triangles.device.is_empty() {
             unsafe {
                 self.module
@@ -423,8 +382,7 @@ impl Renderer {
                         height,
                         shadow,
                         &self.winners.device,
-                        &self.counters.device,
-                        &self.error.device,
+                        &self.queue.device,
                         &mut self.large.device,
                     )
                     .map_err(io::Error::other)?;
@@ -443,8 +401,7 @@ impl Renderer {
                         height,
                         shadow,
                         &self.winners.device,
-                        &self.counters.device,
-                        &self.error.device,
+                        &self.queue.device,
                         &self.large.device,
                     )
                     .map_err(io::Error::other)?;
@@ -462,8 +419,6 @@ impl Renderer {
                         width,
                         height,
                         &self.winners.device,
-                        &self.counters.device,
-                        &self.error.device,
                         &mut self.fragments.device,
                         &mut self.fragment_meta.device,
                     )
@@ -521,8 +476,6 @@ impl Renderer {
         height: u32,
         light: Light,
     ) -> io::Result<(CudaEvent, CudaEvent)> {
-        self.hits.resize(SLOTS * width as usize * height as usize)?;
-        self.hits.fill(255, &self.stream)?;
         let start = self.event()?;
         // Buffers live through the synchronous readback.
         unsafe {
@@ -545,7 +498,6 @@ impl Renderer {
                 &self.depths.device,
                 &self.albedo.device,
                 &mut self.colors.device,
-                &mut self.hits.device,
                 &mut self.trace.device,
             )
         }
@@ -568,24 +520,13 @@ impl Renderer {
             .context()
             .bind_to_thread()
             .map_err(io::Error::other)?;
-        u32::try_from(materials.len()).map_err(io::Error::other)?;
-        if scene.primitives.iter().any(|p| {
-            p.source
-                .material_index
-                .is_some_and(|i| i >= materials.len())
-        }) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Primitive material index is outside the material list",
-            ));
-        }
         let positions = if shadow.enabled || bounce {
-            scene.world_positions()?
+            scene.world_positions()
         } else {
             Vec::new()
         };
         self.upload_geometry(scene, materials, bounce.then_some(&positions[..]))?;
-        let light = Light::new(light, shadow, &positions)?;
+        let light = Light::new(light, shadow, &positions);
         // The default material follows the scene materials, so every index reads device memory.
         let table: Vec<_> = materials
             .iter()
@@ -605,19 +546,18 @@ impl Renderer {
             unsafe {
                 self.module.resolve_depth(
                     &self.stream,
-                    LaunchConfig::for_num_elems(sample_count(map.resolution, map.resolution)?),
+                    LaunchConfig::for_num_elems(map.resolution * map.resolution),
                     &self.winners.device,
                     &mut self.depths.device,
                 )
             }
             .map_err(io::Error::other)?;
-            self.check_error(scene)?;
         }
         self.light = Some(light);
         Ok(())
     }
 
-    /// Keep all intermediate camera and shadow data on the device.
+    /// Returns linear RGB per sample; all intermediate camera and shadow data stays on the device.
     pub fn render(
         &mut self,
         scene: &PreparedScene,
@@ -625,56 +565,33 @@ impl Renderer {
         width: u32,
         height: u32,
         camera_position: Vec3,
-    ) -> io::Result<RenderOutput> {
+    ) -> io::Result<Vec<Vec3>> {
         self.stream
             .context()
             .bind_to_thread()
             .map_err(io::Error::other)?;
-        let count = sample_count(width, height)?;
-        if !camera_position.is_finite() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Non-finite camera position",
-            ));
-        }
-        let light = self
-            .light
-            .ok_or_else(|| io::Error::other("Call prepare before render"))?;
-        self.stats = Stats::default();
+        let light = self.light.expect("prepare before render");
         let vertex_events = self.transform(scene, view_projection)?;
         let raster_events = self.rasterize(width, height, false)?;
-        self.colors.resize(count as usize)?;
+        self.colors.resize(width as usize * height as usize)?;
         let fragment_events = self.shade(width, height, light, camera_position)?;
         let bounce_events = if self.nodes.device.is_empty() {
             None
         } else {
             Some(self.bounce(width, height, light)?)
         };
-        let mut color = self
+        let color = self
             .colors
             .device
             .to_host_vec(&self.stream)
             .map_err(io::Error::other)?;
-        color.truncate(count as usize);
-        self.check_error(scene)?;
-        let counters = read_counters(&self.counters.device, &self.stream)?;
-        self.stats.vertex_time = elapsed(&vertex_events)?;
-        self.stats.rasterization_time = elapsed(&raster_events)?;
-        self.stats.fragment_time = elapsed(&fragment_events)?;
-        if let Some(events) = &bounce_events {
-            self.stats.bounce_time = elapsed(events)?;
-        }
-        self.stats.vertices_shaded = self.primitive_indices.device.len();
-        self.stats.fragments_shaded = counters[2] as usize;
-        Ok(RenderOutput {
-            framebuffer: Framebuffer {
-                color: color.into_iter().map(Vec3::from_array).collect(),
-                width,
-                height,
-            },
-            covered_fragments: counters[0],
-            screen_triangles: counters[1] as usize,
-        })
+        self.stats = Stats {
+            vertex_time: elapsed(&vertex_events)?,
+            rasterization_time: elapsed(&raster_events)?,
+            fragment_time: elapsed(&fragment_events)?,
+            bounce_time: bounce_events.as_ref().map_or(Ok(Duration::ZERO), elapsed)?,
+        };
+        Ok(color.into_iter().map(Vec3::from_array).collect())
     }
 
     /// With `TRACE`, the last render's region bits and material per pixel and pass, as
@@ -687,45 +604,6 @@ impl Renderer {
             .device
             .to_host_vec(&self.stream)
             .map_err(io::Error::other)
-    }
-
-    /// The last render's primary material, then each bounce ray's hit material, per pixel,
-    /// with `u32::MAX` for none; empty without the bounce.
-    pub fn bounce_materials(&self) -> io::Result<Vec<u32>> {
-        if self.nodes.device.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.hits
-            .device
-            .to_host_vec(&self.stream)
-            .map_err(io::Error::other)
-    }
-
-    fn check_error(&self, scene: &PreparedScene) -> io::Result<()> {
-        let error = read_counters(&self.error.device, &self.stream)?[0];
-        if error == u64::MAX {
-            return Ok(());
-        }
-        let primitive = scene
-            .primitives
-            .get((error >> 32) as usize)
-            .ok_or_else(|| io::Error::other("Invalid CUDA error primitive"))?;
-        let message = match error as u32 {
-            1 => "Non-finite vertex position",
-            2 => "Invalid vertex normal",
-            11 => crate::rasterization::RasterError::ClipOverflow.message(),
-            12 => crate::rasterization::RasterError::InvalidProjection.message(),
-            _ => crate::rasterization::RasterError::ProjectionOverflow.message(),
-        };
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Node {}, mesh {}, primitive {}: {message}",
-                primitive.source.node_index,
-                primitive.source.mesh_index,
-                primitive.source.primitive_index
-            ),
-        ))
     }
 }
 
@@ -759,62 +637,48 @@ mod kernels {
     const SMALL_SAMPLES: usize = 256;
     const MAX_PARTS: usize = 16;
 
-    // Call with every lane active, including lanes beyond the input length.
-    fn count_warp(counter: &DeviceAtomicU64, mut count: u32) {
-        // The pinned compiler misclassifies integer redux in test builds.
-        for offset in [16, 8, 4, 2, 1] {
-            count = count.wrapping_add(cuda_device::warp::shuffle_down(count, offset));
-        }
-        if cuda_device::warp::lane_id() == 0 && count != 0 {
-            counter.fetch_add(u64::from(count), AtomicOrdering::Relaxed);
-        }
-    }
-
     fn project_faces(
         vertices: &[f32],
         triangle: &CudaTriangle,
         width: u32,
         height: u32,
         mut emit: impl FnMut(&[ScreenVertex; 3], u32),
-    ) -> Result<u32, crate::rasterization::RasterError> {
+    ) {
         let codes = triangle.vertices.map(|i| {
             outcode(Vec4::from_array(std::array::from_fn(|c| {
                 vertices[soa_offset::<{ ClipVertex::COMPONENTS }>(i as usize, c)]
             })))
         });
         if codes[0] & codes[1] & codes[2] != 0 {
-            return Ok(0);
+            return;
         }
+        let project = |vertex| project_vertex(vertex, width as f32, height as f32);
         // Most triangles avoid the clipping scratch entirely.
         if codes[0] | codes[1] | codes[2] == 0 {
-            let [a, b, c] = triangle.vertices.map(|i| {
-                project_vertex(
-                    ClipVertex::load_soa(vertices, i as usize),
-                    width as f32,
-                    height as f32,
-                )
-            });
-            emit(&[a?, b?, c?], 0);
-            return Ok(1);
+            emit(
+                &triangle
+                    .vertices
+                    .map(|i| project(ClipVertex::load_soa(vertices, i as usize))),
+                0,
+            );
+            return;
         }
         let mut polygon = Polygon::default();
         clip_triangle(
             |i| ClipVertex::load_soa(vertices, i as usize),
             triangle.vertices,
-            codes,
             &mut polygon,
-        )?;
+        );
         if polygon.len < 3 {
-            return Ok(0);
+            return;
         }
-        let first = project_vertex(polygon.vertices[0].0, width as f32, height as f32)?;
-        let mut previous = project_vertex(polygon.vertices[1].0, width as f32, height as f32)?;
+        let first = project(polygon.vertices[0]);
+        let mut previous = project(polygon.vertices[1]);
         for fan in 0..polygon.len - 2 {
-            let current = project_vertex(polygon.vertices[fan + 2].0, width as f32, height as f32)?;
+            let current = project(polygon.vertices[fan + 2]);
             emit(&[first, previous, current], fan as u32);
             previous = current;
         }
-        Ok((polygon.len - 2) as u32)
     }
 
     fn raster_samples(
@@ -825,33 +689,30 @@ mod kernels {
         first: usize,
         stride: usize,
         winners: &[DeviceAtomicU64],
-    ) -> u32 {
+    ) {
         let (xs, ys) = setup.bounds(width, 0..height);
         let columns = (xs.end - xs.start) as usize;
         let count = columns * (ys.end - ys.start) as usize;
         let mut sample = first;
-        let mut covered = 0;
         while sample < count {
             let x = xs.start + (sample % columns) as u32;
             let y = ys.start + (sample / columns) as u32;
             sample += stride;
-            if let Some(barycentric) = setup.coverage(x, y) {
-                covered += 1;
-                if let Some(z) = setup.depth(barycentric) {
-                    let bits = if z == 0.0 { 0 } else { z.to_bits() };
-                    let ordered = if bits >> 31 == 0 {
-                        bits ^ 0x80000000
-                    } else {
-                        !bits
-                    };
-                    winners[y as usize * width as usize + x as usize].fetch_min(
-                        ((ordered as u64) << 32) | rank as u64,
-                        AtomicOrdering::Relaxed,
-                    );
-                }
+            if let Some(barycentric) = setup.coverage(x, y)
+                && let Some(z) = setup.depth(barycentric)
+            {
+                let bits = if z == 0.0 { 0 } else { z.to_bits() };
+                let ordered = if bits >> 31 == 0 {
+                    bits ^ 0x80000000
+                } else {
+                    !bits
+                };
+                winners[y as usize * width as usize + x as usize].fetch_min(
+                    ((ordered as u64) << 32) | rank as u64,
+                    AtomicOrdering::Relaxed,
+                );
             }
         }
-        covered
     }
 
     #[kernel]
@@ -863,19 +724,15 @@ mod kernels {
         height: u32,
         shadow: bool,
         winners: &[DeviceAtomicU64],
-        stats: &[DeviceAtomicU64],
-        error: &[DeviceAtomicU64],
+        queue: &[DeviceAtomicU64],
         mut large: DisjointSlice<[u32; 2]>,
     ) {
         let index = thread::index_1d().get();
-        let mut counts = [0u32; 2];
-        if let Some(triangle) = triangles.get(index)
-            && error[0].load(AtomicOrdering::Relaxed) == u64::MAX
-        {
+        if let Some(triangle) = triangles.get(index) {
             let primitive = primitives[triangle.primitive as usize];
             let rank = index as u32 * 7;
             let mut parts = 0;
-            match project_faces(vertices, triangle, width, height, |points, fan| {
+            project_faces(vertices, triangle, width, height, |points, fan| {
                 if let Some(setup) =
                     Triangle::new(points, primitive.mirrored, primitive.double_sided, shadow)
                 {
@@ -884,29 +741,17 @@ mod kernels {
                     if count > SMALL_SAMPLES {
                         parts = parts.max(count.div_ceil(2048).min(MAX_PARTS));
                     } else {
-                        counts[0] +=
-                            raster_samples(&setup, width, height, rank + fan, 0, 1, winners);
+                        raster_samples(&setup, width, height, rank + fan, 0, 1, winners);
                     }
                 }
-            }) {
-                Ok(triangles) => counts[1] = triangles,
-                Err(reason) => {
-                    error[0].fetch_min(
-                        ((triangle.primitive as u64) << 32) | (10 + reason as u64),
-                        AtomicOrdering::Relaxed,
-                    );
-                }
-            }
+            });
             if parts != 0 {
-                let slot = stats[3].fetch_add(1, AtomicOrdering::Relaxed) as usize;
+                let slot = queue[0].fetch_add(1, AtomicOrdering::Relaxed) as usize;
                 // Each input triangle reserves at most one unique slot.
                 unsafe {
                     *large.get_unchecked_mut(slot) = [index as u32, parts as u32];
                 }
             }
-        }
-        for i in 0..2 {
-            count_warp(&stats[i], counts[i]);
         }
     }
 
@@ -919,8 +764,7 @@ mod kernels {
         height: u32,
         shadow: bool,
         winners: &[DeviceAtomicU64],
-        stats: &[DeviceAtomicU64],
-        error: &[DeviceAtomicU64],
+        queue: &[DeviceAtomicU64],
         large: &[[u32; 2]],
     ) {
         static mut JOB: SharedArray<u64, 1> = SharedArray::UNINIT;
@@ -930,13 +774,13 @@ mod kernels {
         loop {
             if lane == 0 {
                 unsafe {
-                    JOB[0] = stats[4].fetch_add(1, AtomicOrdering::Relaxed);
+                    JOB[0] = queue[1].fetch_add(1, AtomicOrdering::Relaxed);
                     LENGTH[0] = 0;
                 }
             }
             thread::sync_threads();
             let job = unsafe { JOB[0] as usize };
-            if job >= stats[3].load(AtomicOrdering::Relaxed) as usize * MAX_PARTS {
+            if job >= queue[0].load(AtomicOrdering::Relaxed) as usize * MAX_PARTS {
                 return;
             }
             let [index, parts] = large[job / MAX_PARTS];
@@ -946,33 +790,21 @@ mod kernels {
             }
             let index = index as usize;
             let triangle = triangles[index];
-            if lane == 0 && error[0].load(AtomicOrdering::Relaxed) == u64::MAX {
+            if lane == 0 {
                 let primitive = primitives[triangle.primitive as usize];
-                if let Err(reason) =
-                    project_faces(vertices, &triangle, width, height, |points, fan| unsafe {
-                        SETUPS[fan as usize] = Triangle::new(
-                            points,
-                            primitive.mirrored,
-                            primitive.double_sided,
-                            shadow,
-                        );
-                        LENGTH[0] = fan + 1;
-                    })
-                {
-                    error[0].fetch_min(
-                        ((triangle.primitive as u64) << 32) | (10 + reason as u64),
-                        AtomicOrdering::Relaxed,
-                    );
-                }
+                project_faces(vertices, &triangle, width, height, |points, fan| unsafe {
+                    SETUPS[fan as usize] =
+                        Triangle::new(points, primitive.mirrored, primitive.double_sided, shadow);
+                    LENGTH[0] = fan + 1;
+                });
             }
             thread::sync_threads();
-            let mut covered = 0;
             for fan in 0..unsafe { LENGTH[0] } {
                 if let Some(setup) = unsafe { SETUPS[fan as usize] } {
                     let (xs, ys) = setup.bounds(width, 0..height);
                     let count = (xs.end - xs.start) as usize * (ys.end - ys.start) as usize;
                     if count > SMALL_SAMPLES {
-                        covered += raster_samples(
+                        raster_samples(
                             &setup,
                             width,
                             height,
@@ -984,7 +816,6 @@ mod kernels {
                     }
                 }
             }
-            count_warp(&stats[0], covered);
             thread::sync_threads();
         }
     }
@@ -997,60 +828,49 @@ mod kernels {
         width: u32,
         height: u32,
         winners: &[DeviceAtomicU64],
-        stats: &[DeviceAtomicU64],
-        error: &[DeviceAtomicU64],
         mut fragments: DisjointSlice<f32>,
         mut fragment_meta: DisjointSlice<u32>,
     ) {
         let index = thread::index_1d().get();
-        let mut shaded = 0;
         if let Some(winner) = winners.get(index) {
             let key = winner.load(AtomicOrdering::Relaxed);
-            if key != u64::MAX && error[0].load(AtomicOrdering::Relaxed) == u64::MAX {
+            if key != u64::MAX {
                 let rank = key as u32;
                 let triangle = triangles[(rank / 7) as usize];
                 let primitive = primitives[triangle.primitive as usize];
-                if let Err(reason) =
-                    project_faces(vertices, &triangle, width, height, |points, fan| {
-                        if fan != rank % 7 {
-                            return;
-                        }
-                        let Some(setup) = Triangle::new(points, primitive.mirrored, true, false)
-                        else {
-                            return;
-                        };
-                        let Some(barycentric) = setup.coverage(
-                            (index % width as usize) as u32,
-                            (index / width as usize) as u32,
-                        ) else {
-                            return;
-                        };
-                        let attributes =
-                            interpolate_attributes(points, barycentric, &UvGradients::new(points));
-                        // Each lane owns its index in every component plane.
-                        attributes.store_soa(index, |offset, v| unsafe {
-                            *fragments.get_unchecked_mut(offset) = v;
-                        });
-                        unsafe {
-                            *fragment_meta.get_unchecked_mut(soa_offset::<2>(index, 0)) =
-                                primitive.material_index;
-                            *fragment_meta.get_unchecked_mut(soa_offset::<2>(index, 1)) =
-                                u32::from(setup.front_facing);
-                        }
-                        shaded = 1;
-                    })
-                {
-                    error[0].fetch_min(
-                        ((triangle.primitive as u64) << 32) | (10 + reason as u64),
-                        AtomicOrdering::Relaxed,
-                    );
+                let mut shaded = false;
+                project_faces(vertices, &triangle, width, height, |points, fan| {
+                    if fan != rank % 7 {
+                        return;
+                    }
+                    let Some(setup) = Triangle::new(points, primitive.mirrored, true, false) else {
+                        return;
+                    };
+                    let Some(barycentric) = setup.coverage(
+                        (index % width as usize) as u32,
+                        (index / width as usize) as u32,
+                    ) else {
+                        return;
+                    };
+                    let attributes =
+                        interpolate_attributes(points, barycentric, &UvGradients::new(points));
+                    // Each lane owns its index in every component plane.
+                    attributes.store_soa(index, |offset, v| unsafe {
+                        *fragments.get_unchecked_mut(offset) = v;
+                    });
+                    unsafe {
+                        *fragment_meta.get_unchecked_mut(soa_offset::<2>(index, 0)) =
+                            primitive.material_index;
+                        *fragment_meta.get_unchecked_mut(soa_offset::<2>(index, 1)) =
+                            u32::from(setup.front_facing);
+                    }
+                    shaded = true;
+                });
+                if !shaded {
+                    winner.store(u64::MAX, AtomicOrdering::Relaxed);
                 }
             }
-            if key != u64::MAX && shaded == 0 {
-                winner.store(u64::MAX, AtomicOrdering::Relaxed);
-            }
         }
-        count_warp(&stats[2], shaded);
     }
 
     #[kernel]
@@ -1058,25 +878,37 @@ mod kernels {
         vertices: &[f32],
         primitive_indices: &[u32],
         transforms: &[VertexTransform],
-        error: &[DeviceAtomicU64],
         mut output: DisjointSlice<f32>,
     ) {
         let offset = thread::index_1d().get();
         if let Some(&primitive) = primitive_indices.get(offset) {
-            let transform = &transforms[primitive as usize];
-            let vertex = transform.apply(&PreparedVertex::load_soa(vertices, offset));
-            let invalid = vertex.invalid(transform.flat_shaded);
-            if invalid != 0 {
-                error[0].fetch_min(
-                    ((primitive as u64) << 32) | u64::from(invalid),
-                    AtomicOrdering::Relaxed,
-                );
-            }
+            let vertex =
+                transforms[primitive as usize].apply(&PreparedVertex::load_soa(vertices, offset));
             // Each lane owns its index in every component plane.
             vertex.store_soa(offset, |index, v| unsafe {
                 *output.get_unchecked_mut(index) = v;
             });
         }
+    }
+
+    /// A thread's lane in its warp's 8x4 pixel block (one 8-pixel row per group of 8 lanes), its
+    /// pixel's column, row and sample index, and whether a fragment covers it.
+    #[inline(always)]
+    fn block_pixel(
+        index: usize,
+        width: u32,
+        height: u32,
+        winners: &[DeviceAtomicU64],
+    ) -> (usize, usize, usize, usize, bool) {
+        let (block, lane) = (index / 32, index % 32);
+        let blocks = (width as usize).div_ceil(8);
+        let x = block % blocks * 8 + lane % 8;
+        let y = block / blocks * 4 + lane / 8;
+        let sample = y * width as usize + x;
+        let covered = x < width as usize
+            && y < height as usize
+            && winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX;
+        (lane, x, y, sample, covered)
     }
 
     #[kernel]
@@ -1097,19 +929,10 @@ mod kernels {
         mut albedo: DisjointSlice<[f32; 3]>,
         mut trace: DisjointSlice<u32>,
     ) {
-        // Each warp shades an 8x4 pixel block, one 8-pixel row per group of 8 lanes.
-        let index = thread::index_1d().get();
-        let (block, lane) = (index / 32, index % 32);
-        let blocks = (width as usize).div_ceil(8);
-        let row_start = block % blocks * 8;
-        let x = row_start + lane % 8;
-        let y = block / blocks * 4 + lane / 8;
-        let sample = y * width as usize + x;
         // Empty samples take the default material: every lane samples one, since the
         // tensor-core decoder runs warp-wide.
-        let covered = x < width as usize
-            && y < height as usize
-            && winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX;
+        let (lane, x, y, sample, covered) =
+            block_pixel(thread::index_1d().get(), width, height, winners);
         let material_index = if covered {
             fragment_meta[soa_offset::<2>(sample, 0)]
         } else {
@@ -1151,7 +974,7 @@ mod kernels {
             }
         }
         // Transpose each row's colors so its lanes store contiguous floats in host RGB order.
-        let valid = (width as usize - row_start).min(8) * 3;
+        let valid = (width as usize - (x - lane % 8)).min(8) * 3;
         for plane in 0..3 {
             let slot = plane * 8 + lane % 8;
             let source = (lane / 8 * 8 + slot / 3) as u32;
@@ -1200,25 +1023,15 @@ mod kernels {
         depths: &[f32],
         albedo: &[[f32; 3]],
         mut colors: DisjointSlice<[f32; 3]>,
-        mut hits: DisjointSlice<u32>,
         mut trace: DisjointSlice<u32>,
     ) {
-        let index = thread::index_1d().get();
-        let (block, lane) = (index / 32, index % 32);
-        let blocks = (width as usize).div_ceil(8);
-        let x = block % blocks * 8 + lane % 8;
-        let y = block / blocks * 4 + lane / 8;
-        let sample = y * width as usize + x;
         // Lanes of empty samples and misses stay to sample the default material, since the
         // tensor-core decoder runs warp-wide.
-        let covered = x < width as usize
-            && y < height as usize
-            && winners[sample].load(AtomicOrdering::Relaxed) != u64::MAX;
-        // Each lane owns its pixel's color and hit slots; unwritten slots stay u32::MAX.
+        let (_, _, _, sample, covered) =
+            block_pixel(thread::index_1d().get(), width, height, winners);
+        // Each lane owns its pixel's color and trace slots.
         let slots = sample * SLOTS;
         let (origin, normal) = if covered {
-            let primary = fragment_meta[soa_offset::<2>(sample, 0)];
-            unsafe { *hits.get_unchecked_mut(slots) = primary };
             let attributes = FragmentAttributes::load_soa(fragments, sample);
             let normal = if fragment_meta[soa_offset::<2>(sample, 1)] != 0 {
                 attributes.normal
@@ -1307,7 +1120,6 @@ mod kernels {
                         &mut sites,
                     );
                     radiance += weight * shaded;
-                    unsafe { *hits.get_unchecked_mut(slots + 1 + path as usize) = material_index };
                     if depth + 1 < BOUNCES {
                         // The next bounce leaves the side the ray arrived from.
                         normal = if front_facing {
@@ -1353,15 +1165,9 @@ mod kernels {
     }
 
     fn cosine_direction(normal: Vec3, seed: u32) -> Vec3 {
-        // PCG hash.
-        let hash = |x: u32| {
-            let x = x.wrapping_mul(747796405).wrapping_add(2891336453);
-            let word = ((x >> ((x >> 28) + 4)) ^ x).wrapping_mul(277803737);
-            (word >> 22) ^ word
-        };
-        let first = hash(seed);
-        let u = (first >> 8) as f32 / 16777216.0;
-        let v = (hash(first) >> 8) as f32 / 16777216.0;
+        let mut state = seed;
+        let u = uniform(&mut state);
+        let v = uniform(&mut state);
         let (sin, cos) = (std::f32::consts::TAU * v).sin_cos();
         let radius = u.sqrt();
         // Branchless orthonormal basis (Duff et al. 2017).
@@ -1392,34 +1198,4 @@ fn tile_launch(width: u32, height: u32) -> LaunchConfig {
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     }
-}
-
-fn sample_count(width: u32, height: u32) -> io::Result<u32> {
-    width
-        .checked_mul(height)
-        .filter(|&n| n != 0)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "CUDA framebuffer dimensions must be nonzero and fit u32",
-            )
-        })
-}
-
-fn read_counters(
-    buffer: &DeviceBuffer<DeviceAtomicU64>,
-    stream: &CudaStream,
-) -> io::Result<Vec<u64>> {
-    let mut values = vec![0u64; buffer.len()];
-    unsafe {
-        memory::memcpy_dtoh_async(
-            values.as_mut_ptr(),
-            buffer.cu_deviceptr(),
-            values.len() * size_of::<u64>(),
-            stream.cu_stream(),
-        )
-    }
-    .map_err(io::Error::other)?;
-    stream.synchronize().map_err(io::Error::other)?;
-    Ok(values)
 }

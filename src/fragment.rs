@@ -4,7 +4,7 @@ use glam::Vec3;
 
 use crate::{
     lighting::Light,
-    material::{Material, MaterialSample},
+    material::{Material, MaterialSample, Network},
     rasterization::FragmentAttributes,
     texture::Texel,
     trace::{Site, mark},
@@ -22,7 +22,8 @@ pub struct Shading<'a> {
 }
 
 /// Lights a surface whose material the caller sampled once at its UV, returning its light and
-/// the weight of light it scatters from a cosine-weighted direction (its diffuse albedo).
+/// the weight of light it scatters from a cosine-weighted direction (its diffuse albedo). A
+/// neural material samples its own direction and decodes the BSDF there and toward the light.
 // CUDA shading must inline this to address shadow depths as global memory.
 #[inline(always)]
 pub(crate) fn shade(
@@ -33,29 +34,19 @@ pub(crate) fn shade(
     front_facing: bool,
     sites: &mut u32,
 ) -> (Vec3, Vec3) {
-    if let Some(appearance) = &material.appearance {
-        // A neural material samples its own direction and decodes the BSDF there and toward
-        // the light; the light's test and shadow are as below.
-        mark(sites, Site::Light);
-        let light = &shading.light;
-        let position = attributes.world_position;
+    let position = attributes.world_position;
+    let view = (shading.camera_position - position).normalize_or_zero();
+    let light = shading.light.direction;
+    if let Network::Material(appearance) = &material.network {
         let normal = if front_facing {
             attributes.normal
         } else {
             -attributes.normal
         };
-        let view = (shading.camera_position - position).normalize_or_zero();
         let point = appearance.sample(shading.texels, attributes, normal, view, sites);
         let mut reflected = Vec3::ZERO;
-        if normal.dot(light.direction) > 0.0 {
-            if light.shadow.is_some() {
-                mark(sites, Site::Shadow);
-            }
-            let visibility = light.visibility(shading.depths, position);
-            if visibility > 0.0 {
-                reflected += appearance.eval(shading.texels, &point, light.direction, sites)
-                    * (light.irradiance * visibility);
-            }
+        if let Some((_, irradiance)) = lit(shading, position, normal, sites) {
+            reflected += appearance.eval(shading.texels, &point, light, sites) * irradiance;
         }
         return (reflected + surface.emission, point.weight);
     }
@@ -63,32 +54,49 @@ pub(crate) fn shade(
         mark(sites, Site::NormalMap);
     }
     mark(sites, Site::Surface);
-    mark(sites, Site::Light);
-    let position = attributes.world_position;
     let normal = material.shading_normal(surface.normal, attributes.normal, attributes.tangent);
     let normal = if front_facing { normal } else { -normal };
-    let view = (shading.camera_position - position).normalize_or_zero();
     let brdf = Brdf::new(surface.base_color, surface.metallic, surface.roughness);
-    let light = &shading.light;
-    let cosine = normal.dot(light.direction);
     let mut reflected = Vec3::ZERO;
-    // At or below the horizon the BRDF is zero, so the light needs no shadow test.
-    if cosine > 0.0 {
-        if light.shadow.is_some() {
-            mark(sites, Site::Shadow);
-        }
-        let visibility = light.visibility(shading.depths, position);
-        if visibility > 0.0 {
-            mark(sites, Site::Brdf);
-            reflected += brdf.evaluate(normal, view, light.direction)
-                * (light.irradiance * visibility)
-                * cosine.max(0.0);
-        }
+    if let Some((cosine, irradiance)) = lit(shading, position, normal, sites) {
+        mark(sites, Site::Brdf);
+        reflected += brdf.evaluate(normal, view, light) * irradiance * cosine.max(0.0);
     }
     (
         reflected + surface.emission,
         surface.base_color * (1.0 - surface.metallic),
     )
+}
+
+/// The light's cosine and shadowed irradiance at a surface it lights.
+#[inline(always)]
+fn lit(
+    shading: &Shading<'_>,
+    position: Vec3,
+    normal: Vec3,
+    sites: &mut u32,
+) -> Option<(f32, Vec3)> {
+    mark(sites, Site::Light);
+    let light = &shading.light;
+    let cosine = normal.dot(light.direction);
+    // At or below the horizon the BRDF is zero, so the light needs no shadow test.
+    if !(cosine > 0.0) {
+        return None;
+    }
+    if light.shadow.is_some() {
+        mark(sites, Site::Shadow);
+    }
+    let visibility = light.visibility(shading.depths, position);
+    (visibility > 0.0).then_some((cosine, light.irradiance * visibility))
+}
+
+/// A PCG hash step as a uniform float in [0, 1).
+#[inline(always)]
+pub(crate) fn uniform(state: &mut u32) -> f32 {
+    let x = state.wrapping_mul(747796405).wrapping_add(2891336453);
+    let word = ((x >> ((x >> 28) + 4)) ^ x).wrapping_mul(277803737);
+    *state = (word >> 22) ^ word;
+    (*state >> 8) as f32 / 16777216.0
 }
 
 const DIELECTRIC_F0: f32 = 0.04;

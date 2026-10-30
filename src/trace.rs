@@ -12,6 +12,7 @@ pub const TRACE: bool = option_env!("TRACE").is_some();
 /// Straight-line shader regions in program order; a lane marks the bit of each region it
 /// executes, and trace records store their numbers.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub(crate) enum Site {
     Input,
     BaseColor,
@@ -37,30 +38,7 @@ pub(crate) enum Site {
     Hit,
 }
 
-const SITES: [Site; 22] = [
-    Site::Input,
-    Site::BaseColor,
-    Site::BaseColorLevel,
-    Site::Normal,
-    Site::NormalLevel,
-    Site::MetallicRoughness,
-    Site::MetallicRoughnessLevel,
-    Site::Emissive,
-    Site::EmissiveLevel,
-    Site::Latents,
-    Site::Network,
-    Site::Appearance,
-    Site::AppearanceNetwork,
-    Site::AppearanceLight,
-    Site::NormalMap,
-    Site::Surface,
-    Site::Light,
-    Site::Shadow,
-    Site::Brdf,
-    Site::Output,
-    Site::Traverse,
-    Site::Hit,
-];
+const SITES: u8 = Site::Hit as u8 + 1;
 
 #[inline(always)]
 pub(crate) fn mark(sites: &mut u32, site: Site) {
@@ -177,20 +155,6 @@ fn ops(site: Site, sampling: Sampling, bounce: bool) -> ([u16; OPS], [u16; OPS])
     }
 }
 
-fn is_texture(site: Site) -> bool {
-    matches!(
-        site,
-        Site::BaseColor
-            | Site::BaseColorLevel
-            | Site::Normal
-            | Site::NormalLevel
-            | Site::MetallicRoughness
-            | Site::MetallicRoughnessLevel
-            | Site::Emissive
-            | Site::EmissiveLevel
-    )
-}
-
 /// Writes one record per 32-lane warp (an 8x4 pixel block), pass, region and active mask;
 /// texture regions also split by material, since each material reads its own textures, and
 /// network regions by texture set, or by material for neural materials, since each network runs
@@ -215,7 +179,12 @@ pub fn write(
     bounce: bool,
 ) -> io::Result<()> {
     // Network records key each texture set by the first material decoding it.
-    let first = |m: &Material| materials.iter().position(|n| n.neural == m.neural).unwrap();
+    let first = |m: &Material| {
+        materials
+            .iter()
+            .position(|n| n.network == m.network)
+            .unwrap()
+    };
     let sets: Vec<_> = materials.iter().map(first).collect();
     let (width, height) = (width as usize, height as usize);
     let passes = if bounce { SLOTS } else { 1 };
@@ -224,10 +193,14 @@ pub fn write(
     for value in [*b"RTRC", 8u32.to_le_bytes()] {
         bytes.extend(value);
     }
-    for value in [width, height, passes, bounces, SITES.len(), OPS] {
+    for value in [width, height, passes, bounces, SITES as usize, OPS] {
         bytes.extend((value as u32).to_le_bytes());
     }
-    for site in SITES {
+    // Sites number 0..SITES in declaration order.
+    let sites: Vec<Site> = (0..SITES)
+        .map(|bit| unsafe { std::mem::transmute(bit) })
+        .collect();
+    for &site in &sites {
         let (work, path) = ops(site, sampling, bounce);
         for count in work.into_iter().chain(path) {
             bytes.extend(count.to_le_bytes());
@@ -243,13 +216,18 @@ pub fn write(
                     continue;
                 }
                 let slot = 2 * ((y * width + x) * SLOTS + pass);
-                let (sites, material) = (lanes[slot], lanes[slot + 1]);
-                for (bit, &site) in SITES.iter().enumerate() {
-                    if sites >> bit & 1 != 0 {
+                let (bits, material) = (lanes[slot], lanes[slot + 1]);
+                for (bit, &site) in sites.iter().enumerate() {
+                    if bits >> bit & 1 != 0 {
                         let material = match site {
                             Site::Network => sets[material as usize] as u32,
                             Site::AppearanceNetwork | Site::AppearanceLight => material,
-                            _ if is_texture(site) => material,
+                            // Texture regions.
+                            _ if (Site::BaseColor as usize..=Site::EmissiveLevel as usize)
+                                .contains(&bit) =>
+                            {
+                                material
+                            }
                             _ => u32::MAX,
                         };
                         *masks.entry((bit, material)).or_default() |= 1 << lane;

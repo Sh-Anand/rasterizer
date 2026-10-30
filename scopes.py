@@ -1,131 +1,182 @@
-"""Replays a trace's neural decodes on the scopes of a hypothetical tensor core; see notes.md.
+"""Whole-shader cycles per warp of a trace on the scopes of a hypothetical tensor core; see notes.md.
 
-    python3 scopes.py output/<scene>.trace
+    python3 scopes.py output/<scene>.trace ...
+
+Every traced region counts. A per-lane region costs a warp's max(issue, SFU pipe, critical path)
+once per pass, whatever its lanes' materials; a network region costs what each scheme spends on
+the warp's texture sets or materials. Traversal is untraced, so excluded. An NTC trace reports
+its decode ('ntc'); a neural-material trace reports its networks ('neural') and neural materials
+whose latents are NTC-compressed, each hit also decoding its material's NTC set ('both'). Prints
+each bounce depth, then the frame: every pass, summed per warp.
 """
-import sys
+import functools, pathlib, sys
 
 import numpy as np
 
-# The decoder's (inputs, outputs) per layer, and `Site::Network` in trace.rs.
-LAYERS = [(48, 64), (64, 48), (48, 32), (32, 16)]
-NETWORK = 10
-# Outputs M, samples N and inputs K per operation.
-SCOPES = {'quad 8x4x8': (8, 4, 8), 'warp 16x16x16': (16, 16, 16), 'SM 128x256x16': (128, 256, 16)}
-# Windows in warps: one SM holds 48 resident warps on Ada.
-WINDOWS = {'CTA of 8 warps': 8, 'SM of 48 warps': 48, 'frame': 1 << 30}
-# Time model: SM-cycles as the busiest SM resource, with latency hidden (weights double-buffered,
-# pipelines by other warps). Ada's rates, measured: 4 warp instructions issue per cycle, the tensor
-# pipe does 1024 int8 MACs, dp4a's fmaheavy pipe 2 cycles per warp instruction per sub-partition,
-# and the L1/shared data path moves 128 bytes, a whole shuffle. Instructions per unit are from the
-# Ada decoders' SASS. Weights reach tensor operands without instructions; scales and biases are
-# 128-bit loads.
-COMMON = 1390  # latent sampling and output finishing per warp decode, every scheme
-TILE, IMMA = 531, 38  # per occupied 16-row tile
-PASS = 15 + 20  # per warp pass: set loop, and each lane's scales and biases
-TRANSPOSE, SHUFFLES = 201, 84  # fragment transposes per warp decode
-# Per quad round: each thread activates its whole sample, two tiles' worth, with quad MMAs, the
-# set loop and every scale and bias.
-ROUND = 2 * (TILE - IMMA) + sum(o // 8 * (i // 8) for i, o in LAYERS) + 15 + 80
-DP4A, HEAVY = 4111, 2184  # dp4a network per warp decode, of which on fmaheavy
-SET = 8192 + 160 * 8  # weight, scale and bias bytes per set fetch
-REGROUP, REGROUP_SHUFFLES = 30, 21  # in-warp lane permutation; the quad scope then moves inputs and outputs
-SORT, SORT_BYTES = 90, 32 * 2 * 84  # per warp decode, sorting across an SM through shared memory
 RECORD = np.dtype([('warp', '<u4'), ('pass', 'u1'), ('site', 'u1'), ('material', '<u4'), ('mask', '<u4')])
+# `Site` numbers in trace.rs.
+LATENTS, NETWORK, APPEARANCE, NN, LIGHT = 9, 10, 11, 12, 13
+# Latency of a load, store, FP32, SFU and integer op; SFU cycles per warp instruction; and the one
+# in-warp shuffle that regroups lanes before a network.
+LAT = np.array([30, 1, 4, 15, 4]); SFU_PIPE = 8; SHUFFLE = 100
+# Cycles per m16n8k32 int8 or m16n8k16 FP16 warp MMA; a quad MMA (8 quads of 8x4x8) takes the same
+# per MAC. A warp's MMAs serialize.
+MMA = 20
+# The neural material's FP16 multiplies, (outputs, inputs) per op column after the int8 ones.
+SHAPES = [(12, 8), (16, 11), (16, 16), (9, 16), (16, 24), (3, 16)]
 
-data = open(sys.argv[1], 'rb').read()
-assert data[:4] == b'RTRC' and int.from_bytes(data[4:8], 'little') == 8, 'needs an RTRC version 8 trace'
-bounces, sites, ops = (int.from_bytes(data[i:i + 4], 'little') for i in (20, 24, 28))
-# Skip the op table: per site, a u16 count per op type for its work and for its critical path.
-records = np.frombuffer(data, RECORD, offset=32 + 4 * sites * ops)
-records = records[records['site'] == NETWORK]
-useful = sum(i * o for i, o in LAYERS)
 
-def counts(r, window):
-    """Samples per set within each window of `window` warps, ordered by window, and their windows."""
-    key = (r['pass'].astype(np.int64) << 56) | (r['warp'].astype(np.int64) // window << 24) | r['material']
-    keys, inverse = np.unique(key, return_inverse=True)
-    return np.bincount(inverse, np.bitwise_count(r['mask'])).astype(np.int64), keys >> 24
+def load(path):
+    d = open(path, 'rb').read()
+    version = int.from_bytes(d[4:8], 'little')
+    assert d[:4] == b'RTRC' and version in (7, 8), 'needs an RTRC version 7 or 8 trace'
+    w, h, passes, bounces, sites, ops = (int(x) for x in np.frombuffer(d, '<u4', 6, 8))
+    # Per site, a u16 count per op type for its work and for its critical path.
+    table = np.frombuffer(d, '<u2', 2 * sites * ops, 32).reshape(sites, 2, ops).astype(int)
+    return version, bounces, table, np.frombuffer(d, RECORD, offset=32 + 4 * sites * ops)
 
-def tiles(r, n, window):
-    """n-sample tiles covering records r: each set's samples within windows of `window` warps,
-    or for window 0 its occupied groups of n lanes."""
-    if window == 0:
-        return sum(int(np.count_nonzero(r['mask'] >> (n * g) & (1 << n) - 1)) for g in range(32 // n))
-    return int(-(-counts(r, window)[0] // n).sum())
 
-def packed(groups, sizes, unit):
-    """Batches and (batch, item) pairs when each group's items, in order, fill batches of `unit`."""
-    end = np.cumsum(sizes)
-    first = np.r_[0, np.flatnonzero(np.diff(groups)) + 1]
-    end -= np.repeat(np.r_[0, end[first[1:] - 1]], np.diff(np.r_[first, len(sizes)]))
-    last = np.r_[first[1:], len(sizes)] - 1
-    return int(-(-end[last] // unit).sum()), int(((end - 1) // unit - (end - sizes) // unit + 1).sum())
+def lane_cost(table, s):
+    work, path = table[s]
+    return max(work[:5].sum(), work[3] * SFU_PIPE, (path[:5] * LAT).sum())
 
-def lane_groups(r):
-    """Quad rounds and (round, set) pairs when each quad serves its own sets, one per round."""
-    _, warp = np.unique((r['pass'].astype(np.int64) << 32) | r['warp'], return_inverse=True)
-    record, quad = np.nonzero((r['mask'][:, None] >> 4 * np.arange(8) & 15) != 0)
-    group = warp[record] * 8 + quad
-    order = np.lexsort((r['material'][record], group))
-    group, record = group[order], record[order]
-    first = np.r_[0, np.flatnonzero(np.diff(group)) + 1]
-    rank = np.arange(len(group)) - np.repeat(first, np.diff(np.r_[first, len(group)]))
-    rounds = np.zeros(warp.max() + 1, np.int64)
-    np.maximum.at(rounds, group // 8, rank + 1)
-    pairs = np.unique((group // 8 << 37) | (rank.astype(np.int64) << 32) | r['material'][record])
-    return int(rounds.sum()), len(pairs)
 
-# Pass 1 + r b + d is bounce ray r at depth d.
-depth = (records['pass'].astype(int) - 1) % max(bounces, 1)
-for name, kind in [('primary', records['pass'] == 0)] + [
-        (f'bounce {d + 1}', (records['pass'] > 0) & (depth == d)) for d in range(bounces)]:
-    r = records[kind]
-    if not len(r):
-        continue
-    samples = int(np.bitwise_count(r['mask']).sum())
-    key = (r['pass'].astype(np.int64) << 32) | r['warp']
-    decodes = len(np.unique(key))
-    print(f'{name}: {samples} decoding samples in {decodes} warp decodes, '
-          f'{len(r) / decodes:.2f} sets per warp decode; SIMT lanes busy {100 * samples / (32 * decodes):.1f}%')
-    print(f"  {'scope':15s} {'tiling':16s} {'operations':>12s} {'useful MACs':>12s} {'weight B/sample':>16s}  data movement")
-    for scope, (m, n, k) in SCOPES.items():
-        per_tile = sum(-(-o // m) * -(-i // k) for i, o in LAYERS)
-        for tiling, window in [('lane groups', 0), ('warp regrouped', 1)] + list(WINDOWS.items()):
-            if n > 32 and window in (0, 1):
-                continue
-            t = tiles(r, n, window)
-            moved = 'memory' if window > 1 else 'none' if n == 4 and window == 0 else 'shuffles'
-            print(f'  {scope:15s} {tiling:16s} {t * per_tile:12d} {100 * samples * useful / (t * per_tile * m * n * k):11.1f}%'
-                  f' {t * useful / samples:16.0f}  {moved}')
-    # Instructions, pipe cycles per sub-partition, and data-path bytes for each scheme.
-    d, sets = decodes, len(r)
-    warp_counts, warps = counts(r, 1)
-    sm_counts, windows = counts(r, 48)
-    halves = tiles(r, 16, 0)
-    regrouped = tiles(r, 16, 1)
-    _, sorted_passes = packed(windows, sm_counts, 32)
-    _, sorted_tiles = packed(windows, sm_counts, 16)
-    rounds, round_sets = lane_groups(r)
-    regrouped_rounds, regrouped_sets = packed(warps, -(-warp_counts // 4), 8)
-    sorted_rounds, sorted_sets = packed(windows, -(-sm_counts // 4), 8)
-    tile, quad_round = 16 * useful / 256, 32 * useful / 256
-    schemes = {
-        'SIMT dp4a': (d * (COMMON + DP4A), 2 * d * HEAVY, sets * SET),
-        'warp as Ada runs it': (d * (COMMON + TRANSPOSE) + sets * PASS + halves * TILE, halves * tile,
-                                d * SHUFFLES * 128 + sets * SET),
-        'warp regrouped': (d * (COMMON + TRANSPOSE + REGROUP) + sets * PASS + regrouped * TILE, regrouped * tile,
-                           d * SHUFFLES * 128 + sets * SET),
-        'warp SM-sorted': (d * (COMMON + SORT) + sorted_passes * PASS + sorted_tiles * TILE, sorted_tiles * tile,
-                           d * SORT_BYTES + sorted_passes * SET),
-        'quad lane groups': (d * COMMON + rounds * ROUND, rounds * quad_round, round_sets * SET),
-        'quad regrouped': (d * (COMMON + REGROUP + REGROUP_SHUFFLES) + regrouped_rounds * ROUND,
-                           regrouped_rounds * quad_round, d * REGROUP_SHUFFLES * 128 + regrouped_sets * SET),
-        'quad SM-sorted': (d * (COMMON + SORT) + sorted_rounds * ROUND, sorted_rounds * quad_round,
-                           d * SORT_BYTES + sorted_sets * SET),
-    }
-    print(f"  {'time model, SM-cycles per warp decode':38s} {'issue':>6s} {'pipe':>6s} {'data':>6s} {'time':>6s} {'vs dp4a':>8s}")
-    base = max(v / s for v, s in zip(schemes['SIMT dp4a'], (4, 4, 128)))
-    for scheme, demand in schemes.items():
-        cycles = [v / s / d for v, s in zip(demand, (4, 4, 128))]
-        print(f'  {scheme:38s} ' + ' '.join(f'{c:6.0f}' for c in cycles) +
-              f' {max(cycles):6.0f} {base / d / max(cycles):7.2f}x')
+def ntc_model(table):
+    """Warp, quad and SIMT cycles of the NTC network, 48-64-48-32-16 in int8."""
+    work, path = table[NETWORK]
+    issue, p = work[:5].sum(), (path[:5] * LAT).sum()
+    # t occupied 16-row tiles: 16 samples' activations spread over the warp, and per tile 38 MMA
+    # instructions with 32 m16n8k32s' MACs.
+    warp = lambda t: max(issue * t / 2 + 38 * t, 32 * MMA * t, p + 32 * MMA * t)
+    # A round: every lane activates its own sample, and 128 quad MMAs.
+    quad = lambda r: r * max(issue + 128, 64 * MMA, p + 64 * MMA)
+    # Each lane alone, among k sets: 2048 dp4a at 2 cycles and 512 16-byte weight loads, which with
+    # the scale and bias loads fill 4 L1 cycles each, or one per set beyond 4. Path: a layer's
+    # weight load, then its dot products' 48 dependent dp4a.
+    simt = lambda k: max(issue + 2048 + 512, 2 * 2048, (512 + work[0]) * max(4, k),
+                         4 * LAT[0] + 48 * LAT[4] + p)
+    return warp, quad, simt
+
+
+def nn_model(table, site):
+    """Warp, quad and SIMT cycles of a neural material's networks in a region, in FP16."""
+    work, path = table[site]
+    counts, chain = work[9:15], path[9:15]
+    mmas = lambda ops, k: sum(c * -(-o // 8) * -(-i // k) for c, (o, i) in zip(ops, SHAPES))
+    # m16n8k16 per 16-row tile, quad MMAs per round.
+    wi, wc, qi, qc = mmas(counts, 16), mmas(chain, 16), mmas(counts, 8), mmas(chain, 8)
+    issue, p = work[:5].sum(), (path[:5] * LAT).sum()
+    # SIMT: HFMA2 does 2 MACs and a 16-byte load carries 8 weights; each layer on the path loads
+    # its weights, then chains K / 2 HFMA2.
+    macs = sum(c * o * i for c, (o, i) in zip(counts, SHAPES))
+    loads = -(-macs // 8)
+    sp = p + sum(c * (LAT[0] + -(-i // 2) * LAT[4]) for c, (o, i) in zip(chain, SHAPES))
+    warp = lambda t: max(issue * t / 2 + wi * t, wi * MMA * t, p + wc * MMA + (t - 1) * wi * MMA)
+    quad = lambda r: r * max(issue + qi, qi * MMA, p + qc * MMA)
+    simt = lambda k: max(issue + macs // 2 + loads, (loads + work[0]) * max(4, k), sp)
+    return warp, quad, simt
+
+
+def fits(cs, rounds, descending, pick):
+    """Whether lane counts cs fit 8 quads of 4 lanes, each quad serving at most `rounds` sets."""
+    free, items = [4] * 8, [0] * 8
+    for c in sorted(cs, reverse=descending):
+        while c:
+            cand = [i for i in range(8) if items[i] < rounds and free[i] > 0]
+            if not cand:
+                return False
+            i = pick(cand, free, c)
+            take = min(c, free[i])
+            free[i] -= take
+            items[i] += 1
+            c -= take
+    return True
+
+
+PICKS = [
+    lambda cand, f, c: min(cand, key=lambda i: (f[i] < c, f[i] if f[i] >= c else -f[i])),  # best fit, else largest
+    lambda cand, f, c: max(cand, key=lambda i: f[i]),  # worst fit
+    lambda cand, f, c: min(cand, key=lambda i: (f[i] != c, f[i] < min(c, 4), -f[i])),  # exact, else whole quad, else largest
+]
+
+
+@functools.lru_cache(None)
+def shuffled_rounds(cs):
+    """Fewest quad rounds the greedy packings reach after one in-warp shuffle."""
+    lo = max(1, -(-sum(-(-c // 4) for c in cs) // 8))
+    return next(r for r in range(lo, 9) if any(fits(cs, r, o, p) for o in (True, False) for p in PICKS))
+
+
+def schemes(masks, model):
+    """[warp, warp+shuffle, quad, quad+shuffle, SIMT] network cycles for one region's masks."""
+    warp, quad, simt = model
+    cs = tuple(sorted(bin(x).count('1') for x in masks))
+    return np.array([sum(warp((x & 0xFFFF != 0) + (x >> 16 != 0)) for x in masks),
+                     sum(warp(-(-c // 16)) for c in cs),
+                     quad(max(sum(1 for x in masks if x >> 4 * q & 15) for q in range(8))),
+                     quad(shuffled_rounds(cs)), simt(len(masks))], float)
+
+
+def analyze(bounces, table, rec, mode):
+    """Per depth (0 primary), per warp pass: common and hot (latents and networks only) per-lane
+    cycles, then each scheme's network cycles."""
+    nets = {NETWORK: ntc_model(table)} if mode == 'ntc' else {NN: nn_model(table, NN), LIGHT: nn_model(table, LIGHT)}
+    ntc = ntc_model(table)
+    lane = {s: lane_cost(table, s) for s in range(len(table))}
+    rec = rec[np.lexsort((rec['site'], rec['warp'], rec['pass']))]
+    key = (rec['pass'].astype(np.int64) << 32) | rec['warp']
+    first = np.r_[0, np.flatnonzero(np.diff(key)) + 1, len(rec)]
+    out = {}
+    for a, b in zip(first[:-1], first[1:]):
+        g = rec[a:b]
+        # Pass 1 + r b + d is bounce ray r at depth d.
+        p = int(g['pass'][0]); depth = 0 if p == 0 else 1 + (p - 1) % bounces
+        sites = set(int(s) for s in g['site'])
+        common = sum(lane[s] for s in sites if s not in nets)
+        hot = lane[LATENTS] * (LATENTS in sites) if mode == 'ntc' else lane[APPEARANCE] * (APPEARANCE in sites)
+        net = np.zeros(5)
+        for s, model in nets.items():
+            m = [int(x) for x in g['mask'][g['site'] == s]]
+            if m:
+                net += schemes(m, model)
+        if mode == 'both':
+            m = [int(x) for x in g['mask'][g['site'] == NN]]
+            if m:
+                net += schemes(m, ntc)
+                common += lane[LATENTS]; hot += lane[LATENTS]
+        if net.any():
+            net[[1, 3]] += SHUFFLE
+        out.setdefault(depth, []).append((common, hot, *net))
+    return out
+
+
+def report(label, x):
+    """Per-warp choices: the warp scope shuffles only when it helps; today's hybrid may also run
+    SIMT; the flexible core picks the warp or quad scope, either shuffled or not."""
+    def costs(base, net):
+        warp = base + np.minimum(net[:, 0], net[:, 1])
+        quad = base + np.minimum(net[:, 2], net[:, 3])
+        simt = base + net[:, 4]
+        hybrid = np.minimum(warp, simt)
+        flexible = np.minimum(warp, quad)
+        return [v.mean() for v in (warp, quad, simt, hybrid, flexible)]
+    net = x[:, 2:]
+    W, H = costs(x[:, 0], net), costs(x[:, 1], net)
+    f = lambda v: f'{v:4.2f}x'
+    print(f'  {label:8s} ' + ' '.join(f'{v:6.0f}' for v in W) +
+          f' | quad/warp {f(W[0] / W[1])}  quad/SIMT {f(W[2] / W[1])}  flexible/hybrid {f(W[3] / W[4])}'
+          f'   [region only: {f(H[0] / H[1])} {f(H[2] / H[1])} {f(H[3] / H[4])}]')
+
+
+for path in sys.argv[1:]:
+    version, bounces, table, records = load(path)
+    # Version 7 traces predate neural materials and number later sites differently.
+    neural = version == 8 and (records['site'] == NN).any()
+    for mode in ('neural', 'both') if neural else ('ntc',):
+        out = analyze(bounces, table, records, mode)
+        print(f'{pathlib.Path(path).stem} [{mode}]  whole-shader cycles/warp: warp quad SIMT hybrid flexible')
+        for depth in sorted(out):
+            report('primary' if depth == 0 else f'bounce {depth}', np.array(out[depth], float))
+        # Every pass, per warp position: passes summed, warps averaged.
+        rows = sum(map(len, out.values()))
+        report('frame', np.concatenate([np.array(v, float) for v in out.values()]) * (rows / len(out[0])))

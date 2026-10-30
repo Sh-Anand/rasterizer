@@ -2,7 +2,7 @@ use crate::{geometry::ClipVertex, texture::UvSample};
 use glam::{Vec2, Vec3, Vec4};
 use std::ops::Range;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub struct FragmentAttributes {
     pub world_position: Vec3,
     pub uv: UvSample,
@@ -52,7 +52,7 @@ fn intersection(outside: ClipVertex, inside: ClipVertex, axis: usize, sign: f32)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct ScreenVertex {
     pub position: Vec3,
     pub world_position: Vec3,
@@ -97,33 +97,22 @@ impl UvGradients {
     }
 }
 
-pub(crate) fn project_vertex(
-    vertex: ClipVertex,
-    width: f32,
-    height: f32,
-) -> Result<ScreenVertex, RasterError> {
+/// Non-finite results fail `Triangle::new`.
+pub(crate) fn project_vertex(vertex: ClipVertex, width: f32, height: f32) -> ScreenVertex {
     let clip = vertex.position;
-    if !clip.is_finite() || clip.w <= 0.0 {
-        return Err(RasterError::InvalidProjection);
-    }
-    let inv_w = clip.w.recip();
     let ndc = clip.truncate() / clip.w;
-    let position = Vec3::new(
-        (ndc.x + 1.0) * 0.5 * width,
-        (1.0 - ndc.y) * 0.5 * height,
-        (ndc.z + 1.0) * 0.5,
-    );
-    if !position.is_finite() || !inv_w.is_finite() {
-        return Err(RasterError::ProjectionOverflow);
-    }
-    Ok(ScreenVertex {
-        position,
+    ScreenVertex {
+        position: Vec3::new(
+            (ndc.x + 1.0) * 0.5 * width,
+            (1.0 - ndc.y) * 0.5 * height,
+            (ndc.z + 1.0) * 0.5,
+        ),
         world_position: vertex.world_position,
-        inv_w,
+        inv_w: clip.w.recip(),
         uv: vertex.uv,
         normal: vertex.normal,
         tangent: vertex.tangent,
-    })
+    }
 }
 
 pub(crate) fn interpolate_attributes(
@@ -193,81 +182,72 @@ pub(crate) fn sample_range(min: f32, max: f32, bounds: Range<u32>) -> Range<u32>
 
 #[derive(Default)]
 pub(crate) struct Polygon {
-    pub vertices: [(ClipVertex, Option<u32>); 9],
+    pub vertices: [ClipVertex; 9],
     pub len: usize,
 }
 
 impl Polygon {
-    fn push(&mut self, vertex: (ClipVertex, Option<u32>)) -> Result<(), RasterError> {
-        let slot = self
-            .vertices
-            .get_mut(self.len)
-            .ok_or(RasterError::ClipOverflow)?;
-        *slot = vertex;
-        self.len += 1;
-        Ok(())
+    /// Six planes clip a triangle to at most nine vertices; any more are dropped.
+    fn push(&mut self, vertex: ClipVertex) {
+        if let Some(slot) = self.vertices.get_mut(self.len) {
+            *slot = vertex;
+            self.len += 1;
+        }
     }
 }
 
+/// Clips a triangle that crosses a clipping plane.
 pub(crate) fn clip_triangle(
     vertex: impl Fn(u32) -> ClipVertex,
     triangle: [u32; 3],
-    codes: [u8; 3],
     polygon: &mut Polygon,
-) -> Result<(), RasterError> {
+) {
     polygon.len = 0;
-    if codes[0] & codes[1] & codes[2] != 0 {
-        return Ok(());
-    }
     for i in triangle {
-        polygon.push((vertex(i), Some(i)))?;
+        polygon.push(vertex(i));
     }
-    if codes[0] | codes[1] | codes[2] != 0 {
-        let mut scratch = Polygon::default();
-        let (mut current, mut next) = (&mut *polygon, &mut scratch);
-        let mut flipped = false;
-        for (axis, sign) in PLANES {
-            if current.len == 0 {
-                break;
-            }
-            next.len = 0;
-            let mut previous = current.vertices[current.len - 1].0;
-            let mut previous_distance = distance(previous.position, axis, sign);
-            for &(vertex, source) in &current.vertices[..current.len] {
-                let current_distance = distance(vertex.position, axis, sign);
-                if (previous_distance < 0.0) != (current_distance < 0.0) {
-                    let vertex = if previous_distance < 0.0 {
-                        intersection(previous, vertex, axis, sign)
-                    } else {
-                        intersection(vertex, previous, axis, sign)
-                    };
-                    next.push((vertex, None))?;
-                }
-                if current_distance >= 0.0 {
-                    next.push((vertex, source))?;
-                }
-                previous = vertex;
-                previous_distance = current_distance;
-            }
-            std::mem::swap(&mut current, &mut next);
-            flipped = !flipped;
+    let mut scratch = Polygon::default();
+    let (mut current, mut next) = (&mut *polygon, &mut scratch);
+    let mut flipped = false;
+    for (axis, sign) in PLANES {
+        if current.len == 0 {
+            break;
         }
-        if flipped {
-            for i in 0..current.len {
-                next.vertices[i] = current.vertices[i];
+        next.len = 0;
+        let mut previous = current.vertices[current.len - 1];
+        let mut previous_distance = distance(previous.position, axis, sign);
+        for &vertex in &current.vertices[..current.len] {
+            let current_distance = distance(vertex.position, axis, sign);
+            if (previous_distance < 0.0) != (current_distance < 0.0) {
+                next.push(if previous_distance < 0.0 {
+                    intersection(previous, vertex, axis, sign)
+                } else {
+                    intersection(vertex, previous, axis, sign)
+                });
             }
-            next.len = current.len;
+            if current_distance >= 0.0 {
+                next.push(vertex);
+            }
+            previous = vertex;
+            previous_distance = current_distance;
         }
+        std::mem::swap(&mut current, &mut next);
+        flipped = !flipped;
+    }
+    if flipped {
+        for i in 0..current.len {
+            next.vertices[i] = current.vertices[i];
+        }
+        next.len = current.len;
     }
     let mut len = 0;
     for i in 0..polygon.len {
-        if polygon.vertices[i].0.position.w > 0.0 {
+        if polygon.vertices[i].position.w > 0.0 {
             polygon.vertices[len] = polygon.vertices[i];
             len += 1;
         }
     }
     polygon.len = len;
-    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -370,23 +350,5 @@ impl Triangle {
             .sum::<f32>()
             + self.bias;
         depth.is_finite().then_some(depth)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum RasterError {
-    ClipOverflow = 1,
-    InvalidProjection,
-    ProjectionOverflow,
-}
-impl RasterError {
-    pub(crate) fn message(self) -> &'static str {
-        match self {
-            Self::ClipOverflow => "Too many clipped vertices",
-            Self::InvalidProjection => {
-                "Perspective division requires a finite vertex with positive w"
-            }
-            Self::ProjectionOverflow => "Perspective division produced a non-finite result",
-        }
     }
 }

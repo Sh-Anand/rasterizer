@@ -5,12 +5,11 @@ supersampling = 1
 # Material texture filtering: "none" (nearest texel of the nearest mip level), "bilinear"
 # (level zero), or "trilinear".
 sampling = "trilinear"
-# Decode materials that have an RTXNTC texture set assets/scenes/<scene>/ntc/<material>.ntc,
-# always at the nearest texel of the nearest decodable mip level, whatever the sampling.
-ntc = true
-# Make every material a neural material (Zeltner et al. 2024's latents, sampler and decoder) with
-# seeded stand-in weights instead of trained ones, overriding ntc: images are wrong, work is not.
-neural_materials = false
+# "none"; "textures": materials with an RTXNTC texture set assets/scenes/<scene>/ntc/<material>.ntc
+# decode it, always at the nearest texel of the nearest decodable mip level, whatever the
+# sampling; or "materials": every material is a neural material (Zeltner et al. 2024's latents,
+# sampler and decoder) with seeded stand-in weights, so images are wrong but work is not.
+neural = "textures"
 # Ray-traced, cosine-weighted diffuse bounce (CUDA only); build with BOUNCE_RAYS=n for n rays
 # per pixel (default 4) and BOUNCES=n for n bounces per ray (default 1).
 bounce = true

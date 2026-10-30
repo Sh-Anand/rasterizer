@@ -2,7 +2,6 @@ use std::{collections::HashMap, io, path::Path};
 
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 
-#[derive(Debug)]
 pub struct GltfAsset {
     pub document: gltf::Document,
     pub buffers: Vec<gltf::buffer::Data>,
@@ -21,24 +20,20 @@ impl GltfAsset {
 }
 
 /// Object-space geometry with normal/tangent seams split.
-#[derive(Debug, Clone)]
 pub struct PreparedScene {
     pub primitives: Vec<PreparedPrimitive>,
 }
 
-#[derive(Debug, Clone)]
 pub struct PreparedPrimitive {
-    pub source: PrimitiveSource,
+    pub material_index: Option<usize>,
     pub model: Mat4,
     pub normal_matrix: Mat3,
     pub mirrored: bool,
-    /// Allow zero normals on degenerate triangles.
-    pub flat_shaded: bool,
     pub vertices: Vec<PreparedVertex>,
     pub triangles: Vec<[u32; 3]>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct PreparedVertex {
     /// Object-space position.
     pub position: Vec3,
@@ -49,15 +44,7 @@ pub struct PreparedVertex {
     pub tangent: Vec4,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PrimitiveSource {
-    pub node_index: usize,
-    pub mesh_index: usize,
-    pub primitive_index: usize,
-    pub material_index: Option<usize>,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub struct ClipVertex {
     pub position: Vec4,
     pub world_position: Vec3,
@@ -75,7 +62,6 @@ pub(crate) struct VertexTransform {
     normal: Mat3,
     linear: Mat3,
     sign: f32,
-    pub(crate) flat_shaded: bool,
 }
 
 impl VertexTransform {
@@ -87,7 +73,6 @@ impl VertexTransform {
             normal: primitive.normal_matrix,
             linear,
             sign: linear.determinant().signum(),
-            flat_shaded: primitive.flat_shaded,
         }
     }
 
@@ -104,28 +89,6 @@ impl VertexTransform {
             tangent,
         }
     }
-}
-
-impl ClipVertex {
-    pub(crate) fn invalid(&self, flat_shaded: bool) -> u32 {
-        if !self.position.is_finite() || !self.world_position.is_finite() {
-            1
-        } else if !flat_shaded && self.normal == Vec3::ZERO {
-            2
-        } else {
-            0
-        }
-    }
-}
-
-pub(crate) fn check_view_projection(view_projection: Mat4) -> io::Result<()> {
-    if !view_projection.is_finite() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Non-finite projection matrix",
-        ));
-    }
-    Ok(())
 }
 
 pub fn prepare_scene(asset: &GltfAsset) -> io::Result<PreparedScene> {
@@ -149,58 +112,31 @@ fn prepare_node(
 ) -> io::Result<()> {
     let model = parent_model * Mat4::from_cols_array_2d(&node.transform().matrix());
     if let Some(mesh) = node.mesh() {
-        if node.skin().is_some() {
-            return Err(io::Error::new(
+        let unsupported = |message: &str| {
+            io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Skinned meshes are not supported yet",
-            ));
+                format!("Node {}, mesh {}: {message}", node.index(), mesh.index()),
+            )
+        };
+        if node.skin().is_some() {
+            return Err(unsupported("skinned meshes are not supported"));
         }
         let linear = Mat3::from_mat4(model);
-        let determinant = linear.determinant();
-        if !linear.is_finite() || determinant == 0.0 || !determinant.is_finite() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Node {}: Normal transform requires an invertible model matrix",
-                    node.index()
-                ),
-            ));
-        }
         let normal_matrix = linear.inverse().transpose();
-        if !normal_matrix.is_finite() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Node {}: Non-finite normal matrix", node.index()),
-            ));
-        }
         for primitive in mesh.primitives() {
-            let invalid = |message: &str| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Node {}, mesh {}, primitive {}: {message}",
-                        node.index(),
-                        mesh.index(),
-                        primitive.index()
-                    ),
-                )
-            };
             if primitive.mode() != gltf::mesh::Mode::Triangles {
-                return Err(invalid("Only triangle-list primitives are supported"));
+                return Err(unsupported("only triangle-list primitives are supported"));
             }
             if primitive.morph_targets().len() != 0 {
-                return Err(invalid("Morph targets are not supported yet"));
+                return Err(unsupported("morph targets are not supported"));
             }
             let reader = primitive
                 .reader(|buffer| asset.buffers.get(buffer.index()).map(|data| &data.0[..]));
             let positions: Vec<Vec3> = reader
                 .read_positions()
-                .ok_or_else(|| invalid("Cannot read vertex positions"))?
+                .ok_or_else(|| unsupported("cannot read vertex positions"))?
                 .map(Vec3::from_array)
                 .collect();
-            if positions.iter().any(|position| !position.is_finite()) {
-                return Err(invalid("Non-finite vertex position"));
-            }
             let material = primitive.material();
             let pbr = material.pbr_metallic_roughness();
             let mut tex_coords = [
@@ -214,80 +150,43 @@ fn prepare_node(
             .flatten();
             let tex_coord = tex_coords.next();
             if tex_coords.any(|set| Some(set) != tex_coord) {
-                return Err(invalid(
-                    "Material textures must share one texture coordinate set",
+                return Err(unsupported(
+                    "material textures must share one texture coordinate set",
                 ));
             }
-            let uvs: Vec<Vec2> = match (reader.read_tex_coords(tex_coord.unwrap_or(0)), tex_coord) {
-                (Some(uvs), _) => uvs.into_f32().map(Vec2::from).collect(),
-                (None, Some(set)) => {
-                    return Err(invalid(&format!(
-                        "Missing TEXCOORD_{set} for material texture"
-                    )));
-                }
-                (None, None) => vec![Vec2::ZERO; positions.len()],
+            let uvs: Vec<Vec2> = reader.read_tex_coords(tex_coord.unwrap_or(0)).map_or_else(
+                || vec![Vec2::ZERO; positions.len()],
+                |uvs| uvs.into_f32().map(Vec2::from).collect(),
+            );
+            let indices: Vec<u32> = match reader.read_indices() {
+                Some(indices) => indices.into_u32().collect(),
+                None => (0..positions.len() as u32).collect(),
             };
-            if uvs.len() != positions.len() || uvs.iter().any(|uv| !uv.is_finite()) {
-                return Err(invalid("Invalid texture coordinates"));
-            }
-            let indices: Vec<u32> = if primitive.indices().is_some() {
-                reader
-                    .read_indices()
-                    .ok_or_else(|| invalid("Cannot read triangle indices"))?
-                    .into_u32()
-                    .collect()
-            } else {
-                let count =
-                    u32::try_from(positions.len()).map_err(|_| invalid("Too many vertices"))?;
-                (0..count).collect()
-            };
-            if !indices.len().is_multiple_of(3) {
-                return Err(invalid("Triangle index count must be a multiple of three"));
-            }
-            if indices
-                .iter()
-                .any(|&index| index as usize >= positions.len())
-            {
-                return Err(invalid("Triangle index is outside the vertex buffer"));
-            }
             let mut triangles: Vec<[u32; 3]> = indices
                 .chunks_exact(3)
                 .map(|triangle| [triangle[0], triangle[1], triangle[2]])
                 .collect();
+            // Unusable supplied normals fall back to flat normals.
             let normals: Option<Vec<Vec3>> = reader
                 .read_normals()
-                .map(|normals| normals.map(Vec3::from_array).collect());
-            if normals
-                .as_ref()
-                .is_some_and(|normals| normals.len() != positions.len())
-            {
-                return Err(invalid("Normal count does not match vertex count"));
-            }
-            if normals.is_none() && primitive.get(&gltf::Semantic::Normals).is_some() {
-                return Err(invalid("Cannot read vertex normals"));
-            }
-            // Unusable supplied normals fall back to flat normals.
-            let normals = normals.filter(|normals| {
+                .map(|normals| normals.map(Vec3::from_array).collect())
+                .filter(|normals: &Vec<Vec3>| {
+                    normals
+                        .iter()
+                        .all(|normal| normal.try_normalize().is_some())
+                });
+            let tangents = material.normal_texture().map(|_| {
                 normals
-                    .iter()
-                    .all(|normal| normal.try_normalize().is_some())
-            });
-            let tangents = if material.normal_texture().is_some() {
-                let supplied = normals.as_ref().and_then(|_| reader.read_tangents());
-                Some(if let Some(supplied) = supplied {
-                    let tangents: Vec<Vec4> = supplied.map(Vec4::from_array).collect();
-                    supplied_tangents(&tangents, positions.len(), &triangles).unwrap_or_else(|| {
+                    .as_ref()
+                    .and_then(|_| reader.read_tangents())
+                    .and_then(|supplied| {
+                        let tangents: Vec<Vec4> = supplied.map(Vec4::from_array).collect();
+                        supplied_tangents(&tangents, positions.len(), &triangles)
+                    })
+                    .unwrap_or_else(|| {
                         generate_tangents(&positions, normals.as_deref(), &uvs, &triangles)
                     })
-                } else {
-                    if normals.is_some() && primitive.get(&gltf::Semantic::Tangents).is_some() {
-                        return Err(invalid("Cannot read vertex tangents"));
-                    }
-                    generate_tangents(&positions, normals.as_deref(), &uvs, &triangles)
-                })
-            } else {
-                None
-            };
+            });
             let mut vertices: Vec<PreparedVertex> = positions
                 .iter()
                 .enumerate()
@@ -298,14 +197,11 @@ fn prepare_node(
                     tangent: Vec4::ZERO,
                 })
                 .collect();
-            let flat_shaded = normals.is_none();
             if let Some(normals) = normals {
                 for (vertex, normal) in vertices.iter_mut().zip(normals) {
                     vertex.normal = normal;
                 }
             } else {
-                u32::try_from(indices.len())
-                    .map_err(|_| invalid("Too many flat-shaded vertices"))?;
                 let mut flat_vertices = Vec::with_capacity(indices.len());
                 for triangle in &mut triangles {
                     let [a, b, c] = triangle.map(|index| positions[index as usize]);
@@ -320,20 +216,13 @@ fn prepare_node(
                 vertices = flat_vertices;
             }
             if let Some(tangents) = tangents {
-                split_tangents(&mut vertices, &mut triangles, &tangents)
-                    .map_err(|error| invalid(&error.to_string()))?;
+                split_tangents(&mut vertices, &mut triangles, &tangents);
             }
             output.push(PreparedPrimitive {
-                source: PrimitiveSource {
-                    node_index: node.index(),
-                    mesh_index: mesh.index(),
-                    primitive_index: primitive.index(),
-                    material_index: primitive.material().index(),
-                },
+                material_index: primitive.material().index(),
                 model,
                 normal_matrix,
-                mirrored: determinant < 0.0,
-                flat_shaded,
+                mirrored: linear.determinant() < 0.0,
                 vertices,
                 triangles,
             });
@@ -435,7 +324,7 @@ fn split_tangents(
     vertices: &mut Vec<PreparedVertex>,
     triangles: &mut [[u32; 3]],
     tangents: &[[Vec4; 3]],
-) -> io::Result<()> {
+) {
     let mut assigned = vec![false; vertices.len()];
     let mut variants = HashMap::new();
     for (triangle, tangents) in triangles.iter_mut().zip(tangents) {
@@ -448,42 +337,25 @@ fn split_tangents(
             } else if vertices[original as usize].tangent != tangent {
                 // Split tangent discontinuities at UV seams.
                 let key = (original, tangent.to_array().map(f32::to_bits));
-                *index = if let Some(&index) = variants.get(&key) {
-                    index
-                } else {
-                    let index = u32::try_from(vertices.len()).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Too many tangent vertices")
-                    })?;
+                *index = *variants.entry(key).or_insert_with(|| {
                     let mut vertex = vertices[original as usize];
                     vertex.tangent = tangent;
                     vertices.push(vertex);
-                    variants.insert(key, index);
-                    index
-                };
+                    vertices.len() as u32 - 1
+                });
             }
         }
     }
-    Ok(())
 }
 
 impl PreparedScene {
-    pub fn world_positions(&self) -> io::Result<Vec<Vec3>> {
+    pub fn world_positions(&self) -> Vec<Vec3> {
         self.primitives
             .iter()
             .flat_map(|p| {
                 p.vertices
                     .iter()
                     .map(|v| p.model.transform_point3(v.position))
-            })
-            .map(|p| {
-                if p.is_finite() {
-                    Ok(p)
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Non-finite world-space vertex position",
-                    ))
-                }
             })
             .collect()
     }

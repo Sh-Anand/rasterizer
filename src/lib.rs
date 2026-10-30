@@ -1,7 +1,6 @@
 pub mod appearance;
 pub mod config;
 pub mod cuda;
-pub mod framebuffer;
 pub mod geometry;
 pub mod lighting;
 pub mod material;

@@ -6,61 +6,41 @@ use serde::Deserialize;
 
 use crate::texture::Sampling;
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub width: u32,
     pub height: u32,
-    #[serde(default = "default_supersampling")]
     pub supersampling: u32,
-    #[serde(default)]
     pub sampling: Sampling,
-    /// Decode the scene's `ntc/<material>.ntc` texture sets instead of their textures.
-    #[serde(default)]
-    pub ntc: bool,
-    /// Make every material a neural material with stand-in weights, overriding `ntc`.
-    #[serde(default)]
-    pub neural_materials: bool,
-    #[serde(default)]
+    pub neural: Neural,
     pub bounce: bool,
     pub camera: CameraConfig,
-    #[serde(default)]
     scene_cameras: HashMap<String, CameraConfig>,
     pub light: LightConfig,
     pub shadow: ShadowConfig,
-    #[serde(default)]
     pub output: OutputConfig,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// What neural networks replace in every material.
+#[derive(Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Neural {
+    None,
+    /// Base color, normal and metallic-roughness textures, by the scene's RTXNTC texture sets.
+    Textures,
+    /// Textures and BRDF, by neural materials with stand-in weights.
+    Materials,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     pub exposure: f32,
     pub tone_mapping: bool,
 }
 
-impl Default for OutputConfig {
-    fn default() -> Self {
-        Self {
-            exposure: 1.0,
-            tone_mapping: true,
-        }
-    }
-}
-
-impl OutputConfig {
-    pub(crate) fn validate(&self) -> io::Result<()> {
-        if !self.exposure.is_finite() || self.exposure < 0.0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Output exposure must be finite and nonnegative",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShadowConfig {
     pub enabled: bool,
@@ -68,7 +48,7 @@ pub struct ShadowConfig {
     pub bias: f32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LightConfig {
     pub direction: [f32; 3],
@@ -76,7 +56,7 @@ pub struct LightConfig {
     pub intensity: f32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CameraConfig {
     pub position: [f32; 3],
@@ -88,46 +68,22 @@ pub struct CameraConfig {
 }
 
 impl Config {
-    pub fn camera_matrix(&self) -> io::Result<Mat4> {
+    /// Loads the configuration with `scene`'s camera, if it has one.
+    pub fn load(path: impl AsRef<Path>, scene: &str) -> io::Result<Self> {
+        let mut config: Self = toml::from_str(&fs::read_to_string(path)?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if let Some(camera) = config.scene_cameras.remove(scene) {
+            config.camera = camera;
+        }
+        Ok(config)
+    }
+
+    pub fn camera_matrix(&self) -> Mat4 {
         let camera = &self.camera;
-        if self.width == 0 || self.height == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Image width and height must be nonzero",
-            ));
-        }
-        if !camera.fov_y_degrees.is_finite()
-            || camera.fov_y_degrees <= 0.0
-            || camera.fov_y_degrees >= 180.0
-            || !camera.near.is_finite()
-            || !camera.far.is_finite()
-            || camera.near <= 0.0
-            || camera.far <= camera.near
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Camera needs 0 < fov_y_degrees < 180 and finite 0 < near < far",
-            ));
-        }
-
         let position = Vec3::from_array(camera.position);
-        let target = Vec3::from_array(camera.target);
-        let forward = (target - position).try_normalize();
-        let up = Vec3::from_array(camera.up).try_normalize();
-        let (Some(forward), Some(up)) = (forward, up) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Camera needs a finite, nonzero viewing direction and up vector",
-            ));
-        };
-        if !position.is_finite() || forward.cross(up).length_squared() < 1e-12 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Camera position must be finite and up must not parallel the viewing direction",
-            ));
-        }
-
-        let view = rh::view::look_to_mat4(position, forward, up);
+        let forward = (Vec3::from_array(camera.target) - position).normalize();
+        let view =
+            rh::view::look_to_mat4(position, forward, Vec3::from_array(camera.up).normalize());
         // Camera looks down -Z; clipping bounds are -w..w on all three axes.
         let projection = rh::proj::opengl::perspective(
             camera.fov_y_degrees.to_radians(),
@@ -135,47 +91,14 @@ impl Config {
             camera.near,
             camera.far,
         );
-        let view_projection = projection * view;
-        if !view_projection.is_finite() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Camera settings produce a non-finite matrix",
-            ));
-        }
-        Ok(view_projection)
+        projection * view
     }
 
-    pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
-        let text = fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&text)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        config.output.validate()?;
-        config.render_size()?;
-        Ok(config)
+    /// The supersampled render resolution.
+    pub fn render_size(&self) -> (u32, u32) {
+        (
+            self.width * self.supersampling,
+            self.height * self.supersampling,
+        )
     }
-
-    pub fn render_size(&self) -> io::Result<(u32, u32)> {
-        match (
-            self.width.checked_mul(self.supersampling),
-            self.height.checked_mul(self.supersampling),
-        ) {
-            (Some(width), Some(height)) if width > 0 && height > 0 => Ok((width, height)),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Supersampled image dimensions must be nonzero and fit in 32 bits",
-            )),
-        }
-    }
-
-    pub fn load_scene(path: impl AsRef<Path>, scene: &str) -> io::Result<Self> {
-        let mut config = Self::load(path)?;
-        if let Some(camera) = config.scene_cameras.remove(scene) {
-            config.camera = camera;
-        }
-        Ok(config)
-    }
-}
-
-fn default_supersampling() -> u32 {
-    1
 }

@@ -1,4 +1,4 @@
-use std::{f32::consts::PI, io};
+use std::f32::consts::PI;
 
 use glam::{IVec2, Mat4, Vec2, Vec3, camera::rh};
 
@@ -16,38 +16,18 @@ pub struct Light {
 impl Light {
     /// The shadow map, if enabled, is fitted around `positions`, every scene vertex in world
     /// space.
-    pub fn new(light: &LightConfig, shadow: &ShadowConfig, positions: &[Vec3]) -> io::Result<Self> {
-        let direction = Vec3::from_array(light.direction)
-            .try_normalize()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Light direction must be finite and nonzero",
-                )
-            })?;
-        let color = Vec3::from_array(light.color);
-        // Intensity 1 gives unit response for a facing white Lambertian surface.
-        let irradiance = color * light.intensity * PI;
-        if !color.is_finite()
-            || color.min_element() < 0.0
-            || !light.intensity.is_finite()
-            || light.intensity < 0.0
-            || !irradiance.is_finite()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Light color and intensity must be finite, nonnegative, and not overflow",
-            ));
-        }
-        let shadow = shadow
-            .enabled
-            .then(|| ShadowMap::new(light_matrix(positions, direction)?, shadow))
-            .transpose()?;
-        Ok(Self {
+    pub fn new(light: &LightConfig, shadow: &ShadowConfig, positions: &[Vec3]) -> Self {
+        let direction = Vec3::from_array(light.direction).normalize();
+        Self {
             direction,
-            irradiance,
-            shadow,
-        })
+            // Intensity 1 gives unit response for a facing white Lambertian surface.
+            irradiance: Vec3::from_array(light.color) * light.intensity * PI,
+            shadow: shadow.enabled.then(|| ShadowMap {
+                view_projection: light_matrix(positions, direction),
+                resolution: shadow.resolution,
+                bias: shadow.bias,
+            }),
+        }
     }
 
     // CUDA shading must inline depth reads to address the shadow map as global memory.
@@ -68,32 +48,6 @@ pub struct ShadowMap {
 }
 
 impl ShadowMap {
-    fn new(view_projection: Mat4, config: &ShadowConfig) -> io::Result<Self> {
-        if config.resolution == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Shadow resolution must be nonzero",
-            ));
-        }
-        if !(0.0..=1.0).contains(&config.bias) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Shadow bias must be finite and in 0..1",
-            ));
-        }
-        if !view_projection.is_finite() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Non-finite shadow matrix",
-            ));
-        }
-        Ok(Self {
-            view_projection,
-            resolution: config.resolution,
-            bias: config.bias,
-        })
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.resolution as usize * self.resolution as usize
     }
@@ -137,21 +91,12 @@ fn pcf(pixel: Vec2, sample: impl Fn(IVec2) -> f32) -> f32 {
     top * (1.0 - weight.y) + bottom * weight.y
 }
 
-fn light_matrix(positions: &[Vec3], direction: Vec3) -> io::Result<Mat4> {
+fn light_matrix(positions: &[Vec3], direction: Vec3) -> Mat4 {
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
     for &position in positions {
-        if !position.is_finite() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Non-finite shadow caster position",
-            ));
-        }
         min = min.min(position);
         max = max.max(position);
-    }
-    if min.x == f32::INFINITY {
-        return Ok(Mat4::IDENTITY);
     }
     let center = min * 0.5 + max * 0.5;
     let radius = (max - min).length() * 0.5;
@@ -178,5 +123,5 @@ fn light_matrix(positions: &[Vec3], direction: Vec3) -> io::Result<Mat4> {
         (-max.z - padding).max(0.0),
         -min.z + padding,
     );
-    Ok(projection * view)
+    projection * view
 }

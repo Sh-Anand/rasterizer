@@ -7,6 +7,7 @@
 use glam::{Vec2, Vec3};
 
 use crate::{
+    fragment::uniform,
     rasterization::FragmentAttributes,
     texture::Texel,
     trace::{Site, mark},
@@ -361,13 +362,4 @@ fn scaled_sigmoid(x: f32) -> f32 {
     } else {
         SCALE * e / (e + SCALE)
     }
-}
-
-/// A PCG hash step as a uniform float in [0, 1).
-#[inline(always)]
-fn uniform(state: &mut u32) -> f32 {
-    let x = state.wrapping_mul(747796405).wrapping_add(2891336453);
-    let word = ((x >> ((x >> 28) + 4)) ^ x).wrapping_mul(277803737);
-    *state = (word >> 22) ^ word;
-    (*state >> 8) as f32 / 16777216.0
 }

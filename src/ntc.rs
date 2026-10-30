@@ -14,7 +14,7 @@ use cuda_device::{
 use glam::{Vec2, Vec4};
 use serde::Deserialize;
 
-use crate::texture::{Texel, UvSample, lod};
+use crate::texture::{Texel, UvSample, decode_srgb, lod};
 
 /// RTXNTC's network: 48 inputs, hidden layers of 64, 48 and 32 outputs, then 16 outputs.
 const LAYERS: [(usize, usize); 4] = [(48, 64), (64, 48), (48, 32), (32, 16)];
@@ -494,15 +494,6 @@ impl Words {
     fn quad(self, word: usize) -> [u32; 4] {
         let quad = unsafe { self.0.add(word).cast::<u128>().read() };
         [0, 32, 64, 96].map(|shift| (quad >> shift) as u32)
-    }
-}
-
-#[inline(always)]
-fn decode_srgb(value: f32) -> f32 {
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
     }
 }
 
