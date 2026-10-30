@@ -6,7 +6,8 @@ Every traced region counts. A per-lane region costs a warp's max(issue, SFU pipe
 once per pass, whatever its lanes' materials; a network region costs what each scheme spends on
 the warp's texture sets or materials. Traversal is untraced, so excluded. An NTC trace reports
 its decode ('ntc'); a neural-material trace reports its networks ('neural') and neural materials
-whose latents are NTC-compressed, each hit also decoding its material's NTC set ('both'). Prints
+whose latents are NTC-compressed, each point running the sampler also decoding its material's NTC
+set ('both'). Prints
 each bounce depth, then the frame: every pass, summed per warp.
 """
 import functools, pathlib, sys
@@ -15,7 +16,7 @@ import numpy as np
 
 RECORD = np.dtype([('warp', '<u4'), ('pass', 'u1'), ('site', 'u1'), ('material', '<u4'), ('mask', '<u4')])
 # `Site` numbers in trace.rs.
-LATENTS, NETWORK, APPEARANCE, NN, LIGHT = 9, 10, 11, 12, 13
+LATENTS, NETWORK, APPEARANCE, NN, SCATTER, LIGHT = 9, 10, 11, 12, 13, 14
 # Latency of a load, store, FP32, SFU and integer op; SFU cycles per warp instruction; and the one
 # in-warp shuffle that regroups lanes before a network.
 LAT = np.array([30, 1, 4, 15, 4]); SFU_PIPE = 8; SHUFFLE = 100
@@ -28,12 +29,11 @@ SHAPES = [(12, 8), (16, 11), (16, 16), (9, 16), (16, 24), (3, 16)]
 
 def load(path):
     d = open(path, 'rb').read()
-    version = int.from_bytes(d[4:8], 'little')
-    assert d[:4] == b'RTRC' and version in (7, 8), 'needs an RTRC version 7 or 8 trace'
+    assert d[:4] == b'RTRC' and int.from_bytes(d[4:8], 'little') == 9, 'needs an RTRC version 9 trace'
     w, h, passes, bounces, sites, ops = (int(x) for x in np.frombuffer(d, '<u4', 6, 8))
     # Per site, a u16 count per op type for its work and for its critical path.
     table = np.frombuffer(d, '<u2', 2 * sites * ops, 32).reshape(sites, 2, ops).astype(int)
-    return version, bounces, table, np.frombuffer(d, RECORD, offset=32 + 4 * sites * ops)
+    return bounces, table, np.frombuffer(d, RECORD, offset=32 + 4 * sites * ops)
 
 
 def lane_cost(table, s):
@@ -120,7 +120,7 @@ def schemes(masks, model):
 def analyze(bounces, table, rec, mode):
     """Per depth (0 primary), per warp pass: common and hot (latents and networks only) per-lane
     cycles, then each scheme's network cycles."""
-    nets = {NETWORK: ntc_model(table)} if mode == 'ntc' else {NN: nn_model(table, NN), LIGHT: nn_model(table, LIGHT)}
+    nets = {NETWORK: ntc_model(table)} if mode == 'ntc' else {s: nn_model(table, s) for s in (NN, SCATTER, LIGHT)}
     ntc = ntc_model(table)
     lane = {s: lane_cost(table, s) for s in range(len(table))}
     rec = rec[np.lexsort((rec['site'], rec['warp'], rec['pass']))]
@@ -169,10 +169,8 @@ def report(label, x):
 
 
 for path in sys.argv[1:]:
-    version, bounces, table, records = load(path)
-    # Version 7 traces predate neural materials and number later sites differently.
-    neural = version == 8 and (records['site'] == NN).any()
-    for mode in ('neural', 'both') if neural else ('ntc',):
+    bounces, table, records = load(path)
+    for mode in ('neural', 'both') if (records['site'] == NN).any() else ('ntc',):
         out = analyze(bounces, table, records, mode)
         print(f'{pathlib.Path(path).stem} [{mode}]  whole-shader cycles/warp: warp quad SIMT hybrid flexible')
         for depth in sorted(out):

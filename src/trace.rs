@@ -27,6 +27,7 @@ pub(crate) enum Site {
     Network,
     Appearance,
     AppearanceNetwork,
+    AppearanceScatter,
     AppearanceLight,
     NormalMap,
     Surface,
@@ -135,12 +136,19 @@ fn ops(site: Site, sampling: Sampling, bounce: bool) -> ([u16; OPS], [u16; OPS])
         // Path: the latent texel, then the diffuse slope offset through the sampled direction to
         // the decoder's inputs, and the weight.
         Site::Appearance => (scalar([3, 0, 416, 46, 46]), scalar([1, 0, 38, 8, 7])),
-        // The material's networks, once per material: the frame layer, the sampler and the
-        // scatter decode, 20 bias loads, activation of 32 sampler and 32 decoder hidden values
-        // and 3 outputs. Path: a bias, the sampler's layers, then the decoder's.
+        // The frame layer and the sampler, once per material among lanes seeing the surface
+        // from above: 11 bias loads and activation of 32 hidden values. Path: a bias, then the
+        // sampler's layers.
         Site::AppearanceNetwork => (
-            [20, 0, 463, 6, 1, 0, 0, 0, 0, 1, 1, 2, 1, 1, 1],
-            [1, 0, 22, 2, 1, 0, 0, 0, 0, 0, 1, 2, 1, 1, 1],
+            [11, 0, 128, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+            [1, 0, 6, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0],
+        ),
+        // The decode at the sampled direction, once per material among lanes sampling above the
+        // surface: 9 bias loads, activation of 32 hidden values and 3 outputs. Path: the layers,
+        // their biases loaded during the per-lane work before them.
+        Site::AppearanceScatter => (
+            [9, 0, 335, 6, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1],
+            [0, 0, 16, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1],
         ),
         // The decode toward the light, once per material among lit lanes: its inputs, 9 bias
         // loads, the decoder and the light it reflects. Path: the inputs, layers, then the sum.
@@ -163,7 +171,7 @@ fn ops(site: Site, sampling: Sampling, bounce: bool) -> ([u16; OPS], [u16; OPS])
 /// `lanes` holds, per pixel and pass (primary, then each bounce ray's hits by depth), the region
 /// bits and material of that lane.
 ///
-/// The little-endian file holds `b"RTRC"`, version 8, then the width, height, pass count,
+/// The little-endian file holds `b"RTRC"`, version 9, then the width, height, pass count,
 /// bounces per path (0 without the bounce; pass 1 + r b + d is ray r at depth d), `Site` count
 /// and op-type count as u32; then per `Site`, its per-lane op counts in `OPS` order and its
 /// critical path's (see `ops`) as u16; then records: warp u32, pass u8, `Site` number u8,
@@ -190,7 +198,7 @@ pub fn write(
     let passes = if bounce { SLOTS } else { 1 };
     let bounces = if bounce { BOUNCES as usize } else { 0 };
     let mut bytes = Vec::new();
-    for value in [*b"RTRC", 8u32.to_le_bytes()] {
+    for value in [*b"RTRC", 9u32.to_le_bytes()] {
         bytes.extend(value);
     }
     for value in [width, height, passes, bounces, SITES as usize, OPS] {
@@ -221,7 +229,9 @@ pub fn write(
                     if bits >> bit & 1 != 0 {
                         let material = match site {
                             Site::Network => sets[material as usize] as u32,
-                            Site::AppearanceNetwork | Site::AppearanceLight => material,
+                            Site::AppearanceNetwork
+                            | Site::AppearanceScatter
+                            | Site::AppearanceLight => material,
                             // Texture regions.
                             _ if (Site::BaseColor as usize..=Site::EmissiveLevel as usize)
                                 .contains(&bit) =>

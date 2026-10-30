@@ -1067,9 +1067,9 @@ mod kernels {
                     .wrapping_add((depth * BOUNCE_RAYS).wrapping_mul(width * height));
                 let direction = cosine_direction(normal, seed);
                 let mut sites = 0;
-                mark(&mut sites, Site::Traverse);
                 // Slots are recomputed at each store: keeping one live across traversal cost 15%.
                 let hit = if alive {
+                    mark(&mut sites, Site::Traverse);
                     bvh::closest_hit(nodes, order, origin, direction, corners)
                 } else {
                     None

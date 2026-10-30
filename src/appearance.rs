@@ -94,7 +94,9 @@ impl Appearance {
     }
 
     /// Samples the latents, predicts the frames, samples a direction from the sampler's
-    /// mixture and decodes the BSDF there, as a hit does to continue its path.
+    /// mixture and decodes the BSDF there, as a hit does to continue its path. As in the
+    /// reference, a point seen from below runs no network and a direction sampled below the
+    /// surface no decode: both scatter nothing.
     #[inline(always)]
     pub(crate) fn sample(
         &self,
@@ -111,6 +113,16 @@ impl Appearance {
             .unwrap_or_else(|| normal.any_orthonormal_vector());
         let basis = [t, normal.cross(t), normal];
         let wi = local(&basis, view);
+        let mut point = Point {
+            basis,
+            wi,
+            latents: [0.0; LATENTS],
+            frames: [basis; 2],
+            weight: Vec3::ZERO,
+        };
+        if !(wi.z > 0.0) {
+            return point;
+        }
         let uv = attributes.uv.uv - attributes.uv.uv.floor();
         let x = ((uv.x * LATENT_SIZE as f32) as u32).min(LATENT_SIZE - 1);
         let y = ((uv.y * LATENT_SIZE as f32) as u32).min(LATENT_SIZE - 1);
@@ -145,19 +157,13 @@ impl Appearance {
         let lobes = Lobes::new(o);
         let wo = lobes.sample(wi, u);
         let pdf = lobes.pdf(wi, wo);
-        let f = self.decode(texels, &latents, &frames, wi, wo);
-        let weight = if wi.z > 0.0 && wo.z > 0.0 {
-            f / pdf
-        } else {
-            Vec3::ZERO
-        };
-        Point {
-            basis,
-            wi,
-            latents,
-            frames,
-            weight,
+        if wo.z > 0.0 {
+            mark(sites, Site::AppearanceScatter);
+            point.weight = self.decode(texels, &latents, &frames, wi, wo) / pdf;
         }
+        point.latents = latents;
+        point.frames = frames;
+        point
     }
 
     /// The BSDF times cosine toward a light, for a lit point.
@@ -169,11 +175,11 @@ impl Appearance {
         light: Vec3,
         sites: &mut u32,
     ) -> Vec3 {
-        mark(sites, Site::AppearanceLight);
         let wo = local(&point.basis, light);
         if point.wi.z <= 0.0 || wo.z <= 0.0 {
             return Vec3::ZERO;
         }
+        mark(sites, Site::AppearanceLight);
         self.decode(texels, &point.latents, &point.frames, point.wi, wo)
     }
 
